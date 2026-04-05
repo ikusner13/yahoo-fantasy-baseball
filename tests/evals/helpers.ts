@@ -113,7 +113,8 @@ async function callOpenRouter(model: ModelDef, system: string, user: string): Pr
     },
     body: JSON.stringify({
       model: model.openRouterId,
-      max_tokens: 1024,
+      max_tokens: 512,
+      temperature: 0.3,
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },
@@ -163,7 +164,7 @@ export async function callModel(modelId: ModelId, system: string, user: string):
 
 // --- Judge (uses cheapest model available) ---
 
-const JUDGE_MODEL: ModelId = "gpt-5.4-nano";
+const JUDGE_MODEL: ModelId = "gpt-5.4-mini";
 
 async function callJudge(system: string, user: string): Promise<string> {
   if (process.env.OPENROUTER_API_KEY) {
@@ -174,15 +175,34 @@ async function callJudge(system: string, user: string): Promise<string> {
 
 // --- Evalite Scorers ---
 
-/** Check that expected keywords appear in output (case-insensitive) */
+/** Keyword synonyms for flexible matching */
+const KEYWORD_SYNONYMS: Record<string, string[]> = {
+  closer: ["closer", "save", "saves", "closing", "ninth-inning", "9th inning"],
+  marginal: ["marginal", "modest", "minimal", "slight", "small", "negligible", "thin"],
+  priority: ["priority", "waiver", "claim", "priority #"],
+  hold: ["hold", "stand pat", "don't", "do not", "pass", "skip", "wait", "save"],
+  protect: ["protect", "preserve", "maintain", "safeguard", "lock in", "don't risk"],
+  stream: ["stream", "streaming", "start", "add", "pick up", "grab"],
+  aggressive: ["aggressive", "aggressively", "push", "chase", "attack", "go for"],
+  sell: ["sell", "sell high", "trade away", "move", "deal", "cash in"],
+  drop: ["drop", "cut", "release", "let go", "move on from"],
+  stash: ["stash", "stash on IL", "IL stash", "place on IL", "move to IL"],
+};
+
+/** Check that expected keywords appear in output (with synonym matching) */
 export const containsKeywords = createScorer<{ keywords: string[] }, string, unknown>({
   name: "Keywords",
-  description: "Expected keywords present in output",
+  description: "Expected keywords or synonyms present in output",
   scorer: ({ input, output }) => {
     const keywords = (input as { keywords: string[] }).keywords ?? [];
     if (keywords.length === 0) return 1;
     const lower = output.toLowerCase();
-    const found = keywords.filter((k) => lower.includes(k.toLowerCase()));
+    const found = keywords.filter((k) => {
+      const kl = k.toLowerCase();
+      if (lower.includes(kl)) return true;
+      const synonyms = KEYWORD_SYNONYMS[kl];
+      return synonyms?.some((s) => lower.includes(s)) ?? false;
+    });
     return found.length / keywords.length;
   },
 });
@@ -281,24 +301,32 @@ export const noHallucination = createScorer<{ rejectKeywords?: string[] }, strin
   },
 });
 
-/** LLM-as-judge using cheapest available model */
+/** LLM-as-judge using reliable mid-tier model */
 export function llmJudge(criteria: string) {
   return createScorer<unknown, string, unknown>({
     name: "LLM Judge",
     description: criteria,
     scorer: async ({ output }) => {
       const judgePrompt = [
-        "You are evaluating an AI response. Score it 0-100 based on this criteria:",
+        "Score this fantasy baseball AI response 0-100.",
+        "",
+        "CRITERIA:",
         criteria,
         "",
-        'Respond with ONLY a JSON object: {"score": <0-100>, "reason": "<brief reason>"}',
+        "SCORING GUIDE:",
+        "90-100: Correct decision, names relevant categories, concise, actionable",
+        "70-89: Mostly correct, minor issues (slightly verbose, missing a category)",
+        "50-69: Partially correct but significant issues (wrong advice, too long, markdown)",
+        "0-49: Wrong decision, hallucinated info, or completely off-topic",
         "",
         "RESPONSE TO EVALUATE:",
         output,
+        "",
+        'Output ONLY: {"score": <0-100>, "reason": "<1 sentence>"}',
       ].join("\n");
 
       const result = await callJudge(
-        "You are a strict evaluator. Output only valid JSON.",
+        "Score the response. Output only valid JSON. Be fair — if the advice is correct and relevant, score 80+.",
         judgePrompt,
       );
 
