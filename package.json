@@ -1,0 +1,36 @@
+{
+  "name": "fantasy-baseball",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI-powered Yahoo fantasy baseball GM",
+  "keywords": [],
+  "license": "ISC",
+  "author": "",
+  "scripts": {
+    "dev": "tsx watch src/index.tsx",
+    "start": "tsx src/index.tsx",
+    "typecheck": "tsc --noEmit",
+    "test": "vp test run",
+    "test:watch": "vp test",
+    "prepare": "vp config"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.19.12",
+    "better-sqlite3": "^12.8.0",
+    "csv-parse": "^6.2.1",
+    "hono": "^4.12.10",
+    "node-cron": "^4.2.1",
+    "puppeteer-core": "^24.40.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.5.2",
+    "@types/node-cron": "^3.0.11",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2",
+    "vite": "catalog:",
+    "vite-plus": "catalog:",
+    "vitest": "catalog:"
+  },
+  "packageManager": "pnpm@10.33.0"
+}
