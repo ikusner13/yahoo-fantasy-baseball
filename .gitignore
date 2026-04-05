@@ -2,3 +2,5 @@ node_modules/
 dist/
 config.json
 data/
+tests/evals/results-*.json
+.env
