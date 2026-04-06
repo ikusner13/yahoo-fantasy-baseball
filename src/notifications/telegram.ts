@@ -1,4 +1,6 @@
+import { eq, desc, sql } from "drizzle-orm";
 import type { Env } from "../types";
+import { decisions, feedback } from "../db/schema";
 
 const TG_API = "https://api.telegram.org/bot";
 
@@ -82,20 +84,20 @@ async function handleFeedbackCommand(env: Env, chatId: number, text: string): Pr
   // Get current matchup week (best effort)
   let week: number | null = null;
   try {
-    const row = env.db
-      .prepare(
-        "SELECT json_extract(action, '$.week') as week FROM decisions WHERE type = 'lineup' ORDER BY timestamp DESC LIMIT 1",
-      )
-      .get() as { week: number } | undefined;
+    const row = await env.db
+      .select({ week: sql<number>`json_extract(${decisions.action}, '$.week')` })
+      .from(decisions)
+      .where(eq(decisions.type, "lineup"))
+      .orderBy(desc(decisions.timestamp))
+      .limit(1)
+      .get();
     if (row?.week) week = row.week;
   } catch {
     // non-fatal
   }
 
   try {
-    env.db
-      .prepare("INSERT INTO feedback (type, message, week) VALUES (?, ?, ?)")
-      .run(type, message, week);
+    await env.db.insert(feedback).values({ type, message, week });
     await sendReply(env, chatId, `Logged ${type} feedback${week ? ` (week ${week})` : ""}`);
   } catch (e) {
     await sendReply(
@@ -185,11 +187,15 @@ export async function sendTradeApproval(env: Env, tradeId: string, summary: stri
 // ---------------------------------------------------------------------------
 
 async function sendReply(env: Env, chatId: number, text: string): Promise<void> {
-  await fetch(`${TG_API}${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  const res = await fetch(`${TG_API}${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, text }),
   });
+  if (!res.ok) {
+    const body = await res.text();
+    console.error(`[telegram] sendReply failed (${res.status}): ${body}`);
+  }
 }
 
 async function answerCallbackQuery(env: Env, callbackQueryId: string, text: string): Promise<void> {

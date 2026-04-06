@@ -1,5 +1,3 @@
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
 import type { Env } from "../types";
 import type { PickupRecommendation } from "./waivers";
 import { loadTuning } from "../config/tuning";
@@ -17,9 +15,7 @@ export type AddPriority = "critical" | "high" | "medium" | "low";
 
 // --- Helpers ---
 
-function budgetPath(env: Env): string {
-  return `${env.DATA_DIR}/add-budget.json`;
-}
+const KV_KEY = "add-budget";
 
 /** Day-of-week aware reserve calculation. Reads thresholds from tuning config. */
 function computeReserve(): number {
@@ -30,27 +26,25 @@ function computeReserve(): number {
   return budget.reserveWedThu;
 }
 
-function readState(env: Env): AddBudgetState {
+async function readState(env: Env): Promise<AddBudgetState> {
   try {
-    const raw = readFileSync(budgetPath(env), "utf-8");
-    return JSON.parse(raw) as AddBudgetState;
+    const state = await env.KV.get<AddBudgetState>(KV_KEY, "json");
+    if (state) return state;
   } catch {
-    // No file yet — return defaults
-    const now = new Date();
-    const weekStart = now.toISOString().slice(0, 10);
-    return {
-      weekStart,
-      addsUsed: 0,
-      addsRemaining: loadTuning().budget.maxAddsPerWeek,
-      reserveForReactions: computeReserve(),
-    };
+    // fall through to defaults
   }
+  const now = new Date();
+  const weekStart = now.toISOString().slice(0, 10);
+  return {
+    weekStart,
+    addsUsed: 0,
+    addsRemaining: loadTuning().budget.maxAddsPerWeek,
+    reserveForReactions: computeReserve(),
+  };
 }
 
-function writeState(env: Env, state: AddBudgetState): void {
-  const path = budgetPath(env);
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(state, null, 2), "utf-8");
+async function writeState(env: Env, state: AddBudgetState): Promise<void> {
+  await env.KV.put(KV_KEY, JSON.stringify(state));
 }
 
 // --- Core exports ---
@@ -59,41 +53,35 @@ function writeState(env: Env, state: AddBudgetState): void {
  * Read current add budget for this matchup week.
  * Recalculates reserve based on current day-of-week.
  */
-export function getAddBudget(env: Env): AddBudgetState {
-  const state = readState(env);
-  // Always refresh reserve based on current day
+export async function getAddBudget(env: Env): Promise<AddBudgetState> {
+  const state = await readState(env);
   state.reserveForReactions = computeReserve();
   state.addsRemaining = loadTuning().budget.maxAddsPerWeek - state.addsUsed;
   return state;
 }
 
 /** Increment addsUsed and persist. */
-export function recordAdd(env: Env): void {
-  const state = readState(env);
+export async function recordAdd(env: Env): Promise<void> {
+  const state = await readState(env);
   state.addsUsed = Math.min(state.addsUsed + 1, loadTuning().budget.maxAddsPerWeek);
   state.addsRemaining = loadTuning().budget.maxAddsPerWeek - state.addsUsed;
   state.reserveForReactions = computeReserve();
-  writeState(env, state);
+  await writeState(env, state);
 }
 
 /** Reset budget for a new matchup week. */
-export function resetWeeklyBudget(env: Env, weekStart: string): void {
+export async function resetWeeklyBudget(env: Env, weekStart: string): Promise<void> {
   const state: AddBudgetState = {
     weekStart,
     addsUsed: 0,
     addsRemaining: loadTuning().budget.maxAddsPerWeek,
     reserveForReactions: computeReserve(),
   };
-  writeState(env, state);
+  await writeState(env, state);
 }
 
 /**
  * Classify how urgent a pickup is.
- *
- * - critical: closer change or injury to starter — always use an add
- * - high: netValue > 2.0
- * - medium: netValue 1.0-2.0
- * - low: netValue < 1.0
  */
 export function classifyAddPriority(
   recommendation: PickupRecommendation,
@@ -111,11 +99,6 @@ export function classifyAddPriority(
 
 /**
  * Decide whether to spend an add given budget and priority.
- *
- * - Critical: always true (can't miss a closer change)
- * - High: true if any adds remain
- * - Medium: true if adds remain beyond reserve
- * - Low: true if adds remain beyond reserve + 1
  */
 export function shouldSpendAdd(budget: AddBudgetState, priority: AddPriority): boolean {
   switch (priority) {

@@ -1,5 +1,3 @@
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
 import type { Env, YahooTokens } from "../types";
 
 const AUTH_URL = "https://api.login.yahoo.com/oauth2/request_auth";
@@ -7,23 +5,18 @@ const TOKEN_URL = "https://api.login.yahoo.com/oauth2/get_token";
 
 /** Buffer before expiry to trigger refresh (60s) */
 const EXPIRY_BUFFER_MS = 60_000;
+const KV_KEY = "yahoo-tokens";
 
-function tokenPath(env: Env): string {
-  return join(env.DATA_DIR, "yahoo-tokens.json");
-}
-
-function readTokens(env: Env): YahooTokens | null {
-  const p = tokenPath(env);
-  if (!existsSync(p)) return null;
+async function readTokens(env: Env): Promise<YahooTokens | null> {
   try {
-    return JSON.parse(readFileSync(p, "utf-8")) as YahooTokens;
+    return await env.KV.get<YahooTokens>(KV_KEY, "json");
   } catch {
     return null;
   }
 }
 
-function writeTokens(env: Env, tokens: YahooTokens): void {
-  writeFileSync(tokenPath(env), JSON.stringify(tokens, null, 2));
+async function writeTokens(env: Env, tokens: YahooTokens): Promise<void> {
+  await env.KV.put(KV_KEY, JSON.stringify(tokens));
 }
 
 function basicAuthHeader(env: Env): string {
@@ -40,7 +33,7 @@ export function getAuthUrl(env: Env, redirectUri: string): string {
   return `${AUTH_URL}?${params.toString()}`;
 }
 
-/** Exchange an authorization code for tokens, store to file. */
+/** Exchange an authorization code for tokens, store to KV. */
 export async function handleCallback(
   env: Env,
   code: string,
@@ -76,11 +69,11 @@ export async function handleCallback(
     expiresAt: Date.now() + data.expires_in * 1000,
   };
 
-  writeTokens(env, tokens);
+  await writeTokens(env, tokens);
   return tokens;
 }
 
-/** Refresh expired tokens, store new ones to file. */
+/** Refresh expired tokens, store new ones to KV. */
 export async function refreshTokens(env: Env, refreshToken: string): Promise<YahooTokens> {
   const res = await fetch(TOKEN_URL, {
     method: "POST",
@@ -111,13 +104,13 @@ export async function refreshTokens(env: Env, refreshToken: string): Promise<Yah
     expiresAt: Date.now() + data.expires_in * 1000,
   };
 
-  writeTokens(env, tokens);
+  await writeTokens(env, tokens);
   return tokens;
 }
 
 /** Get a valid access token, refreshing if needed. */
 export async function getValidToken(env: Env): Promise<string> {
-  const tokens = readTokens(env);
+  const tokens = await readTokens(env);
   if (!tokens) {
     throw new Error("No Yahoo tokens found — complete OAuth flow first");
   }

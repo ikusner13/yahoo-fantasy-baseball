@@ -2,11 +2,11 @@ import { defineConfig } from "vite-plus";
 
 export default defineConfig({
   build: {
-    ssr: "src/index.tsx",
+    ssr: "src/worker.tsx",
     outDir: "dist",
   },
   ssr: {
-    target: "node",
+    target: "webworker",
   },
   test: {
     include: ["tests/**/*.test.ts"],
