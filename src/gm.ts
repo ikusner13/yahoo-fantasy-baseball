@@ -69,13 +69,22 @@ import {
 } from "./data/matchup-data";
 import { buildRetrospective, formatRetrospectiveForTelegram } from "./analysis/retrospective";
 import { loadTuning } from "./config/tuning";
+import { eq, desc } from "drizzle-orm";
+import {
+  feedback as feedbackTable,
+  decisions as decisionsTable,
+  retrospectives,
+} from "./db/schema";
 
 /** Query recent feedback entries formatted for LLM context */
-function getRecentFeedback(env: Env, limit: number = 5): string | undefined {
+async function getRecentFeedback(env: Env, limit: number = 5): Promise<string | undefined> {
   try {
-    const rows = env.db
-      .prepare("SELECT type, message FROM feedback ORDER BY timestamp DESC LIMIT ?")
-      .all(limit) as Array<{ type: string; message: string }>;
+    const rows = await env.db
+      .select({ type: feedbackTable.type, message: feedbackTable.message })
+      .from(feedbackTable)
+      .orderBy(desc(feedbackTable.timestamp))
+      .limit(limit)
+      .all();
     if (rows.length === 0) return undefined;
     return rows.map((r) => `\u2022 [${r.type}] ${r.message}`).join("\n");
   } catch {
@@ -83,9 +92,24 @@ function getRecentFeedback(env: Env, limit: number = 5): string | undefined {
   }
 }
 
-// Cross-run dedup for news monitor (survives between cron runs in same process)
-const sentAlertKeys = new Set<string>();
-let sentAlertDate = "";
+// KV-backed alert dedup for news monitor
+const ALERT_KV_KEY = "sent-alert-keys";
+
+async function getSentAlertKeys(env: Env): Promise<Set<string>> {
+  try {
+    const raw = (await env.KV.get(ALERT_KV_KEY, "json")) as string[] | null;
+    return new Set(raw ?? []);
+  } catch {
+    return new Set();
+  }
+}
+
+async function addSentAlertKeys(env: Env, keys: string[]): Promise<void> {
+  const existing = await getSentAlertKeys(env);
+  for (const k of keys) existing.add(k);
+  // TTL 24h — auto-cleanup
+  await env.KV.put(ALERT_KV_KEY, JSON.stringify([...existing]), { expirationTtl: 86400 });
+}
 
 // Pitcher hand cache — handedness never changes, so cache forever (process lifetime)
 const pitcherHandCache = new Map<number, "L" | "R">();
@@ -182,12 +206,12 @@ function getCurrentIP(matchup: {
 /** Build a Map<yahooId, PlayerProjection> from FanGraphs raw projections.
  *  When rosterPlayers is provided, keys projections by Yahoo ID via name+team matching.
  *  Unmatched projections fall back to `fg:${fangraphsId}` key. */
-function buildProjectionMap(
+async function buildProjectionMap(
   batters: Awaited<ReturnType<typeof fetchBatterProjections>>,
   pitchers: Awaited<ReturnType<typeof fetchPitcherProjections>>,
   rosterPlayers?: Array<{ yahooId: string; name: string; team: string }>,
   env?: Env,
-): Map<string, PlayerProjection> {
+): Promise<Map<string, PlayerProjection>> {
   const map = new Map<string, PlayerProjection>();
   const now = new Date().toISOString();
 
@@ -219,7 +243,7 @@ function buildProjectionMap(
         };
       });
       try {
-        upsertPlayerIds(env, rows);
+        await upsertPlayerIds(env, rows);
       } catch {
         // non-fatal — DB write failure shouldn't break projection flow
       }
@@ -367,7 +391,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
       fetchPitcherProjections(undefined, env),
     ]);
     const rosterForMatch = roster?.entries.map((e) => e.player) ?? [];
-    projectionMap = buildProjectionMap(rawBatters, rawPitchers, rosterForMatch, env);
+    projectionMap = await buildProjectionMap(rawBatters, rawPitchers, rosterForMatch, env);
     allProjections = projectionsToArray(projectionMap);
     summaryLines.push(`Projections: ${rawBatters.length} batters, ${rawPitchers.length} pitchers`);
 
@@ -404,7 +428,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
     const p = entry.player;
     let mlbId = p.mlbId;
     if (!mlbId) {
-      const row = lookupByYahooId(env, p.yahooId);
+      const row = await lookupByYahooId(env, p.yahooId);
       if (row?.mlbId) mlbId = row.mlbId;
     }
     if (mlbId) {
@@ -673,7 +697,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
   }
 
   // 8. Waiver wire evaluation
-  const budget = getAddBudget(env);
+  const budget = await getAddBudget(env);
   try {
     const freeAgents = await yahoo.getFreeAgents(undefined, 50);
     if (freeAgents.length > 0 && valuations.length > 0) {
@@ -723,7 +747,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
             reasoning: rec.reasoning,
             method,
           });
-          recordAdd(env);
+          await recordAdd(env);
           decisions.push({
             type: "waiver",
             action: { add: rec.add.name, drop: rec.drop.name, net: rec.netValue },
@@ -859,7 +883,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
                 streamReasoning,
               );
               await sendMessage(env, streamMsg);
-              recordAdd(env);
+              await recordAdd(env);
               summaryLines.push(`  -> Streaming pickup notified, drop ${dropTarget.player.name}`);
               decisions.push({
                 type: "stream",
@@ -913,13 +937,13 @@ export async function runDailyMorning(env: Env): Promise<void> {
   // 11. Log all decisions to SQLite
   for (const d of decisions) {
     try {
-      logDecision(env, d);
+      await logDecision(env, d);
     } catch {
       // db logging is best-effort
     }
   }
   try {
-    logDecision(env, {
+    await logDecision(env, {
       type: "lineup",
       action: { routine: "daily_morning", date: today, gamesCount: games.length },
       reasoning: `Morning routine completed for ${today}`,
@@ -986,7 +1010,7 @@ export async function runLateScratchCheck(env: Env): Promise<void> {
     ].join("\n");
     await sendMessage(env, msg);
 
-    logDecision(env, {
+    await logDecision(env, {
       type: "lineup",
       action: { routine: "late_scratch", changes },
       reasoning: `${changes.length} late changes detected`,
@@ -1008,24 +1032,30 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
     const prevWeek = currentMatchup.week - 1;
     if (prevWeek >= 1) {
       // Check if we already have a retrospective for this week
-      const existing = env.db
-        .prepare("SELECT week FROM retrospectives WHERE week = ?")
-        .get(prevWeek) as { week: number } | undefined;
+      const existing = await env.db
+        .select({ week: retrospectives.week })
+        .from(retrospectives)
+        .where(eq(retrospectives.week, prevWeek))
+        .get();
 
       if (!existing) {
         const prevMatchup = await yahoo.getMatchup(prevWeek);
         const retro = buildRetrospective(prevMatchup);
 
         // Store retrospective
-        env.db
-          .prepare("INSERT OR REPLACE INTO retrospectives (week, data) VALUES (?, ?)")
-          .run(prevWeek, JSON.stringify(retro));
+        await env.db
+          .insert(retrospectives)
+          .values({ week: prevWeek, data: JSON.stringify(retro) })
+          .onConflictDoUpdate({
+            target: retrospectives.week,
+            set: { data: JSON.stringify(retro) },
+          });
 
         // Send Telegram summary
         await sendMessage(env, formatRetrospectiveForTelegram(retro));
 
         // Log decision for audit trail
-        logDecision(env, {
+        await logDecision(env, {
           type: "lineup",
           action: { routine: "retrospective", week: prevWeek, score: retro.finalScore },
           reasoning: `Week ${prevWeek} retrospective: ${retro.finalScore}`,
@@ -1068,7 +1098,7 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
       fetchPitcherProjections(undefined, env),
     ]);
     const rosterPlayers = myRoster.entries.map((e) => e.player);
-    const projMap = buildProjectionMap(rawBat, rawPit, rosterPlayers, env);
+    const projMap = await buildProjectionMap(rawBat, rawPit, rosterPlayers, env);
     const allVals = computeZScores(projectionsToArray(projMap));
     const valMap = new Map(allVals.map((v) => [v.yahooId, v]));
 
@@ -1092,7 +1122,7 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
   // Reset weekly add budget on Monday
   try {
     const today = new Date().toISOString().slice(0, 10);
-    resetWeeklyBudget(env, today);
+    await resetWeeklyBudget(env, today);
   } catch {}
 
   const lines = [
@@ -1133,7 +1163,7 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
       ipStatus: `${ipInfo.currentIP.toFixed(1)} IP (${ipInfo.above ? "above" : "below"} ${ipInfo.minimum} min${ipInfo.ipNeeded > 0 ? `, need ${ipInfo.ipNeeded.toFixed(1)} more` : ""})`,
       opponentScouting: scoutReport || undefined,
       standings: rankInfo?.label,
-      recentFeedback: getRecentFeedback(env),
+      recentFeedback: await getRecentFeedback(env),
     });
     const prompt = matchupStrategyPrompt(briefing);
     const strategyMemo = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
@@ -1152,7 +1182,7 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
     await sendMessage(env, `Week ${matchup.week} analysis generated but send failed`);
   }
 
-  logDecision(env, {
+  await logDecision(env, {
     type: "lineup",
     action: {
       routine: "weekly_matchup",
@@ -1246,7 +1276,7 @@ export async function runMidWeekAdjustment(env: Env): Promise<void> {
       streaming: `${detailed.streamingDecision.reasoning} (quality floor: ${detailed.streamingDecision.qualityFloor})`,
       ipStatus: `${ipInfo.currentIP.toFixed(1)} IP (${ipInfo.above ? "above" : "below"} ${ipInfo.minimum} min${ipInfo.ipNeeded > 0 ? `, need ${ipInfo.ipNeeded.toFixed(1)} more` : ""})`,
       standings: rankInfo?.label,
-      recentFeedback: getRecentFeedback(env),
+      recentFeedback: await getRecentFeedback(env),
     });
     const prompt = matchupStrategyPrompt(briefing);
     const strategyMemo = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
@@ -1264,7 +1294,7 @@ export async function runMidWeekAdjustment(env: Env): Promise<void> {
     await sendMessage(env, `Week ${matchup.week} mid-week adjustment generated but send failed`);
   }
 
-  logDecision(env, {
+  await logDecision(env, {
     type: "lineup",
     action: {
       routine: "midweek_adjustment",
@@ -1297,7 +1327,7 @@ export async function runTradeEvaluation(env: Env): Promise<void> {
       fetchPitcherProjections(undefined, env),
     ]);
     const rosterPlayers = roster.entries.map((e) => e.player);
-    const projMap = buildProjectionMap(batProj, pitProj, rosterPlayers, env);
+    const projMap = await buildProjectionMap(batProj, pitProj, rosterPlayers, env);
     const projArr = projectionsToArray(projMap);
     const valuations = computeZScores(projArr);
 
@@ -1366,7 +1396,7 @@ export async function runTradeEvaluation(env: Env): Promise<void> {
 
   await sendMessage(env, lines.join("\n"));
 
-  logDecision(env, {
+  await logDecision(env, {
     type: "trade",
     action: { routine: "trade_evaluation" },
     reasoning: lines.join(" | "),
@@ -1382,12 +1412,6 @@ export async function runNewsMonitor(env: Env): Promise<void> {
   const yahoo = new YahooClient(env);
   const today = new Date().toISOString().slice(0, 10);
 
-  // Clear stale keys from previous days
-  if (sentAlertDate !== today) {
-    sentAlertKeys.clear();
-    sentAlertDate = today;
-  }
-
   // 1. Fetch alerts
   let alerts: NewsAlert[];
   try {
@@ -1398,10 +1422,11 @@ export async function runNewsMonitor(env: Env): Promise<void> {
   }
   if (alerts.length === 0) return;
 
-  // 1b. Dedup: filter out alerts already sent this process lifetime (same day)
+  // 1b. Dedup: filter out alerts already sent (KV-backed, 24h TTL)
+  const sentKeys = await getSentAlertKeys(env);
   alerts = alerts.filter((a) => {
     const key = `${a.playerName}:${a.type}:${today}`;
-    return !sentAlertKeys.has(key);
+    return !sentKeys.has(key);
   });
   if (alerts.length === 0) return;
 
@@ -1498,17 +1523,16 @@ export async function runNewsMonitor(env: Env): Promise<void> {
 
   try {
     await sendMessage(env, msg);
-    // Mark all alerts as sent after successful delivery
-    for (const alert of alerts) {
-      sentAlertKeys.add(`${alert.playerName}:${alert.type}:${today}`);
-    }
+    // Mark all alerts as sent after successful delivery (KV-backed, 24h TTL)
+    const newKeys = alerts.map((a) => `${a.playerName}:${a.type}:${today}`);
+    await addSentAlertKeys(env, newKeys);
   } catch (e) {
     console.error("News monitor send failed:", e);
   }
 
   // 5. Log
   try {
-    logDecision(env, {
+    await logDecision(env, {
       type: "waiver",
       action: {
         routine: "news_monitor",
@@ -1578,9 +1602,9 @@ export async function runSundayTactics(env: Env): Promise<void> {
         : "None — all categories still in play",
     streaming: `${detailed.streamingDecision.reasoning} (quality floor: ${detailed.streamingDecision.qualityFloor})`,
     ipStatus: `${ipInfo.currentIP.toFixed(1)} IP (${ipInfo.above ? "above" : "below"} ${ipInfo.minimum} min${ipInfo.ipNeeded > 0 ? `, need ${ipInfo.ipNeeded.toFixed(1)} more` : ""})`,
-    addBudget: `${getAddBudget(env).addsRemaining} adds remaining`,
+    addBudget: `${(await getAddBudget(env)).addsRemaining} adds remaining`,
     standings: rankInfo?.label,
-    recentFeedback: getRecentFeedback(env),
+    recentFeedback: await getRecentFeedback(env),
   });
 
   let aiTactics = "";
@@ -1613,7 +1637,7 @@ export async function runSundayTactics(env: Env): Promise<void> {
     }
   }
 
-  logDecision(env, {
+  await logDecision(env, {
     type: "lineup",
     action: {
       routine: "sunday_tactics",
@@ -1672,7 +1696,7 @@ export async function runTwoStartPreview(env: Env): Promise<void> {
       env,
       `<b>Two-Start Preview</b>\nNo two-start pitchers identified for ${weekStart} — ${weekEnd}. Probables may not be posted yet.`,
     );
-    logDecision(env, {
+    await logDecision(env, {
       type: "stream",
       action: { routine: "two_start_preview", weekStart, weekEnd, count: 0 },
       reasoning: "No two-start pitchers found (probables may not be posted)",
@@ -1695,7 +1719,7 @@ export async function runTwoStartPreview(env: Env): Promise<void> {
   const rostered = twoStarters.filter((p) => !faNames.has(p.name.toLowerCase()));
 
   // Get add budget
-  const budget = getAddBudget(env);
+  const budget = await getAddBudget(env);
 
   const weekLabel = nextWeek > 0 ? ` — Week ${nextWeek}` : "";
   const lines = [
@@ -1741,7 +1765,7 @@ export async function runTwoStartPreview(env: Env): Promise<void> {
     }
   }
 
-  logDecision(env, {
+  await logDecision(env, {
     type: "stream",
     action: {
       routine: "two_start_preview",
@@ -1760,15 +1784,13 @@ export async function runTwoStartPreview(env: Env): Promise<void> {
 // Decision logging
 // ---------------------------------------------------------------------------
 
-export function logDecision(env: Env, decision: Decision): void {
-  env.db
-    .prepare("INSERT INTO decisions (type, action, reasoning, result) VALUES (?, ?, ?, ?)")
-    .run(
-      decision.type,
-      JSON.stringify(decision.action),
-      decision.reasoning ?? null,
-      decision.result,
-    );
+export async function logDecision(env: Env, decision: Decision): Promise<void> {
+  await env.db.insert(decisionsTable).values({
+    type: decision.type,
+    action: JSON.stringify(decision.action),
+    reasoning: decision.reasoning ?? null,
+    result: decision.result,
+  });
 }
 
 // ---------------------------------------------------------------------------

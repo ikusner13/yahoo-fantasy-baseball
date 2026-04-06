@@ -160,7 +160,7 @@ function makeClient() {
     YAHOO_TEAM_ID: "12",
     TELEGRAM_BOT_TOKEN: "",
     TELEGRAM_CHAT_ID: "",
-    DATA_DIR: "/tmp",
+    KV: null as any,
     db: null as any,
   });
 }

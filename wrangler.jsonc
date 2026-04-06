@@ -1,0 +1,45 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "fantasy-baseball",
+  "main": "src/worker.tsx",
+  "compatibility_date": "2025-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fantasy-baseball",
+      "database_id": "<create-with-wrangler-d1-create>",
+      "migrations_dir": "./drizzle",
+    },
+  ],
+
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "<create-with-wrangler-kv-namespace-create>",
+    },
+  ],
+
+  "triggers": {
+    "crons": [
+      "0 13 * * *",
+      "0 22 * * *",
+      "0 14 * * 1",
+      "0 19 * * 3",
+      "0 14 * * 6",
+      "0 14 * * 0",
+      "0 14 * * 5",
+      "15,45 13-23 * * *",
+    ],
+  },
+
+  // Non-secret env vars
+  "vars": {
+    "YAHOO_LEAGUE_ID": "62744",
+    "YAHOO_TEAM_ID": "12",
+    "TELEGRAM_CHAT_ID": "8201735333",
+  },
+  // Secrets (set via `wrangler secret put`):
+  // YAHOO_CLIENT_ID, YAHOO_CLIENT_SECRET, TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY
+}

@@ -1,5 +1,4 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import tuningOverrides from "../../config/tuning.json";
 
 // --- Interfaces ---
 
@@ -72,21 +71,13 @@ const DEFAULTS: TuningConfig = {
 
 // --- Core export ---
 
-/**
- * Load tuning config from config/tuning.json with fallback defaults.
- * Re-reads from disk on every call (no caching) so changes take effect immediately.
- */
+const parsed = tuningOverrides as Partial<TuningConfig>;
+
 export function loadTuning(): TuningConfig {
-  try {
-    const raw = readFileSync(join(process.cwd(), "config", "tuning.json"), "utf-8");
-    const parsed = JSON.parse(raw) as Partial<TuningConfig>;
-    return {
-      streaming: { ...DEFAULTS.streaming, ...parsed.streaming },
-      budget: { ...DEFAULTS.budget, ...parsed.budget },
-      matchup: { ...DEFAULTS.matchup, ...parsed.matchup },
-      llm: { ...DEFAULTS.llm, ...parsed.llm },
-    };
-  } catch {
-    return DEFAULTS;
-  }
+  return {
+    streaming: { ...DEFAULTS.streaming, ...parsed.streaming },
+    budget: { ...DEFAULTS.budget, ...parsed.budget },
+    matchup: { ...DEFAULTS.matchup, ...parsed.matchup },
+    llm: { ...DEFAULTS.llm, ...parsed.llm },
+  };
 }

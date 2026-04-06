@@ -7,9 +7,9 @@
   "license": "ISC",
   "author": "",
   "scripts": {
-    "dev": "tsx watch src/index.tsx",
-    "start": "tsx src/index.tsx",
-    "typecheck": "tsc --noEmit",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit -p tsconfig.worker.json",
     "test": "vp test run",
     "test:watch": "vp test",
     "eval": "evalite",
@@ -19,26 +19,27 @@
     "eval:matchup": "evalite tests/evals/matchup-strategy.eval.ts",
     "eval:trade": "evalite tests/evals/trade-proposal.eval.ts",
     "eval:injury": "evalite tests/evals/injury-assessment.eval.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
     "prepare": "vp config"
   },
   "dependencies": {
-    "@hono/node-server": "^1.19.12",
-    "better-sqlite3": "^12.8.0",
-    "csv-parse": "^6.2.1",
-    "hono": "^4.12.10",
-    "node-cron": "^4.2.1"
+    "drizzle-orm": "^0.44.0",
+    "hono": "^4.12.10"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
+    "@cloudflare/workers-types": "^4.20250620.0",
     "@types/node": "^25.5.2",
-    "@types/node-cron": "^3.0.11",
     "dotenv": "^17.4.0",
+    "drizzle-kit": "^0.31.0",
     "evalite": "^0.19.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2",
     "vite": "catalog:",
     "vite-plus": "catalog:",
-    "vitest": "catalog:"
+    "vitest": "catalog:",
+    "wrangler": "^4.22.0"
   },
   "packageManager": "pnpm@10.33.0"
 }

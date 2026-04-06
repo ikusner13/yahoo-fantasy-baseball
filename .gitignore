@@ -1,6 +1,8 @@
 node_modules/
 dist/
 config.json
-data/
+/data/
 tests/evals/results-*.json
 .env
+.wrangler/
+drizzle/

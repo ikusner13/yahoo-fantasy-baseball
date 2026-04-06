@@ -104,12 +104,12 @@ function formatDetailedCategories(detailed: DetailedMatchupAnalysis): string {
     .join("\n");
 }
 
-function buildProjectionMap(
+async function buildProjectionMap(
   batters: Awaited<ReturnType<typeof fetchBatterProjections>>,
   pitchers: Awaited<ReturnType<typeof fetchPitcherProjections>>,
   rosterPlayers?: Array<{ yahooId: string; name: string; team: string }>,
   env?: Env,
-): { map: Map<string, PlayerProjection>; matchCount: number } {
+): Promise<{ map: Map<string, PlayerProjection>; matchCount: number }> {
   const map = new Map<string, PlayerProjection>();
   const now = new Date().toISOString();
   let matchCount = 0;
@@ -142,7 +142,7 @@ function buildProjectionMap(
         };
       });
       try {
-        upsertPlayerIds(env, rows);
+        await upsertPlayerIds(env, rows);
       } catch {
         // non-fatal
       }
@@ -204,7 +204,7 @@ export async function simulateDay(env: Env, date: string): Promise<SimulationRes
 
   // 5. Build projection map with player ID matching
   const rosterForMatch = roster.entries.map((e) => e.player);
-  const { map: projectionMap, matchCount } = buildProjectionMap(
+  const { map: projectionMap, matchCount } = await buildProjectionMap(
     rawBatters,
     rawPitchers,
     rosterForMatch,
@@ -236,7 +236,7 @@ export async function simulateDay(env: Env, date: string): Promise<SimulationRes
     const p = entry.player;
     let mlbId = p.mlbId;
     if (!mlbId) {
-      const row = lookupByYahooId(env, p.yahooId);
+      const row = await lookupByYahooId(env, p.yahooId);
       if (row?.mlbId) mlbId = row.mlbId;
     }
     if (mlbId) {
@@ -428,7 +428,7 @@ export async function simulateDay(env: Env, date: string): Promise<SimulationRes
   // 14. Build the full matchup briefing (what the LLM would see)
   let llmBriefing: string | undefined;
   try {
-    const budget = getAddBudget(env);
+    const budget = await getAddBudget(env);
     const myVals = roster.entries
       .map((e) => valMap.get(e.player.yahooId))
       .filter((v): v is PlayerValuation => !!v);

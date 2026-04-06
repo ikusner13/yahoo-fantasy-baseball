@@ -1,9 +1,11 @@
-import type Database from "better-sqlite3";
+import type { DrizzleD1Database } from "drizzle-orm/d1";
+import type * as schema from "./db/schema";
 
 // --- App config ---
 
 export interface Env {
-  db: Database.Database;
+  db: DrizzleD1Database<typeof schema>;
+  KV: KVNamespace;
   YAHOO_CLIENT_ID: string;
   YAHOO_CLIENT_SECRET: string;
   TELEGRAM_BOT_TOKEN: string;
@@ -14,7 +16,6 @@ export interface Env {
   OPENAI_API_KEY?: string;
   OPENROUTER_API_KEY?: string;
   ODDS_API_KEY?: string;
-  DATA_DIR: string; // path to store tokens, cache, etc.
 }
 
 // --- Roster positions ---
