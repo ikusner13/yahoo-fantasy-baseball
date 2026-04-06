@@ -3,31 +3,20 @@
  * NO Yahoo writes, NO Telegram sends, NO LLM calls. Pure deterministic analysis.
  */
 
-import type {
-  Env,
-  PlayerProjection,
-  PlayerValuation,
-} from "./types";
+import type { Env, PlayerProjection, PlayerValuation } from "./types";
 import { YahooClient } from "./yahoo/client";
 import { getTodaysGames } from "./data/mlb";
 import { fetchBatterProjections, fetchPitcherProjections } from "./data/projections";
 import { computeZScores } from "./analysis/valuations";
 import { optimizeLineup, scorePlayerForToday, type ScoringContext } from "./analysis/lineup";
-import {
-  analyzeMatchupDetailed,
-  type DetailedMatchupAnalysis,
-} from "./analysis/matchup";
+import { analyzeMatchupDetailed, type DetailedMatchupAnalysis } from "./analysis/matchup";
 import { rankStreamingOptions, estimateStreamingImpact, getIPStatus } from "./analysis/streaming";
 import { findBestPickups } from "./analysis/waivers";
 import { buildPlayerIdMap } from "./data/player-match";
 import { lookupByYahooId, upsertPlayerIds } from "./data/player-ids";
 import type { PlayerIdRow } from "./data/player-ids";
 import { getBatterStatcast } from "./data/statcast";
-import {
-  getParkFactor,
-  getPitcherHand,
-  getBatchPlatoonSplits,
-} from "./data/matchup-data";
+import { getParkFactor, getPitcherHand, getBatchPlatoonSplits } from "./data/matchup-data";
 import {
   computeStreaks,
   getStreakSummary,
@@ -231,10 +220,7 @@ export async function simulateDay(env: Env, date: string): Promise<SimulationRes
   // 7. Compute daysRemaining from matchup dates
   const weekEnd = new Date(matchup.weekEnd);
   const simDate = new Date(date);
-  const daysRemaining = Math.max(
-    0,
-    Math.ceil((weekEnd.getTime() - simDate.getTime()) / 86400000),
-  );
+  const daysRemaining = Math.max(0, Math.ceil((weekEnd.getTime() - simDate.getTime()) / 86400000));
 
   // 8. Detailed matchup analysis
   const currentIP = getCurrentIP(matchup);
@@ -458,10 +444,7 @@ export async function simulateDay(env: Env, date: string): Promise<SimulationRes
         parts.push(
           `Hot: ${hot
             .slice(0, 3)
-            .map(
-              (s) =>
-                `${s.name} (.${(s.recentXwoba * 1000).toFixed(0)} xwOBA)`,
-            )
+            .map((s) => `${s.name} (.${(s.recentXwoba * 1000).toFixed(0)} xwOBA)`)
             .join(", ")}`,
         );
       }
@@ -469,10 +452,7 @@ export async function simulateDay(env: Env, date: string): Promise<SimulationRes
         parts.push(
           `Cold: ${cold
             .slice(0, 3)
-            .map(
-              (s) =>
-                `${s.name} (.${(s.recentXwoba * 1000).toFixed(0)} xwOBA)`,
-            )
+            .map((s) => `${s.name} (.${(s.recentXwoba * 1000).toFixed(0)} xwOBA)`)
             .join(", ")}`,
         );
       }

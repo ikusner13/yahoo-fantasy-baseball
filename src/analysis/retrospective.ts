@@ -94,7 +94,8 @@ export function buildRetrospective(
     const predictedState = pred?.state ?? "unknown";
     const expected = pred ? predictedToExpected(pred.state) : "tied";
     // Correct if predicted outcome matches actual, or swing and any result
-    const correct = predictedState === "unknown" ? false : expected === actual || predictedState === "swing";
+    const correct =
+      predictedState === "unknown" ? false : expected === actual || predictedState === "swing";
 
     predictions.push({
       category: cs.category,
@@ -126,8 +127,13 @@ export function buildRetrospective(
 
   // Biggest misses: predicted safe/clinched but lost, or predicted lost but won
   const bigMisses = predictions.filter((p) => {
-    if ((p.predictedState === "safe" || p.predictedState === "clinched") && p.actualResult === "lost") return true;
-    if ((p.predictedState === "lost" || p.predictedState === "losing") && p.actualResult === "won") return true;
+    if (
+      (p.predictedState === "safe" || p.predictedState === "clinched") &&
+      p.actualResult === "lost"
+    )
+      return true;
+    if ((p.predictedState === "lost" || p.predictedState === "losing") && p.actualResult === "won")
+      return true;
     return false;
   });
 
@@ -140,7 +146,9 @@ export function buildRetrospective(
   }
 
   if (correctCount < total * 0.5) {
-    lessons.push(`Low prediction accuracy (${correctCount}/${total}) — engine thresholds may need tuning`);
+    lessons.push(
+      `Low prediction accuracy (${correctCount}/${total}) — engine thresholds may need tuning`,
+    );
   }
 
   const outcome = wins > losses ? "WIN" : wins < losses ? "LOSS" : "TIE";
@@ -169,11 +177,15 @@ export function formatRetrospectiveForTelegram(retro: WeeklyRetrospective): stri
   ];
 
   // Biggest misses
-  const misses = retro.predictions.filter((p) => !p.correct && p.predictedState !== "unknown" && p.predictedState !== "swing");
+  const misses = retro.predictions.filter(
+    (p) => !p.correct && p.predictedState !== "unknown" && p.predictedState !== "swing",
+  );
   if (misses.length > 0) {
     lines.push("Biggest misses:");
     for (const m of misses.slice(0, 5)) {
-      lines.push(`  \u2022 Predicted ${m.category} as ${m.predictedState}, actually ${m.actualResult}`);
+      lines.push(
+        `  \u2022 Predicted ${m.category} as ${m.predictedState}, actually ${m.actualResult}`,
+      );
     }
   }
 

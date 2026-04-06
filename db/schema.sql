@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS decisions (
   type TEXT NOT NULL,       -- 'lineup' | 'waiver' | 'stream' | 'trade' | 'il'
   action TEXT NOT NULL,     -- JSON: what was done
   reasoning TEXT,           -- LLM reasoning or stats summary
-  result TEXT NOT NULL      -- 'success' | 'failed' | 'pending_approval'
+  result TEXT NOT NULL      -- 'success' | 'failed' | 'pending_approval' | 'notified'
 );
 
 CREATE INDEX IF NOT EXISTS idx_decisions_type ON decisions(type);

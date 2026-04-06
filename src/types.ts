@@ -181,7 +181,7 @@ export interface Decision {
   type: DecisionType;
   action: Record<string, unknown>;
   reasoning?: string;
-  result: "success" | "failed" | "pending_approval";
+  result: "success" | "failed" | "pending_approval" | "notified";
 }
 
 // --- Yahoo API tokens ---

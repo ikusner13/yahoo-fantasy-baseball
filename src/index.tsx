@@ -7,7 +7,6 @@ import { join } from "node:path";
 import type { Env } from "./types";
 import { handleTelegramWebhook } from "./notifications/telegram";
 import { getAuthUrl, handleCallback } from "./yahoo/auth";
-import { startBrowserLogin } from "./yahoo/browser";
 import { runTestSuite } from "./test-harness";
 import {
   runDailyMorning,
@@ -121,12 +120,6 @@ app.get("/test", (c) => {
   const dryRun = c.req.query("apply") !== "1";
   const date = c.req.query("date") ?? undefined;
   return runTestSuite(env, dryRun, date);
-});
-
-// GET /auth/browser — interactive browser login for Yahoo session
-app.get("/auth/browser", async (c) => {
-  const result = await startBrowserLogin(env);
-  return c.text(result.message, result.success ? 200 : 500);
 });
 
 // GET /health

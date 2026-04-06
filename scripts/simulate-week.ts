@@ -89,9 +89,13 @@ function getDatesInRange(start: string, end: string): string[] {
 
 // --- Formatters ---
 
-function formatCategoryState(
-  states: SimulationResult["matchupState"]["categoryStates"],
-): { clinched: string[]; swing: string[]; lost: string[]; safe: string[]; losing: string[] } {
+function formatCategoryState(states: SimulationResult["matchupState"]["categoryStates"]): {
+  clinched: string[];
+  swing: string[];
+  lost: string[];
+  safe: string[];
+  losing: string[];
+} {
   const clinched: string[] = [];
   const safe: string[] = [];
   const swing: string[] = [];
@@ -244,12 +248,8 @@ async function main() {
   // Track how categories evolved over the week
   if (results.length > 1) {
     const first = results[0];
-    const firstCats = new Map(
-      first.matchupState.categoryStates.map((c) => [c.category, c]),
-    );
-    const finalCats = new Map(
-      final.matchupState.categoryStates.map((c) => [c.category, c]),
-    );
+    const firstCats = new Map(first.matchupState.categoryStates.map((c) => [c.category, c]));
+    const finalCats = new Map(final.matchupState.categoryStates.map((c) => [c.category, c]));
 
     const flipped: string[] = [];
     const couldHaveFlipped: string[] = [];
@@ -261,16 +261,16 @@ async function main() {
 
       const wasSwing = firstState.state === "swing";
       const wasLosing = firstState.state === "losing";
-      const isNowWinning =
-        finalState.state === "clinched" || finalState.state === "safe";
-      const isNowLost =
-        finalState.state === "lost" || finalState.state === "losing";
+      const isNowWinning = finalState.state === "clinched" || finalState.state === "safe";
+      const isNowLost = finalState.state === "lost" || finalState.state === "losing";
       const isSwing = finalState.state === "swing";
 
       if ((wasSwing || wasLosing) && isNowWinning) {
         flipped.push(cat);
       } else if (isSwing && Math.abs(finalState.margin) <= 2) {
-        couldHaveFlipped.push(`${cat} (margin: ${finalState.margin >= 0 ? "+" : ""}${finalState.margin.toFixed(0)})`);
+        couldHaveFlipped.push(
+          `${cat} (margin: ${finalState.margin >= 0 ? "+" : ""}${finalState.margin.toFixed(0)})`,
+        );
       } else if (isNowLost && (wasSwing || wasLosing)) {
         correctlyLost.push(cat);
       }
@@ -288,20 +288,10 @@ async function main() {
   }
 
   // Aggregated recommendations
-  const totalWaiverRecs = results.reduce(
-    (sum, r) => sum + r.waiverRecommendations.length,
-    0,
-  );
-  const totalStreamCandidates = results.reduce(
-    (sum, r) => sum + r.streamingCandidates.length,
-    0,
-  );
-  console.log(
-    `\nTotal waiver recommendations: ${totalWaiverRecs}`,
-  );
-  console.log(
-    `Total streaming candidates evaluated: ${totalStreamCandidates}`,
-  );
+  const totalWaiverRecs = results.reduce((sum, r) => sum + r.waiverRecommendations.length, 0);
+  const totalStreamCandidates = results.reduce((sum, r) => sum + r.streamingCandidates.length, 0);
+  console.log(`\nTotal waiver recommendations: ${totalWaiverRecs}`);
+  console.log(`Total streaming candidates evaluated: ${totalStreamCandidates}`);
 
   // Player ID match quality
   console.log(

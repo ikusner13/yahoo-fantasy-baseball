@@ -24,8 +24,8 @@ const LEAGUE_AVG_K_PCT = 22.7;
 // --- Composite signal weights ---
 const W_BARREL = 0.35;
 const W_HARD_HIT = 0.25;
-const W_EXIT_VELO = 0.20;
-const W_K_PCT = 0.20;
+const W_EXIT_VELO = 0.2;
+const W_K_PCT = 0.2;
 
 // --- Structural change threshold (in SDs) ---
 const STRUCTURAL_CHANGE_SD = 1.5;
@@ -102,15 +102,12 @@ export function computeStreaks(
     // Barrel%, hardHit%, exitVelo: positive delta = hot (higher is better)
     // K%: INVERTED — positive delta = cold (higher K% is worse)
 
-    const barrelZ = sdBarrel > 0
-      ? clamp((sc.barrelPct - LEAGUE_AVG_BARREL_PCT) / sdBarrel, -1, 1)
-      : 0;
-    const hardHitZ = sdHardHit > 0
-      ? clamp((sc.hardHitPct - LEAGUE_AVG_HARD_HIT_PCT) / sdHardHit, -1, 1)
-      : 0;
-    const exitVeloZ = sdExitVelo > 0
-      ? clamp((sc.exitVelo - LEAGUE_AVG_EXIT_VELO) / sdExitVelo, -1, 1)
-      : 0;
+    const barrelZ =
+      sdBarrel > 0 ? clamp((sc.barrelPct - LEAGUE_AVG_BARREL_PCT) / sdBarrel, -1, 1) : 0;
+    const hardHitZ =
+      sdHardHit > 0 ? clamp((sc.hardHitPct - LEAGUE_AVG_HARD_HIT_PCT) / sdHardHit, -1, 1) : 0;
+    const exitVeloZ =
+      sdExitVelo > 0 ? clamp((sc.exitVelo - LEAGUE_AVG_EXIT_VELO) / sdExitVelo, -1, 1) : 0;
 
     // K%: use population avg as baseline when player kPct available, else 0 weight
     let kPctZ = 0;
@@ -123,13 +120,18 @@ export function computeStreaks(
 
     // Renormalize weights if kPct unavailable
     const totalWeight = W_BARREL + W_HARD_HIT + W_EXIT_VELO + effectiveKWeight;
-    const streakScore = totalWeight > 0
-      ? clamp(
-          (barrelZ * W_BARREL + hardHitZ * W_HARD_HIT + exitVeloZ * W_EXIT_VELO + kPctZ * effectiveKWeight) / totalWeight,
-          -1,
-          1,
-        )
-      : 0;
+    const streakScore =
+      totalWeight > 0
+        ? clamp(
+            (barrelZ * W_BARREL +
+              hardHitZ * W_HARD_HIT +
+              exitVeloZ * W_EXIT_VELO +
+              kPctZ * effectiveKWeight) /
+              totalWeight,
+            -1,
+            1,
+          )
+        : 0;
 
     // Confidence: Savant leaderboard min is 25 PA. Scale linearly to 1.0 at 100 PA.
     // Since the leaderboard doesn't expose PA directly, use exitVelo as proxy for

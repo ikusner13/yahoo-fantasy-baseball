@@ -93,10 +93,7 @@ const ROSTERS_FIXTURE = {
                             { name: { full: "Aaron Judge" } },
                             { editorial_team_abbr: "NYY" },
                             {
-                              eligible_positions: [
-                                { position: "OF" },
-                                { position: "Util" },
-                              ],
+                              eligible_positions: [{ position: "OF" }, { position: "Util" }],
                             },
                           ],
                         ],
@@ -108,9 +105,7 @@ const ROSTERS_FIXTURE = {
                             { name: { full: "Shohei Ohtani" } },
                             { editorial_team_abbr: "LAD" },
                             {
-                              eligible_positions: [
-                                { position: "Util" },
-                              ],
+                              eligible_positions: [{ position: "Util" }],
                             },
                           ],
                         ],
@@ -136,10 +131,7 @@ const ROSTERS_FIXTURE = {
                             { name: { full: "Mookie Betts" } },
                             { editorial_team_abbr: "LAD" },
                             {
-                              eligible_positions: [
-                                { position: "SS" },
-                                { position: "OF" },
-                              ],
+                              eligible_positions: [{ position: "SS" }, { position: "OF" }],
                             },
                           ],
                         ],

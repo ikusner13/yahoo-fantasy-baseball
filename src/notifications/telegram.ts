@@ -83,7 +83,9 @@ async function handleFeedbackCommand(env: Env, chatId: number, text: string): Pr
   let week: number | null = null;
   try {
     const row = env.db
-      .prepare("SELECT json_extract(action, '$.week') as week FROM decisions WHERE type = 'lineup' ORDER BY timestamp DESC LIMIT 1")
+      .prepare(
+        "SELECT json_extract(action, '$.week') as week FROM decisions WHERE type = 'lineup' ORDER BY timestamp DESC LIMIT 1",
+      )
       .get() as { week: number } | undefined;
     if (row?.week) week = row.week;
   } catch {
@@ -96,7 +98,11 @@ async function handleFeedbackCommand(env: Env, chatId: number, text: string): Pr
       .run(type, message, week);
     await sendReply(env, chatId, `Logged ${type} feedback${week ? ` (week ${week})` : ""}`);
   } catch (e) {
-    await sendReply(env, chatId, `Failed to save feedback: ${e instanceof Error ? e.message : "unknown"}`);
+    await sendReply(
+      env,
+      chatId,
+      `Failed to save feedback: ${e instanceof Error ? e.message : "unknown"}`,
+    );
   }
 }
 

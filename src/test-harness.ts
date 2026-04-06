@@ -1,7 +1,6 @@
 import type { Env, PlayerProjection, Roster } from "./types";
 import { YahooClient } from "./yahoo/client";
 import { getValidToken } from "./yahoo/auth";
-import { setLineupViaBrowser } from "./yahoo/browser";
 import { getTodaysGames, getInjuries } from "./data/mlb";
 import { optimizeLineup } from "./analysis/lineup";
 import { simulateDay, type SimulationResult } from "./simulation";
@@ -132,7 +131,10 @@ export async function runTestSuite(
         `Streaming: ${simResult.matchupState.streamingDecision.reasoning}`,
         `IP: ${simResult.matchupState.ipStatus.currentIP.toFixed(1)} (${simResult.matchupState.ipStatus.above ? "above" : "below"} min)`,
         `Lineup: ${simResult.lineupDecisions.starters.length} starters, ${simResult.lineupDecisions.benched.length} benched`,
-        `Top starters: ${simResult.lineupDecisions.starters.slice(0, 5).map((s) => `${s.name} (${s.position}, ${s.score.toFixed(2)})`).join(", ")}`,
+        `Top starters: ${simResult.lineupDecisions.starters
+          .slice(0, 5)
+          .map((s) => `${s.name} (${s.position}, ${s.score.toFixed(2)})`)
+          .join(", ")}`,
         `Benched: ${simResult.lineupDecisions.benched.map((b) => `${b.name} (${b.reason})`).join(", ") || "none"}`,
         `Park boosts: ${simResult.lineupDecisions.parkFactors.length} players`,
         `Platoon matches: ${simResult.lineupDecisions.platoonMatches}`,
@@ -180,8 +182,7 @@ export async function runTestSuite(
       if (!simResult) throw new Error("Simulation not run");
       const briefing = simResult.llmBriefing;
       if (!briefing) throw new Error("No LLM briefing generated");
-      if (briefing.length < 100)
-        throw new Error(`Briefing too short (${briefing.length} chars)`);
+      if (briefing.length < 100) throw new Error(`Briefing too short (${briefing.length} chars)`);
 
       const expectedSections = ["WORTHLESS", "STREAMING", "IP STATUS"];
       const missing = expectedSections.filter((s) => !briefing.includes(s));
@@ -194,19 +195,12 @@ export async function runTestSuite(
   // --- 13. Set Lineup (only if ?apply=1) ---
   if (!dryRun && roster) {
     results.push(
-      await runTest("SET LINEUP — apply via browser (LIVE)", async () => {
+      await runTest("SET LINEUP — apply via API (LIVE)", async () => {
         const games = await getTodaysGames(today);
         const projMap = new Map<string, PlayerProjection>();
         const moves = optimizeLineup(roster!, projMap, games);
-        try {
-          await yahoo.setLineup(today, moves);
-          return `Applied ${moves.length} lineup moves via API for ${today}`;
-        } catch {
-          const result = await setLineupViaBrowser(env, today, moves);
-          const debugInfo = result.debug ? `\n${result.debug}` : "";
-          if (!result.success) throw new Error(`${result.message}${debugInfo}`);
-          return `${result.message} (via browser)${debugInfo}`;
-        }
+        await yahoo.setLineup(today, moves);
+        return `Applied ${moves.length} lineup moves via API for ${today}`;
       }),
     );
   } else {

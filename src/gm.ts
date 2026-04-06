@@ -9,6 +9,14 @@ import type {
 import { YahooClient } from "./yahoo/client";
 import { getTodaysGames } from "./data/mlb";
 import { sendMessage } from "./notifications/telegram";
+import {
+  formatLineupNotification,
+  formatILNotification,
+  formatPickupNotification,
+  formatStreamingNotification,
+  formatLateScratchNotification,
+  type PickupNotificationItem,
+} from "./notifications/action-messages";
 import { getILMoves, countILSlots, getInjuredActivePlayers } from "./analysis/il-manager";
 import { optimizeLineup, type ScoringContext } from "./analysis/lineup";
 import {
@@ -53,7 +61,12 @@ import { buildPlayerIdMap } from "./data/player-match";
 import { upsertPlayerIds, lookupByYahooId } from "./data/player-ids";
 import type { PlayerIdRow } from "./data/player-ids";
 import { getBatterStatcast } from "./data/statcast";
-import { getParkFactor, getPitcherHand, getBatchPlatoonSplits, type PlatoonSplit } from "./data/matchup-data";
+import {
+  getParkFactor,
+  getPitcherHand,
+  getBatchPlatoonSplits,
+  type PlatoonSplit,
+} from "./data/matchup-data";
 import { buildRetrospective, formatRetrospectiveForTelegram } from "./analysis/retrospective";
 import { loadTuning } from "./config/tuning";
 
@@ -404,7 +417,6 @@ export async function runDailyMorning(env: Env): Promise<void> {
   const rosterMlbIds = [...yahooToMlb.values()];
 
   try {
-
     if (rosterMlbIds.length > 0) {
       // Fetch Statcast batter data (1 HTTP call, cached per day)
       const statcast = await getBatterStatcast(rosterMlbIds, 2026, env);
@@ -588,11 +600,12 @@ export async function runDailyMorning(env: Env): Promise<void> {
 
       if (ilMoves.length > 0) {
         try {
-          await yahoo.setLineup(today, ilMoves);
-          summaryLines.push(`IL moves executed: ${ilMoves.length}`);
+          const ilMsg = formatILNotification(env, ilActions, ilMoves);
+          await sendMessage(env, ilMsg);
+          summaryLines.push(`IL moves notified: ${ilMoves.length}`);
         } catch (e) {
           summaryLines.push(
-            `IL move execution failed: ${e instanceof Error ? e.message : "unknown"}`,
+            `IL notification failed: ${e instanceof Error ? e.message : "unknown"}`,
           );
         }
       }
@@ -603,7 +616,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
       type: "il",
       action: { ilActions },
       reasoning: ilActions.map((a) => a.reasoning).join("; ") || "no moves",
-      result: "success",
+      result: ilActions.length > 0 ? "notified" : "success",
     });
   } catch (e) {
     summaryLines.push(`IL check failed: ${e instanceof Error ? e.message : "unknown"}`);
@@ -613,9 +626,12 @@ export async function runDailyMorning(env: Env): Promise<void> {
   try {
     const moves = optimizeLineup(roster, projectionMap, games, matchup, streakMap, contextMap);
     if (moves.length > 0) {
-      await yahoo.setLineup(today, moves);
+      const lineupMsg = formatLineupNotification(env, today, moves, roster);
+      await sendMessage(env, lineupMsg);
       const activeCount = moves.filter((m) => m.position !== "BN" && m.position !== "IL").length;
-      summaryLines.push(`Lineup set: ${activeCount} active, ${moves.length} total moves`);
+      summaryLines.push(
+        `Lineup changes notified: ${activeCount} active, ${moves.length} total moves`,
+      );
     } else {
       summaryLines.push("Lineup: no changes needed");
     }
@@ -650,7 +666,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
       type: "lineup",
       action: { moves: moves.length },
       reasoning: `Set ${moves.length} lineup moves`,
-      result: "success",
+      result: moves.length > 0 ? "notified" : "success",
     });
   } catch (e) {
     summaryLines.push(`Lineup optimization failed: ${e instanceof Error ? e.message : "unknown"}`);
@@ -676,6 +692,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
         summaryLines.push(
           `\n<b>Waiver Picks (${pickups.length}):</b> [${budget.addsRemaining} adds left this week]`,
         );
+        const pickupNotifications: PickupNotificationItem[] = [];
         for (const rec of pickups) {
           const reasoningLower = rec.reasoning.toLowerCase();
           const priority = classifyAddPriority(rec, {
@@ -695,44 +712,39 @@ export async function runDailyMorning(env: Env): Promise<void> {
             continue;
           }
 
-          // Execute high-value pickups
-          if (shouldUseWaiverPriority(rec, 5)) {
-            try {
-              await yahoo.claimWaiver(rec.add.yahooId, rec.drop.yahooId);
-              summaryLines.push(`  -> Waiver claim submitted`);
-              recordAdd(env);
-              decisions.push({
-                type: "waiver",
-                action: { add: rec.add.name, drop: rec.drop.name, net: rec.netValue },
-                reasoning: rec.reasoning,
-                result: "success",
-              });
-            } catch (e) {
-              summaryLines.push(`  -> Claim failed: ${e instanceof Error ? e.message : "unknown"}`);
-              decisions.push({
-                type: "waiver",
-                action: { add: rec.add.name, drop: rec.drop.name },
-                reasoning: rec.reasoning,
-                result: "failed",
-              });
-            }
-          } else {
-            // Low priority — use add/drop (instant FA pickup)
-            try {
-              await yahoo.addDrop(rec.add.yahooId, rec.drop.yahooId);
-              summaryLines.push(`  -> Add/drop executed`);
-              recordAdd(env);
-              decisions.push({
-                type: "waiver",
-                action: { add: rec.add.name, drop: rec.drop.name, net: rec.netValue },
-                reasoning: rec.reasoning,
-                result: "success",
-              });
-            } catch (e) {
-              summaryLines.push(
-                `  -> Add/drop failed: ${e instanceof Error ? e.message : "unknown"}`,
-              );
-            }
+          const method = shouldUseWaiverPriority(rec, 5)
+            ? ("waiver" as const)
+            : ("add/drop" as const);
+          pickupNotifications.push({
+            addName: rec.add.name,
+            dropName: rec.drop.name,
+            netValue: rec.netValue,
+            priority,
+            reasoning: rec.reasoning,
+            method,
+          });
+          recordAdd(env);
+          decisions.push({
+            type: "waiver",
+            action: { add: rec.add.name, drop: rec.drop.name, net: rec.netValue },
+            reasoning: rec.reasoning,
+            result: "notified",
+          });
+        }
+
+        if (pickupNotifications.length > 0) {
+          try {
+            const pickupMsg = formatPickupNotification(
+              env,
+              pickupNotifications,
+              budget.addsRemaining,
+            );
+            await sendMessage(env, pickupMsg);
+            summaryLines.push(`  -> ${pickupNotifications.length} pickup(s) notified`);
+          } catch (e) {
+            summaryLines.push(
+              `  -> Pickup notification failed: ${e instanceof Error ? e.message : "unknown"}`,
+            );
           }
         }
 
@@ -838,9 +850,17 @@ export async function runDailyMorning(env: Env): Promise<void> {
           if (benchPitchers.length > 0) {
             const dropTarget = benchPitchers[benchPitchers.length - 1];
             try {
-              await yahoo.addDrop(top.player.yahooId, dropTarget.player.yahooId);
+              const streamMsg = formatStreamingNotification(
+                env,
+                top.player.name,
+                top.opponent,
+                top.score,
+                dropTarget.player.name,
+                streamReasoning,
+              );
+              await sendMessage(env, streamMsg);
               recordAdd(env);
-              summaryLines.push(`  -> Added, dropping ${dropTarget.player.name}`);
+              summaryLines.push(`  -> Streaming pickup notified, drop ${dropTarget.player.name}`);
               decisions.push({
                 type: "stream",
                 action: {
@@ -850,11 +870,11 @@ export async function runDailyMorning(env: Env): Promise<void> {
                   opponent: top.opponent,
                 },
                 reasoning: `Streaming ${top.player.name} vs ${top.opponent} (score ${top.score.toFixed(1)}, ${streamReasoning})`,
-                result: "success",
+                result: "notified",
               });
             } catch (e) {
               summaryLines.push(
-                `  -> Stream add failed: ${e instanceof Error ? e.message : "unknown"}`,
+                `  -> Stream notification failed: ${e instanceof Error ? e.message : "unknown"}`,
               );
             }
           } else {
@@ -949,8 +969,9 @@ export async function runLateScratchCheck(env: Env): Promise<void> {
     try {
       const moves = optimizeLineup(roster, new Map(), games);
       if (moves.length > 0) {
-        await yahoo.setLineup(today, moves);
-        changes.push(`Lineup re-optimized: ${moves.length} moves`);
+        const scratchMsg = formatLateScratchNotification(env, today, moves, injured, roster);
+        await sendMessage(env, scratchMsg);
+        changes.push(`Lineup re-optimization notified: ${moves.length} moves`);
       }
     } catch (e) {
       changes.push(`Re-optimization failed: ${e instanceof Error ? e.message : "unknown"}`);
@@ -969,7 +990,7 @@ export async function runLateScratchCheck(env: Env): Promise<void> {
       type: "lineup",
       action: { routine: "late_scratch", changes },
       reasoning: `${changes.length} late changes detected`,
-      result: "success",
+      result: "notified",
     });
   }
 }

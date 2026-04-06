@@ -169,9 +169,7 @@ export async function checkMLBTransactions(_env: Env): Promise<NewsAlert[]> {
  */
 export async function checkRSSFeeds(): Promise<NewsAlert[]> {
   // RotoWire RSS removed — paywalled, returns HTML instead of XML
-  const feeds = [
-    "https://www.mlb.com/feeds/news/rss.xml",
-  ];
+  const feeds = ["https://www.mlb.com/feeds/news/rss.xml"];
 
   const cutoff = hoursAgo(2);
   const alerts: NewsAlert[] = [];
