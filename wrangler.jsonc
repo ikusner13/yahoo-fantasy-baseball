@@ -9,7 +9,7 @@
     {
       "binding": "DB",
       "database_name": "fantasy-baseball",
-      "database_id": "<create-with-wrangler-d1-create>",
+      "database_id": "1ec2f27c-b2b8-4e70-a0ae-20388c30a605",
       "migrations_dir": "./drizzle",
     },
   ],
@@ -17,21 +17,12 @@
   "kv_namespaces": [
     {
       "binding": "KV",
-      "id": "<create-with-wrangler-kv-namespace-create>",
+      "id": "18291390b97e481bacf4dad246885a7f",
     },
   ],
 
   "triggers": {
-    "crons": [
-      "0 13 * * *",
-      "0 22 * * *",
-      "0 14 * * 1",
-      "0 19 * * 3",
-      "0 14 * * 6",
-      "0 14 * * 0",
-      "0 14 * * 5",
-      "15,45 13-23 * * *",
-    ],
+    "crons": ["0 13 * * *", "0 22 * * *", "0 14 * * 1,5,6,SUN", "0 19 * * 3", "15,45 13-23 * * *"],
   },
 
   // Non-secret env vars

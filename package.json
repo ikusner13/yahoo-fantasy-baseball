@@ -8,7 +8,7 @@
   "author": "",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "cf:deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit -p tsconfig.worker.json",
     "test": "vp test run",
     "test:watch": "vp test",

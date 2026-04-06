@@ -187,11 +187,15 @@ export async function sendTradeApproval(env: Env, tradeId: string, summary: stri
 // ---------------------------------------------------------------------------
 
 async function sendReply(env: Env, chatId: number, text: string): Promise<void> {
-  await fetch(`${TG_API}${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  const res = await fetch(`${TG_API}${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, text }),
   });
+  if (!res.ok) {
+    const body = await res.text();
+    console.error(`[telegram] sendReply failed (${res.status}): ${body}`);
+  }
 }
 
 async function answerCallbackQuery(env: Env, callbackQueryId: string, text: string): Promise<void> {

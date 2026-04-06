@@ -4,5 +4,6 @@ config.json
 /data/
 tests/evals/results-*.json
 .env
+.dev.vars
 .wrangler/
 drizzle/
