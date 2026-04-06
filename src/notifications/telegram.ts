@@ -55,6 +55,8 @@ export async function handleTelegramWebhook(request: Request, env: Env): Promise
       await sendReply(env, chatId, "GM is online");
     } else if (text === "/roster") {
       await sendReply(env, chatId, "roster coming soon");
+    } else if (text.startsWith("/feedback ")) {
+      await handleFeedbackCommand(env, chatId, text);
     }
   }
 
@@ -62,24 +64,85 @@ export async function handleTelegramWebhook(request: Request, env: Env): Promise
 }
 
 // ---------------------------------------------------------------------------
+// Feedback command
+// ---------------------------------------------------------------------------
+
+/** Handle /feedback <good|bad|note> <text> commands */
+async function handleFeedbackCommand(env: Env, chatId: number, text: string): Promise<void> {
+  // Parse: /feedback good|bad|note <message>
+  const parts = text.replace("/feedback ", "").match(/^(good|bad|note)\s+(.+)/s);
+  if (!parts) {
+    await sendReply(env, chatId, "Usage: /feedback good|bad|note <your feedback>");
+    return;
+  }
+
+  const type = parts[1];
+  const message = parts[2].trim();
+
+  // Get current matchup week (best effort)
+  let week: number | null = null;
+  try {
+    const row = env.db
+      .prepare("SELECT json_extract(action, '$.week') as week FROM decisions WHERE type = 'lineup' ORDER BY timestamp DESC LIMIT 1")
+      .get() as { week: number } | undefined;
+    if (row?.week) week = row.week;
+  } catch {
+    // non-fatal
+  }
+
+  try {
+    env.db
+      .prepare("INSERT INTO feedback (type, message, week) VALUES (?, ?, ?)")
+      .run(type, message, week);
+    await sendReply(env, chatId, `Logged ${type} feedback${week ? ` (week ${week})` : ""}`);
+  } catch (e) {
+    await sendReply(env, chatId, `Failed to save feedback: ${e instanceof Error ? e.message : "unknown"}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Outbound messages
 // ---------------------------------------------------------------------------
 
+/** Split text into chunks at newline boundaries, each under maxLen chars. */
+function splitMessage(text: string, maxLen: number): string[] {
+  if (text.length <= maxLen) return [text];
+
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      chunks.push(remaining);
+      break;
+    }
+    // Find last newline within limit
+    let splitAt = remaining.lastIndexOf("\n", maxLen);
+    if (splitAt <= 0) splitAt = maxLen; // no newline found — hard split
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).replace(/^\n/, "");
+  }
+  return chunks;
+}
+
 /** Send a message to the configured chat via Telegram API. */
 export async function sendMessage(env: Env, text: string): Promise<void> {
-  const res = await fetch(`${TG_API}${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: env.TELEGRAM_CHAT_ID,
-      text,
-      parse_mode: "HTML",
-    }),
-  });
+  const chunks = splitMessage(text, 4000);
 
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Telegram sendMessage failed (${res.status}): ${body}`);
+  for (const chunk of chunks) {
+    const res = await fetch(`${TG_API}${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: env.TELEGRAM_CHAT_ID,
+        text: chunk,
+        parse_mode: "HTML",
+      }),
+    });
+
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`Telegram sendMessage failed (${res.status}): ${body}`);
+    }
   }
 }
 

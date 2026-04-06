@@ -12,6 +12,7 @@ export interface Env {
   TELEGRAM_CHAT_ID: string;
   ANTHROPIC_API_KEY?: string;
   OPENAI_API_KEY?: string;
+  OPENROUTER_API_KEY?: string;
   ODDS_API_KEY?: string;
   DATA_DIR: string; // path to store tokens, cache, etc.
 }
@@ -112,6 +113,7 @@ export interface StatcastBatter {
   barrelPct: number;
   hardHitPct: number;
   exitVelo: number;
+  kPct?: number;
   sprintSpeed?: number;
 }
 
@@ -145,6 +147,8 @@ export interface CategoryScore {
 
 export interface Matchup {
   week: number;
+  weekStart: string; // ISO date "YYYY-MM-DD"
+  weekEnd: string; // ISO date "YYYY-MM-DD"
   opponentTeamKey: string;
   opponentTeamName: string;
   categories: CategoryScore[];
@@ -161,6 +165,7 @@ export interface ProbablePitcher {
 export interface ScheduledGame {
   gameId: number;
   date: string;
+  gameTime?: string; // ISO datetime of first pitch (e.g., "2026-04-05T17:10:00Z")
   homeTeam: string;
   awayTeam: string;
   homeProbable?: ProbablePitcher;

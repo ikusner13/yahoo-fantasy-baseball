@@ -35,11 +35,23 @@ function hoursAgo(n: number): Date {
 }
 
 /** Classify an MLB Stats API transaction type into a NewsAlert type. */
-function classifyTransaction(typeCode: string, description: string): NewsAlert["type"] | null {
+export function classifyTransaction(
+  typeCode: string,
+  description: string,
+): NewsAlert["type"] | null {
   const desc = description.toLowerCase();
   const code = typeCode.toLowerCase();
 
   if (code.includes("trade") || desc.includes("trade")) return "trade";
+  // Check injury BEFORE callup — "Status Change" typeCode covers both IL placements and call-ups
+  if (
+    code.includes("injured") ||
+    code.includes("disabled") ||
+    desc.includes("injured list") ||
+    desc.includes("placed on il") ||
+    desc.includes("placed on the")
+  )
+    return "injury";
   if (
     code.includes("status change") ||
     code.includes("call-up") ||
@@ -49,26 +61,19 @@ function classifyTransaction(typeCode: string, description: string): NewsAlert["
     desc.includes("selected to")
   )
     return "callup";
-  if (
-    code.includes("injured") ||
-    code.includes("disabled") ||
-    desc.includes("injured list") ||
-    desc.includes("placed on")
-  )
-    return "injury";
   if (code.includes("optioned") || desc.includes("optioned")) return "callup";
 
   return null;
 }
 
 /** Detect if a headline/description relates to closer changes. */
-function isCloserRelated(text: string): boolean {
+export function isCloserRelated(text: string): boolean {
   const lower = text.toLowerCase();
   return CLOSER_KEYWORDS.some((kw) => lower.includes(kw));
 }
 
 /** Extract fantasy impact string from transaction description. */
-function assessImpact(type: NewsAlert["type"], _description: string): string {
+export function assessImpact(type: NewsAlert["type"], _description: string): string {
   switch (type) {
     case "closer_change":
       return "Potential saves/holds impact — check closer depth chart";
@@ -163,9 +168,9 @@ export async function checkMLBTransactions(_env: Env): Promise<NewsAlert[]> {
  * Checks main MLB feed and RotoBaller for items from last 2 hours.
  */
 export async function checkRSSFeeds(): Promise<NewsAlert[]> {
+  // RotoWire RSS removed — paywalled, returns HTML instead of XML
   const feeds = [
     "https://www.mlb.com/feeds/news/rss.xml",
-    "https://www.rotowire.com/rss/mlb-news.xml",
   ];
 
   const cutoff = hoursAgo(2);

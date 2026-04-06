@@ -11,6 +11,8 @@ function cat(category: Category, my: number, opp: number): CategoryScore {
 function makeMatchup(categories: CategoryScore[]): Matchup {
   return {
     week: 1,
+    weekStart: "2026-03-30",
+    weekEnd: "2026-04-05",
     opponentTeamKey: "opp",
     opponentTeamName: "Opponent",
     categories,

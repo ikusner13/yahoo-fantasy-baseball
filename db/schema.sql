@@ -45,6 +45,31 @@ CREATE TABLE IF NOT EXISTS daily_stats (
   PRIMARY KEY (yahoo_id, date)
 );
 
+-- Generic API response cache (key-value with TTL)
+CREATE TABLE IF NOT EXISTS api_cache (
+  cache_key TEXT PRIMARY KEY,
+  data TEXT NOT NULL,       -- JSON blob
+  updated_at TEXT NOT NULL
+);
+
+-- Weekly retrospectives
+CREATE TABLE IF NOT EXISTS retrospectives (
+  week INTEGER PRIMARY KEY,
+  data TEXT NOT NULL, -- JSON blob of WeeklyRetrospective
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- User feedback for learning loop
+CREATE TABLE IF NOT EXISTS feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+  type TEXT NOT NULL, -- 'good' | 'bad' | 'note'
+  message TEXT NOT NULL,
+  week INTEGER -- which matchup week this relates to
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_week ON feedback(week);
+
 -- Park factors (static-ish, refresh yearly)
 CREATE TABLE IF NOT EXISTS park_factors (
   team TEXT PRIMARY KEY,

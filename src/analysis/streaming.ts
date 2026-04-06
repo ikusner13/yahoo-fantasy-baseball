@@ -1,5 +1,5 @@
-import type { Player, PitcherStats, ScheduledGame } from "../types";
-import type { MatchupAnalysis } from "./matchup";
+import type { Player, PitcherStats, ScheduledGame, Category } from "../types";
+import type { MatchupAnalysis, DetailedCategoryState } from "./matchup";
 
 // --- Constants ---
 
@@ -105,4 +105,151 @@ export function shouldStream(
   if (matchup.strategy.protectRatios && currentEra < 3.5 && currentWhip < 1.2) return false;
 
   return true;
+}
+
+// --- Net category impact & IP tracking ---
+
+export interface CategoryImpact {
+  category: Category;
+  direction: "helps" | "hurts" | "neutral";
+  magnitude: "high" | "medium" | "low";
+}
+
+/**
+ * Estimate how a streaming pitcher start affects each matchup category.
+ * Compares projected stat contributions against current category margins.
+ *
+ * Assumptions for a typical streaming start: ~6 IP (18 outs), ~6 K, possible QS.
+ * ERA/WHIP impact depends on pitcher projection quality vs current team rates.
+ */
+export function estimateStreamingImpact(
+  pitcherProjection: PitcherStats,
+  categoryStates: DetailedCategoryState[],
+): {
+  impacts: CategoryImpact[];
+  netCategoriesHelped: number;
+  netCategoriesHurt: number;
+} {
+  const stateMap = new Map(categoryStates.map((c) => [c.category, c]));
+  const impacts: CategoryImpact[] = [];
+  let helped = 0;
+  let hurt = 0;
+
+  // Projected contributions from this start
+  const projectedOuts = pitcherProjection.outs || pitcherProjection.ip * 3;
+  const projectedK = pitcherProjection.k;
+  const projectedQS = pitcherProjection.ip >= 6 && pitcherProjection.era < 4.5 ? 1 : 0;
+  const projectedSVHD = pitcherProjection.svhd;
+
+  // Counting stat contributions: K, OUT, QS, SVHD
+  const countingContributions: Array<{
+    cat: Category;
+    projected: number;
+  }> = [
+    { cat: "K", projected: projectedK },
+    { cat: "OUT", projected: projectedOuts },
+    { cat: "QS", projected: projectedQS },
+    { cat: "SVHD", projected: projectedSVHD },
+  ];
+
+  for (const { cat, projected } of countingContributions) {
+    const state = stateMap.get(cat);
+    if (!state) continue;
+
+    // No impact if category is clinched or lost
+    if (state.state === "clinched" || state.state === "lost") {
+      impacts.push({ category: cat, direction: "neutral", magnitude: "low" });
+      continue;
+    }
+
+    if (projected <= 0) {
+      impacts.push({ category: cat, direction: "neutral", magnitude: "low" });
+      continue;
+    }
+
+    // If we're losing/swing and this contribution could flip or narrow the gap
+    const deficit = Math.abs(state.margin);
+    if (state.state === "swing" || state.state === "losing") {
+      if (state.margin < 0 && projected >= deficit) {
+        // Could flip the category
+        impacts.push({ category: cat, direction: "helps", magnitude: "high" });
+        helped++;
+      } else if (state.margin < 0 && projected >= deficit * 0.5) {
+        impacts.push({ category: cat, direction: "helps", magnitude: "medium" });
+        helped++;
+      } else if (state.margin >= 0) {
+        // We're winning a swing cat — padding the lead
+        impacts.push({ category: cat, direction: "helps", magnitude: "low" });
+      } else {
+        impacts.push({ category: cat, direction: "helps", magnitude: "low" });
+      }
+    } else if (state.state === "safe") {
+      // Padding a safe lead — minor help
+      impacts.push({ category: cat, direction: "helps", magnitude: "low" });
+    }
+  }
+
+  // Rate stat impact: ERA, WHIP
+  // Adding IP with a certain ERA/WHIP moves team totals toward the pitcher's rates
+  for (const rateCat of ["ERA", "WHIP"] as const) {
+    const state = stateMap.get(rateCat);
+    if (!state) continue;
+
+    if (state.state === "clinched" || state.state === "lost") {
+      impacts.push({ category: rateCat, direction: "neutral", magnitude: "low" });
+      continue;
+    }
+
+    // Compare pitcher's rate to a "neutral" threshold
+    // ERA < 3.50 = good, 3.50-4.50 = risky, > 4.50 = bad
+    // WHIP < 1.15 = good, 1.15-1.35 = risky, > 1.35 = bad
+    const pitcherRate = rateCat === "ERA" ? pitcherProjection.era : pitcherProjection.whip;
+    const goodThreshold = rateCat === "ERA" ? 3.5 : 1.15;
+    const badThreshold = rateCat === "ERA" ? 4.5 : 1.35;
+
+    if (state.state === "safe" || (state.state === "swing" && state.margin > 0)) {
+      // We're winning — a bad pitcher hurts
+      if (pitcherRate > badThreshold) {
+        impacts.push({ category: rateCat, direction: "hurts", magnitude: "high" });
+        hurt++;
+      } else if (pitcherRate > goodThreshold) {
+        impacts.push({ category: rateCat, direction: "hurts", magnitude: "medium" });
+        hurt++;
+      } else {
+        impacts.push({ category: rateCat, direction: "helps", magnitude: "low" });
+      }
+    } else {
+      // We're losing — a good pitcher helps
+      if (pitcherRate < goodThreshold) {
+        impacts.push({ category: rateCat, direction: "helps", magnitude: "medium" });
+        helped++;
+      } else if (pitcherRate < badThreshold) {
+        impacts.push({ category: rateCat, direction: "neutral", magnitude: "low" });
+      } else {
+        impacts.push({ category: rateCat, direction: "hurts", magnitude: "low" });
+      }
+    }
+  }
+
+  return { impacts, netCategoriesHelped: helped, netCategoriesHurt: hurt };
+}
+
+/**
+ * Track IP status against the weekly minimum requirement.
+ */
+export function getIPStatus(
+  currentIP: number,
+  minimum: number = 20,
+): {
+  currentIP: number;
+  minimum: number;
+  above: boolean;
+  ipNeeded: number;
+} {
+  return {
+    currentIP,
+    minimum,
+    above: currentIP >= minimum,
+    ipNeeded: Math.max(0, minimum - currentIP),
+  };
 }

@@ -3,11 +3,8 @@ import { YahooClient } from "./yahoo/client";
 import { getValidToken } from "./yahoo/auth";
 import { setLineupViaBrowser } from "./yahoo/browser";
 import { getTodaysGames, getInjuries } from "./data/mlb";
-import { fetchBatterProjections, fetchPitcherProjections } from "./data/projections";
-import { computeZScores } from "./analysis/valuations";
 import { optimizeLineup } from "./analysis/lineup";
-import { analyzeMatchup } from "./analysis/matchup";
-import { getILMoves } from "./analysis/il-manager";
+import { simulateDay, type SimulationResult } from "./simulation";
 
 interface TestResult {
   name: string;
@@ -115,108 +112,92 @@ export async function runTestSuite(
     }),
   );
 
-  // --- 8. FanGraphs Projections ---
-  let projMap: Map<string, PlayerProjection> | null = null;
+  // --- 8. Full Simulation (comprehensive end-to-end) ---
+  let simResult: SimulationResult | null = null;
   results.push(
-    await runTest("FanGraphs — batter + pitcher projections", async () => {
-      const [batters, pitchers] = await Promise.all([
-        fetchBatterProjections(),
-        fetchPitcherProjections(),
-      ]);
+    await runTest("Simulation — full day analysis (read-only)", async () => {
+      simResult = await simulateDay(env, today);
 
-      projMap = new Map<string, PlayerProjection>();
-      for (const b of batters) {
-        projMap.set(`fg:${b.fangraphsId}`, {
-          yahooId: `fg:${b.fangraphsId}`,
-          playerType: "batter",
-          batting: {
-            pa: b.pa,
-            r: b.r,
-            h: b.h,
-            hr: b.hr,
-            rbi: b.rbi,
-            sb: b.sb,
-            tb: b.tb,
-            obp: b.obp,
-          },
-          updatedAt: new Date().toISOString(),
-        });
-      }
-      for (const p of pitchers) {
-        projMap.set(`fg:${p.fangraphsId}`, {
-          yahooId: `fg:${p.fangraphsId}`,
-          playerType: "pitcher",
-          pitching: {
-            ip: p.ip,
-            outs: Math.round(p.ip * 3),
-            k: p.k,
-            era: p.era,
-            whip: p.whip,
-            qs: p.qs,
-            svhd: p.svhd,
-          },
-          updatedAt: new Date().toISOString(),
-        });
-      }
+      const catSummary = simResult.matchupState.categoryStates
+        .map((c) => {
+          const sign = c.margin >= 0 ? "+" : "";
+          return `${c.category}: ${c.state} (${sign}${c.margin.toFixed(c.category === "ERA" || c.category === "WHIP" || c.category === "OBP" ? 3 : 0)})`;
+        })
+        .join(", ");
 
-      return `${batters.length} batters, ${pitchers.length} pitchers. Top batter: ${batters[0]?.name}. Top pitcher: ${pitchers[0]?.name}`;
+      const lines = [
+        `Week ${simResult.matchupState.week} vs ${simResult.matchupState.opponent}, ${simResult.matchupState.daysRemaining} days left`,
+        `Categories: ${catSummary}`,
+        `Worthless: ${simResult.matchupState.worthlessCategories.join(", ") || "none"}`,
+        `Streaming: ${simResult.matchupState.streamingDecision.reasoning}`,
+        `IP: ${simResult.matchupState.ipStatus.currentIP.toFixed(1)} (${simResult.matchupState.ipStatus.above ? "above" : "below"} min)`,
+        `Lineup: ${simResult.lineupDecisions.starters.length} starters, ${simResult.lineupDecisions.benched.length} benched`,
+        `Top starters: ${simResult.lineupDecisions.starters.slice(0, 5).map((s) => `${s.name} (${s.position}, ${s.score.toFixed(2)})`).join(", ")}`,
+        `Benched: ${simResult.lineupDecisions.benched.map((b) => `${b.name} (${b.reason})`).join(", ") || "none"}`,
+        `Park boosts: ${simResult.lineupDecisions.parkFactors.length} players`,
+        `Platoon matches: ${simResult.lineupDecisions.platoonMatches}`,
+        `Streaks applied: ${simResult.lineupDecisions.streaksApplied}`,
+        `Waiver recs: ${simResult.waiverRecommendations.length}`,
+        `Streaming candidates: ${simResult.streamingCandidates.length}`,
+      ];
+      return lines.join("\n");
     }),
   );
 
-  // --- 9. Z-Score Valuations ---
+  // --- 9. Player ID Mapping ---
   results.push(
-    await runTest("Valuations — compute z-scores", async () => {
-      if (!projMap) throw new Error("No projections loaded");
-      const projArr = Array.from(projMap.values());
-      const vals = computeZScores(projArr);
-      const top5 = vals.slice(0, 5).map((v) => `${v.yahooId} (z=${v.totalZScore.toFixed(2)})`);
-      return `${vals.length} players valued. Top 5: ${top5.join(", ")}`;
+    await runTest("Player ID Mapping — roster to projections", async () => {
+      if (!simResult) throw new Error("Simulation not run");
+      const pct = ((simResult.playerIdMatchCount / simResult.rosterSize) * 100).toFixed(0);
+      return `${simResult.playerIdMatchCount}/${simResult.rosterSize} roster players matched to FanGraphs (${pct}%)`;
     }),
   );
 
-  // --- 10. Lineup Optimizer (dry run) ---
+  // --- 10. Matchup Categories Parsed ---
   results.push(
-    await runTest("Lineup Optimizer — generate moves (DRY RUN)", async () => {
-      if (!roster || !projMap) throw new Error("No roster or projections");
-      const games = await getTodaysGames(today);
-      const moves = optimizeLineup(roster, projMap, games);
-      const summary = moves
-        .filter((m) => m.position !== "BN")
-        .map((m) => `${m.playerId} → ${m.position}`)
-        .join("\n");
-      return `${moves.length} moves generated:\n${summary}`;
+    await runTest("Matchup Categories — all 13 parsed", async () => {
+      if (!simResult) throw new Error("Simulation not run");
+      const count = simResult.matchupState.categoryStates.length;
+      const cats = simResult.matchupState.categoryStates.map((c) => c.category).join(", ");
+      if (count < 13) throw new Error(`Only ${count}/13 categories parsed: ${cats}`);
+      return `All ${count} categories: ${cats}`;
     }),
   );
 
-  // --- 11. Matchup Analysis ---
+  // --- 11. Detailed Analysis Produced ---
   results.push(
-    await runTest("Matchup Analysis — strategy recommendation", async () => {
-      const matchup = await yahoo.getMatchup();
-      if (matchup.categories.length === 0) {
-        return "No category data yet (season may not have started)";
-      }
-      const analysis = analyzeMatchup(matchup);
-      return `Projected: ${analysis.projectedWins}W-${analysis.projectedLosses}L. Swing: ${analysis.swingCategories.join(",")}. ${analysis.strategy.benchMessage}`;
+    await runTest("Detailed Analysis — worthless cats + streaming decision", async () => {
+      if (!simResult) throw new Error("Simulation not run");
+      const worthless = simResult.matchupState.worthlessCategories;
+      const stream = simResult.matchupState.streamingDecision;
+      return `Worthless categories: ${worthless.length > 0 ? worthless.join(", ") : "none (all in play)"}. Streaming: ${stream.canStream ? "yes" : "no"} (floor: ${stream.qualityFloor}). ${stream.reasoning}`;
     }),
   );
 
-  // --- 12. IL Manager ---
+  // --- 12. LLM Briefing Formatting ---
   results.push(
-    await runTest("IL Manager — check moves needed", async () => {
-      if (!roster) throw new Error("No roster");
-      const ilMoves = getILMoves(roster);
-      if (ilMoves.length === 0) return "No IL moves needed";
-      return ilMoves.map((m) => m.reasoning).join("; ");
+    await runTest("LLM Briefing — non-empty with expected sections", async () => {
+      if (!simResult) throw new Error("Simulation not run");
+      const briefing = simResult.llmBriefing;
+      if (!briefing) throw new Error("No LLM briefing generated");
+      if (briefing.length < 100)
+        throw new Error(`Briefing too short (${briefing.length} chars)`);
+
+      const expectedSections = ["WORTHLESS", "STREAMING", "IP STATUS"];
+      const missing = expectedSections.filter((s) => !briefing.includes(s));
+      if (missing.length > 0) throw new Error(`Missing sections: ${missing.join(", ")}`);
+
+      return `Briefing: ${briefing.length} chars, all expected sections present`;
     }),
   );
 
   // --- 13. Set Lineup (only if ?apply=1) ---
-  if (!dryRun && roster && projMap) {
+  if (!dryRun && roster) {
     results.push(
       await runTest("SET LINEUP — apply via browser (LIVE)", async () => {
         const games = await getTodaysGames(today);
-        const moves = optimizeLineup(roster!, projMap!, games);
-        // Try API first, fall back to browser automation
+        const projMap = new Map<string, PlayerProjection>();
+        const moves = optimizeLineup(roster!, projMap, games);
         try {
           await yahoo.setLineup(today, moves);
           return `Applied ${moves.length} lineup moves via API for ${today}`;

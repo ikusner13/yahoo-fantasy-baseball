@@ -10,17 +10,36 @@ import { YahooClient } from "./yahoo/client";
 import { getTodaysGames } from "./data/mlb";
 import { sendMessage } from "./notifications/telegram";
 import { getILMoves, countILSlots, getInjuredActivePlayers } from "./analysis/il-manager";
-import { optimizeLineup } from "./analysis/lineup";
+import { optimizeLineup, type ScoringContext } from "./analysis/lineup";
+import {
+  computeStreaks,
+  getStreakSummary,
+  type RecentPerformance,
+} from "./analysis/recent-performance";
 import { computeZScores } from "./analysis/valuations";
-import { analyzeMatchup } from "./analysis/matchup";
-import type { MatchupAnalysis } from "./analysis/matchup";
-import { rankStreamingOptions, shouldStream } from "./analysis/streaming";
+import { analyzeMatchup, analyzeMatchupDetailed } from "./analysis/matchup";
+import type { MatchupAnalysis, DetailedMatchupAnalysis } from "./analysis/matchup";
+import { rankStreamingOptions, getIPStatus } from "./analysis/streaming";
 import { findBestPickups, shouldUseWaiverPriority } from "./analysis/waivers";
 import { fetchBatterProjections, fetchPitcherProjections } from "./data/projections";
 import { identifyCategoryNeeds, identifySurplus } from "./analysis/trades";
-import { askLLM, summarizeForTelegram } from "./ai/llm";
-import { waiverWirePrompt, matchupStrategyPrompt, tradeProposalPrompt } from "./ai/prompts";
+import { askLLM } from "./ai/llm";
+import {
+  lineupSummaryPrompt,
+  waiverWirePrompt,
+  matchupStrategyPrompt,
+  tradeProposalPrompt,
+  injuryAssessmentPrompt,
+} from "./ai/prompts";
+import {
+  formatMatchupForLLM,
+  formatWaiverForLLM,
+  formatTradeForLLM,
+  formatInjuryForLLM,
+  formatLineupForLLM,
+} from "./ai/briefing";
 import { getWeekSchedule, findGameCountEdge } from "./analysis/game-count";
+import { getTwoStartPitchers } from "./analysis/two-start";
 import {
   getAddBudget,
   recordAdd,
@@ -29,6 +48,65 @@ import {
   resetWeeklyBudget,
 } from "./analysis/add-budget";
 import { getActionableAlerts, formatAlertForTelegram } from "./monitors/news";
+import type { NewsAlert } from "./monitors/news";
+import { buildPlayerIdMap } from "./data/player-match";
+import { upsertPlayerIds, lookupByYahooId } from "./data/player-ids";
+import type { PlayerIdRow } from "./data/player-ids";
+import { getBatterStatcast } from "./data/statcast";
+import { getParkFactor, getPitcherHand, getBatchPlatoonSplits, type PlatoonSplit } from "./data/matchup-data";
+import { buildRetrospective, formatRetrospectiveForTelegram } from "./analysis/retrospective";
+import { loadTuning } from "./config/tuning";
+
+/** Query recent feedback entries formatted for LLM context */
+function getRecentFeedback(env: Env, limit: number = 5): string | undefined {
+  try {
+    const rows = env.db
+      .prepare("SELECT type, message FROM feedback ORDER BY timestamp DESC LIMIT ?")
+      .all(limit) as Array<{ type: string; message: string }>;
+    if (rows.length === 0) return undefined;
+    return rows.map((r) => `\u2022 [${r.type}] ${r.message}`).join("\n");
+  } catch {
+    return undefined;
+  }
+}
+
+// Cross-run dedup for news monitor (survives between cron runs in same process)
+const sentAlertKeys = new Set<string>();
+let sentAlertDate = "";
+
+// Pitcher hand cache — handedness never changes, so cache forever (process lifetime)
+const pitcherHandCache = new Map<number, "L" | "R">();
+
+// Platoon split cache — keyed by mlbId, refreshed once per process lifetime
+const platoonSplitCache = new Map<number, PlatoonSplit>();
+
+/** Extract last name from a full name string. */
+function extractLastName(fullName: string): string {
+  const parts = fullName.trim().split(/\s+/);
+  return (parts[parts.length - 1] ?? fullName).toLowerCase();
+}
+
+/** Check if two player names match by last name. */
+function namesMatch(a: string, b: string): boolean {
+  return extractLastName(a) === extractLastName(b);
+}
+
+export type AlertRelevance = "OUR_PLAYER" | "FREE_AGENT" | "OTHER";
+
+/** Tag alert relevance relative to our roster. */
+function classifyAlertRelevance(alert: NewsAlert, rosterNames: string[]): AlertRelevance {
+  if (rosterNames.some((n) => namesMatch(n, alert.playerName))) return "OUR_PLAYER";
+  return "FREE_AGENT"; // no ownership data available in alert — treat non-roster as FA
+}
+
+/** Determine if alert should be sent based on relevance + type. */
+function shouldSendAlert(alert: NewsAlert, relevance: AlertRelevance): boolean {
+  if (relevance === "OUR_PLAYER") return true;
+  if (relevance === "FREE_AGENT") {
+    return alert.type === "closer_change" || alert.type === "callup";
+  }
+  return false;
+}
 
 // Helper to find player name from roster by ID
 function findPlayerName(
@@ -38,21 +116,106 @@ function findPlayerName(
   return roster.entries.find((e) => e.player.yahooId === playerId)?.player.name ?? playerId;
 }
 
+/** Build category line for briefing: "HR: 10 vs 7 (WIN clinched, margin +3)" */
+function formatDetailedCategories(detailed: DetailedMatchupAnalysis): string {
+  return detailed.detailedCategories
+    .map((c) => {
+      const stateLabel = c.state.toUpperCase();
+      const sign = c.margin >= 0 ? "+" : "";
+      return `${c.category}: ${c.myValue} vs ${c.opponentValue} (${stateLabel}, margin ${sign}${c.margin.toFixed(c.category === "ERA" || c.category === "WHIP" || c.category === "OBP" ? 3 : 0)})`;
+    })
+    .join("\n");
+}
+
+/** Build Yahoo team key from env. */
+function buildTeamKey(env: Env): string {
+  return `mlb.l.${env.YAHOO_LEAGUE_ID}.t.${env.YAHOO_TEAM_ID}`;
+}
+
+/** Fetch our standings rank + record string, e.g. "#4 (6-4-3)" */
+async function getOurRank(
+  yahoo: YahooClient,
+  teamKey: string,
+): Promise<{ rank: number; label: string } | undefined> {
+  try {
+    const standings = await yahoo.getStandings();
+    const us = standings.find((s) => s.teamKey === teamKey);
+    if (!us) return undefined;
+    return {
+      rank: us.rank,
+      label: `#${us.rank} (${us.wins}-${us.losses}-${us.ties})`,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Compute IP from matchup pitching stats */
+function getCurrentIP(matchup: {
+  categories: Array<{ category: string; myValue: number }>;
+}): number {
+  // OUT stat / 3 = IP, or use IP stat directly
+  const outStat = matchup.categories.find((c) => c.category === "OUT");
+  if (outStat) return outStat.myValue / 3;
+  const ipStat = matchup.categories.find((c) => c.category === "IP");
+  if (ipStat) return ipStat.myValue;
+  return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Projection helpers
 // ---------------------------------------------------------------------------
 
 /** Build a Map<yahooId, PlayerProjection> from FanGraphs raw projections.
- *  Uses `fg:${fangraphsId}` as key since player-ids mapping is incomplete. */
+ *  When rosterPlayers is provided, keys projections by Yahoo ID via name+team matching.
+ *  Unmatched projections fall back to `fg:${fangraphsId}` key. */
 function buildProjectionMap(
   batters: Awaited<ReturnType<typeof fetchBatterProjections>>,
   pitchers: Awaited<ReturnType<typeof fetchPitcherProjections>>,
+  rosterPlayers?: Array<{ yahooId: string; name: string; team: string }>,
+  env?: Env,
 ): Map<string, PlayerProjection> {
   const map = new Map<string, PlayerProjection>();
   const now = new Date().toISOString();
 
+  // Build fangraphsId → yahooId map if roster is available
+  let fgToYahoo = new Map<number, string>();
+  if (rosterPlayers && rosterPlayers.length > 0) {
+    const allProjections = [
+      ...batters.map((b) => ({ fangraphsId: b.fangraphsId, name: b.name, team: b.team })),
+      ...pitchers.map((p) => ({ fangraphsId: p.fangraphsId, name: p.name, team: p.team })),
+    ];
+    const { idMap, matches } = buildPlayerIdMap(rosterPlayers, allProjections);
+    fgToYahoo = idMap;
+
+    // Persist matches to player_ids table
+    if (env && matches.length > 0) {
+      const projByFg = new Map<number, { name: string; team: string }>();
+      for (const b of batters) projByFg.set(b.fangraphsId, { name: b.name, team: b.team });
+      for (const p of pitchers) projByFg.set(p.fangraphsId, { name: p.name, team: p.team });
+
+      const rows: PlayerIdRow[] = matches.map((m) => {
+        const proj = projByFg.get(m.fangraphsId);
+        return {
+          yahooId: m.yahooId,
+          mlbId: null,
+          fangraphsId: m.fangraphsId,
+          name: proj?.name ?? m.name,
+          positions: null,
+          team: proj?.team ?? m.team,
+        };
+      });
+      try {
+        upsertPlayerIds(env, rows);
+      } catch {
+        // non-fatal — DB write failure shouldn't break projection flow
+      }
+    }
+  }
+
   for (const b of batters) {
-    const key = `fg:${b.fangraphsId}`;
+    const yahooId = fgToYahoo.get(b.fangraphsId);
+    const key = yahooId ?? `fg:${b.fangraphsId}`;
     map.set(key, {
       yahooId: key,
       playerType: "batter",
@@ -71,7 +234,8 @@ function buildProjectionMap(
   }
 
   for (const p of pitchers) {
-    const key = `fg:${p.fangraphsId}`;
+    const yahooId = fgToYahoo.get(p.fangraphsId);
+    const key = yahooId ?? `fg:${p.fangraphsId}`;
     map.set(key, {
       yahooId: key,
       playerType: "pitcher",
@@ -113,6 +277,25 @@ export async function runDailyMorning(env: Env): Promise<void> {
       summaryLines.push(`\n<b>News Alerts (${alerts.length}):</b>`);
       for (const alert of alerts.slice(0, 5)) {
         summaryLines.push(formatAlertForTelegram(alert));
+
+        // Run injury alerts through LLM injury assessment
+        if (alert.type === "injury" && alert.playerName) {
+          try {
+            const briefing = formatInjuryForLLM({
+              player: alert.playerName,
+              injury: alert.headline,
+              rosterContext: `Team: ${alert.team}. ${alert.fantasyImpact}`,
+              ilSlots: "Check roster for availability",
+            });
+            const prompt = injuryAssessmentPrompt(briefing);
+            const assessment = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
+            if (!assessment.startsWith("[")) {
+              summaryLines.push(`  → AI: ${assessment}`);
+            }
+          } catch {
+            // supplemental
+          }
+        }
       }
     }
   } catch {
@@ -134,7 +317,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
   // 2. Fetch today's games
   let games: ScheduledGame[] = [];
   try {
-    games = await getTodaysGames(today);
+    games = await getTodaysGames(today, env);
     summaryLines.push(`Games today: ${games.length}`);
     appendProbablePitchers(summaryLines, games);
   } catch (e) {
@@ -167,10 +350,11 @@ export async function runDailyMorning(env: Env): Promise<void> {
   let valuations: PlayerValuation[] = [];
   try {
     const [rawBatters, rawPitchers] = await Promise.all([
-      fetchBatterProjections(),
-      fetchPitcherProjections(),
+      fetchBatterProjections(undefined, env),
+      fetchPitcherProjections(undefined, env),
     ]);
-    projectionMap = buildProjectionMap(rawBatters, rawPitchers);
+    const rosterForMatch = roster?.entries.map((e) => e.player) ?? [];
+    projectionMap = buildProjectionMap(rawBatters, rawPitchers, rosterForMatch, env);
     allProjections = projectionsToArray(projectionMap);
     summaryLines.push(`Projections: ${rawBatters.length} batters, ${rawPitchers.length} pitchers`);
 
@@ -191,6 +375,198 @@ export async function runDailyMorning(env: Env): Promise<void> {
     }
   } catch {
     // non-fatal, lineup optimization works without matchup context
+  }
+
+  // 5b. Statcast recent performance + park factors (contextual multipliers for lineup optimizer)
+  let streakMap: Map<number, RecentPerformance> | undefined;
+  let streakSummaryText = "";
+  let contextMap: Map<string, ScoringContext> | undefined;
+
+  // Build yahooId -> mlbId map from player_ids table (shared across statcast + platoon)
+  const yahooToMlb = new Map<string, number>();
+  const mlbToYahoo = new Map<number, string>();
+  const mlbToName = new Map<number, string>();
+
+  for (const entry of roster.entries) {
+    const p = entry.player;
+    let mlbId = p.mlbId;
+    if (!mlbId) {
+      const row = lookupByYahooId(env, p.yahooId);
+      if (row?.mlbId) mlbId = row.mlbId;
+    }
+    if (mlbId) {
+      yahooToMlb.set(p.yahooId, mlbId);
+      mlbToYahoo.set(mlbId, p.yahooId);
+      mlbToName.set(mlbId, p.name);
+    }
+  }
+
+  const rosterMlbIds = [...yahooToMlb.values()];
+
+  try {
+
+    if (rosterMlbIds.length > 0) {
+      // Fetch Statcast batter data (1 HTTP call, cached per day)
+      const statcast = await getBatterStatcast(rosterMlbIds, 2026, env);
+
+      if (statcast.length > 0) {
+        // Compute streaks: compare recent xwOBA vs ROS projections
+        const streaks = computeStreaks(statcast, allProjections, mlbToYahoo, mlbToName);
+        streakMap = new Map(streaks.map((s) => [s.mlbId, s]));
+
+        // Build human-readable summary for LLM briefings
+        const { hot, cold } = getStreakSummary(streaks);
+        const parts: string[] = [];
+        if (hot.length > 0) {
+          parts.push(
+            `Hot: ${hot
+              .slice(0, 3)
+              .map(
+                (s) =>
+                  `${s.name} (.${(s.recentXwoba * 1000).toFixed(0)} xwOBA, streak ${s.streakScore >= 0 ? "+" : ""}${s.streakScore.toFixed(2)})`,
+              )
+              .join(", ")}`,
+          );
+        }
+        if (cold.length > 0) {
+          parts.push(
+            `Cold: ${cold
+              .slice(0, 3)
+              .map(
+                (s) =>
+                  `${s.name} (.${(s.recentXwoba * 1000).toFixed(0)} xwOBA, streak ${s.streakScore >= 0 ? "+" : ""}${s.streakScore.toFixed(2)})`,
+              )
+              .join(", ")}`,
+          );
+        }
+        streakSummaryText = parts.join(". ");
+        if (streakSummaryText) {
+          summaryLines.push(`Statcast: ${statcast.length} batters tracked. ${streakSummaryText}`);
+        } else {
+          summaryLines.push(`Statcast: ${statcast.length} batters tracked, no notable streaks`);
+        }
+      } else {
+        summaryLines.push("Statcast: no data for roster players");
+      }
+    } else {
+      summaryLines.push("Statcast: skipped (no mlbId mappings)");
+    }
+  } catch (e) {
+    summaryLines.push(
+      `Statcast: failed (${e instanceof Error ? e.message : "unknown"}) — continuing without`,
+    );
+    // Non-fatal: optimizer handles missing streaks gracefully
+  }
+
+  // Build per-player ScoringContext with park factors (static data, never fails)
+  try {
+    contextMap = new Map<string, ScoringContext>();
+    for (const entry of roster.entries) {
+      const team = entry.player.team;
+      // Find the game this player's team is in today
+      const game = games.find((g) => g.homeTeam === team || g.awayTeam === team);
+      if (game) {
+        // Park factor comes from the HOME team's park
+        const parkFactor = getParkFactor(game.homeTeam);
+        contextMap.set(entry.player.yahooId, { parkFactor });
+      }
+    }
+    if (contextMap.size > 0) {
+      summaryLines.push(`Park factors: ${contextMap.size} players in context`);
+    }
+  } catch {
+    // Park factors are static — this should never fail, but be safe
+    contextMap = undefined;
+  }
+
+  // 5c. Platoon splits — highest signal-to-noise daily factor for batter lineup decisions
+  try {
+    if (!contextMap) contextMap = new Map<string, ScoringContext>();
+
+    // Step 1: Resolve opposing pitcher hand for each game today
+    // Build team -> opposing pitcher mlbId mapping
+    const teamToOpposingPitcherId = new Map<string, number>();
+    for (const game of games) {
+      if (game.awayProbable?.mlbId) {
+        // Home team faces the away probable
+        teamToOpposingPitcherId.set(game.homeTeam, game.awayProbable.mlbId);
+      }
+      if (game.homeProbable?.mlbId) {
+        // Away team faces the home probable
+        teamToOpposingPitcherId.set(game.awayTeam, game.homeProbable.mlbId);
+      }
+    }
+
+    // Fetch pitcher hands (only for pitchers not already cached)
+    const uncachedPitcherIds = [...new Set(teamToOpposingPitcherId.values())].filter(
+      (id) => !pitcherHandCache.has(id),
+    );
+    if (uncachedPitcherIds.length > 0) {
+      const handResults = await Promise.all(
+        uncachedPitcherIds.map((id) => getPitcherHand(id).then((hand) => ({ id, hand }))),
+      );
+      for (const { id, hand } of handResults) {
+        if (hand) pitcherHandCache.set(id, hand);
+      }
+    }
+
+    // Build team -> opposing pitcher hand
+    const teamToOpposingHand = new Map<string, "L" | "R">();
+    for (const [team, pitcherId] of teamToOpposingPitcherId) {
+      const hand = pitcherHandCache.get(pitcherId);
+      if (hand) teamToOpposingHand.set(team, hand);
+    }
+
+    // Step 2: Fetch platoon splits for batters who have a game today
+    const battersWithGame: Array<{ yahooId: string; mlbId: number }> = [];
+    for (const entry of roster.entries) {
+      const team = entry.player.team;
+      if (!teamToOpposingHand.has(team)) continue; // no game or no pitcher hand
+      const mlbId = yahooToMlb.get(entry.player.yahooId);
+      if (!mlbId) continue;
+      // Skip pitchers — platoon splits only matter for batters
+      const proj = projectionMap.get(entry.player.yahooId);
+      if (proj?.playerType === "pitcher") continue;
+      battersWithGame.push({ yahooId: entry.player.yahooId, mlbId });
+    }
+
+    // Only fetch splits for batters not already cached
+    const uncachedBatterIds = battersWithGame
+      .map((b) => b.mlbId)
+      .filter((id) => !platoonSplitCache.has(id));
+    if (uncachedBatterIds.length > 0) {
+      const freshSplits = await getBatchPlatoonSplits(uncachedBatterIds);
+      for (const [id, split] of freshSplits) {
+        platoonSplitCache.set(id, split);
+      }
+    }
+
+    // Step 3: Wire platoon + opposing pitcher hand into contextMap
+    let platoonCount = 0;
+    for (const { yahooId, mlbId } of battersWithGame) {
+      const team = roster.entries.find((e) => e.player.yahooId === yahooId)?.player.team;
+      if (!team) continue;
+      const opposingPitcherHand = teamToOpposingHand.get(team);
+      const platoon = platoonSplitCache.get(mlbId);
+      if (!opposingPitcherHand) continue;
+
+      const existing = contextMap.get(yahooId) ?? {};
+      contextMap.set(yahooId, { ...existing, platoon, opposingPitcherHand });
+      platoonCount++;
+    }
+
+    if (platoonCount > 0) {
+      const lhpCount = [...teamToOpposingHand.values()].filter((h) => h === "L").length;
+      const rhpCount = [...teamToOpposingHand.values()].filter((h) => h === "R").length;
+      summaryLines.push(
+        `Platoon: ${platoonCount} batters matched (${lhpCount}L/${rhpCount}R pitchers)`,
+      );
+    }
+  } catch (e) {
+    summaryLines.push(
+      `Platoon: failed (${e instanceof Error ? e.message : "unknown"}) — continuing without`,
+    );
+    // Non-fatal: optimizer handles missing platoon data gracefully
   }
 
   // 6. IL moves
@@ -235,7 +611,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
 
   // 7. Optimize lineup + AI analysis
   try {
-    const moves = optimizeLineup(roster, projectionMap, games, matchup);
+    const moves = optimizeLineup(roster, projectionMap, games, matchup, streakMap, contextMap);
     if (moves.length > 0) {
       await yahoo.setLineup(today, moves);
       const activeCount = moves.filter((m) => m.position !== "BN" && m.position !== "IL").length;
@@ -248,17 +624,21 @@ export async function runDailyMorning(env: Env): Promise<void> {
     try {
       const starters = moves.filter((m) => m.position !== "BN" && m.position !== "IL");
       const benched = moves.filter((m) => m.position === "BN");
-      const context = [
-        `Stats engine set the lineup. Summarize the key decisions:`,
-        `STARTERS: ${starters.map((m) => `${findPlayerName(roster, m.playerId)} → ${m.position}`).join(", ")}`,
-        `BENCHED: ${benched.map((m) => findPlayerName(roster, m.playerId)).join(", ")}`,
-        `GAMES: ${games
+      const briefing = formatLineupForLLM({
+        starters: starters
+          .map((m) => `${findPlayerName(roster, m.playerId)} → ${m.position}`)
+          .join(", "),
+        benched: benched.map((m) => findPlayerName(roster, m.playerId)).join(", "),
+        games: games
           .slice(0, 8)
           .map((g) => `${g.awayTeam}@${g.homeTeam}`)
-          .join(", ")}`,
-        matchupAnalysis ? `STRATEGY: ${matchupAnalysis.strategy.benchMessage}` : "",
-      ].join("\n");
-      const aiNotes = await summarizeForTelegram(env, context);
+          .join(", "),
+        strategy: matchupAnalysis?.strategy.benchMessage,
+        swingCategories: matchupAnalysis?.swingCategories.join(", "),
+        streaks: streakSummaryText || undefined,
+      });
+      const prompt = lineupSummaryPrompt(briefing);
+      const aiNotes = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
       if (!aiNotes.startsWith("[")) {
         summaryLines.push(`\n<b>AI Notes:</b> ${aiNotes}`);
       }
@@ -277,6 +657,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
   }
 
   // 8. Waiver wire evaluation
+  const budget = getAddBudget(env);
   try {
     const freeAgents = await yahoo.getFreeAgents(undefined, 50);
     if (freeAgents.length > 0 && valuations.length > 0) {
@@ -292,12 +673,18 @@ export async function runDailyMorning(env: Env): Promise<void> {
       const pickups = findBestPickups(faValuations, roster.entries, valMap, 5);
 
       if (pickups.length > 0) {
-        const budget = getAddBudget(env);
         summaryLines.push(
           `\n<b>Waiver Picks (${pickups.length}):</b> [${budget.addsRemaining} adds left this week]`,
         );
         for (const rec of pickups) {
-          const priority = classifyAddPriority(rec, {});
+          const reasoningLower = rec.reasoning.toLowerCase();
+          const priority = classifyAddPriority(rec, {
+            isCloserChange: reasoningLower.includes("closer") || reasoningLower.includes("saves"),
+            isInjuryReplacement:
+              reasoningLower.includes("injur") ||
+              reasoningLower.includes("IL") ||
+              rec.drop.status === "IL",
+          });
           summaryLines.push(
             `• ${rec.add.name} for ${rec.drop.name} (+${rec.netValue.toFixed(1)}) [${priority}]`,
           );
@@ -353,12 +740,15 @@ export async function runDailyMorning(env: Env): Promise<void> {
         try {
           const rosterNeeds =
             valuations.length > 0 ? identifyCategoryNeeds(valuations).join(", ") : "unknown";
-          const prompt = waiverWirePrompt({
+          const swingCats = matchupAnalysis?.swingCategories.join(", ") ?? "unknown";
+          const briefing = formatWaiverForLLM({
+            matchupContext: `Swing categories this week: ${swingCats}`,
+            addBudget: `${budget.addsRemaining} adds remaining (${budget.addsUsed} used)`,
             recommendations: pickups.map((r) => r.reasoning).join("\n"),
             rosterNeeds,
-            waiverPriority: 5,
           });
-          const waiverInsight = await askLLM(env, prompt.system, prompt.user);
+          const prompt = waiverWirePrompt(briefing);
+          const waiverInsight = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
           if (!waiverInsight.startsWith("[")) {
             summaryLines.push(`\n<b>AI Waiver Notes:</b> ${waiverInsight}`);
           }
@@ -389,50 +779,93 @@ export async function runDailyMorning(env: Env): Promise<void> {
       });
 
       const ranked = rankStreamingOptions(streamCandidates, games);
-      const canStream = shouldStream(matchupAnalysis, 4.0, 1.3); // conservative defaults
 
-      if (canStream && ranked.length > 0 && ranked[0].score > 3.0) {
+      // Compute days remaining from day-of-week (Sun=1, Mon=7, Tue=6, ...)
+      const dow = new Date().getDay(); // 0=Sun
+      const daysRemaining = dow === 0 ? 1 : 8 - dow;
+
+      // Use smart streaming decision from detailed matchup analysis
+      let canStream = true;
+      let minScore = 3.0;
+      let streamReasoning = "No matchup data — streaming freely";
+      if (matchup) {
+        const currentIP = getCurrentIP(matchup);
+        const detailed = analyzeMatchupDetailed(matchup, daysRemaining, currentIP);
+        const decision = detailed.streamingDecision;
+        canStream = decision.canStream;
+        streamReasoning = decision.reasoning;
+
+        // Map quality floors to minimum score thresholds (from tuning config)
+        const streamMinimums = loadTuning().streaming.scoreMinimum;
+        switch (decision.qualityFloor) {
+          case "any":
+            minScore = streamMinimums.any;
+            break;
+          case "high-floor":
+            minScore = streamMinimums["high-floor"];
+            break;
+          case "elite-only":
+            minScore = streamMinimums["elite-only"];
+            break;
+          case "none":
+            canStream = false;
+            break;
+        }
+      }
+
+      if (canStream && ranked.length > 0 && ranked[0].score > minScore) {
         const top = ranked[0];
-        summaryLines.push(`\n<b>Streaming SP:</b>`);
+        summaryLines.push(`\n<b>Streaming SP:</b> (${streamReasoning})`);
         summaryLines.push(
-          `• ${top.player.name} vs ${top.opponent} (score: ${top.score.toFixed(1)})`,
+          `• ${top.player.name} vs ${top.opponent} (score: ${top.score.toFixed(1)}, floor: ${minScore.toFixed(1)})`,
         );
 
-        // Find worst bench pitcher to drop
-        const benchPitchers = roster.entries.filter(
-          (e) =>
-            e.currentPosition === "BN" && e.player.positions.some((p) => p === "SP" || p === "RP"),
+        // Check add budget before streaming
+        const streamPriority = classifyAddPriority(
+          { add: top.player, drop: top.player, netValue: top.score, reasoning: "streaming" },
+          {},
         );
-
-        if (benchPitchers.length > 0) {
-          const dropTarget = benchPitchers[benchPitchers.length - 1];
-          try {
-            await yahoo.addDrop(top.player.yahooId, dropTarget.player.yahooId);
-            summaryLines.push(`  -> Added, dropping ${dropTarget.player.name}`);
-            decisions.push({
-              type: "stream",
-              action: {
-                add: top.player.name,
-                drop: dropTarget.player.name,
-                score: top.score,
-                opponent: top.opponent,
-              },
-              reasoning: `Streaming ${top.player.name} vs ${top.opponent} (score ${top.score.toFixed(1)})`,
-              result: "success",
-            });
-          } catch (e) {
-            summaryLines.push(
-              `  -> Stream add failed: ${e instanceof Error ? e.message : "unknown"}`,
-            );
-          }
+        if (!shouldSpendAdd(budget, streamPriority)) {
+          summaryLines.push("  -> Skipped (saving adds for higher-impact moves)");
         } else {
-          summaryLines.push("  -> No droppable bench pitcher");
+          // Find worst bench pitcher to drop
+          const benchPitchers = roster.entries.filter(
+            (e) =>
+              e.currentPosition === "BN" &&
+              e.player.positions.some((p) => p === "SP" || p === "RP"),
+          );
+
+          if (benchPitchers.length > 0) {
+            const dropTarget = benchPitchers[benchPitchers.length - 1];
+            try {
+              await yahoo.addDrop(top.player.yahooId, dropTarget.player.yahooId);
+              recordAdd(env);
+              summaryLines.push(`  -> Added, dropping ${dropTarget.player.name}`);
+              decisions.push({
+                type: "stream",
+                action: {
+                  add: top.player.name,
+                  drop: dropTarget.player.name,
+                  score: top.score,
+                  opponent: top.opponent,
+                },
+                reasoning: `Streaming ${top.player.name} vs ${top.opponent} (score ${top.score.toFixed(1)}, ${streamReasoning})`,
+                result: "success",
+              });
+            } catch (e) {
+              summaryLines.push(
+                `  -> Stream add failed: ${e instanceof Error ? e.message : "unknown"}`,
+              );
+            }
+          } else {
+            summaryLines.push("  -> No droppable bench pitcher");
+          }
         }
       } else if (!canStream) {
-        summaryLines.push("Streaming: skipped (protecting ratios)");
+        summaryLines.push(`Streaming: skipped (${streamReasoning})`);
       } else {
         summaryLines.push(
-          `Streaming: no strong options (top: ${ranked[0]?.score.toFixed(1) ?? "none"})`,
+          `Streaming: no strong options (top: ${ranked[0]?.score.toFixed(1) ?? "none"}, need >${minScore.toFixed(1)})`,
         );
       }
     } else {
@@ -485,8 +918,20 @@ export async function runLateScratchCheck(env: Env): Promise<void> {
   const yahoo = new YahooClient(env);
   const today = new Date().toISOString().slice(0, 10);
 
-  const roster = await yahoo.getRoster(today);
-  const games = await getTodaysGames(today);
+  let roster;
+  let games: ScheduledGame[];
+  try {
+    [roster, games] = await Promise.all([yahoo.getRoster(today), getTodaysGames(today, env)]);
+  } catch (e) {
+    const msg = `Late scratch check failed: ${e instanceof Error ? e.message : "unknown"}`;
+    console.error(msg);
+    try {
+      await sendMessage(env, `<b>Late Scratch Error</b>\n${msg}`);
+    } catch {
+      // telegram send itself failed
+    }
+    return;
+  }
 
   const injured = getInjuredActivePlayers(roster);
   const ilStatus = countILSlots(roster);
@@ -536,6 +981,41 @@ export async function runLateScratchCheck(env: Env): Promise<void> {
 export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
   const yahoo = new YahooClient(env);
 
+  // --- Retrospective: analyze completed previous week before starting new analysis ---
+  try {
+    const currentMatchup = await yahoo.getMatchup();
+    const prevWeek = currentMatchup.week - 1;
+    if (prevWeek >= 1) {
+      // Check if we already have a retrospective for this week
+      const existing = env.db
+        .prepare("SELECT week FROM retrospectives WHERE week = ?")
+        .get(prevWeek) as { week: number } | undefined;
+
+      if (!existing) {
+        const prevMatchup = await yahoo.getMatchup(prevWeek);
+        const retro = buildRetrospective(prevMatchup);
+
+        // Store retrospective
+        env.db
+          .prepare("INSERT OR REPLACE INTO retrospectives (week, data) VALUES (?, ?)")
+          .run(prevWeek, JSON.stringify(retro));
+
+        // Send Telegram summary
+        await sendMessage(env, formatRetrospectiveForTelegram(retro));
+
+        // Log decision for audit trail
+        logDecision(env, {
+          type: "lineup",
+          action: { routine: "retrospective", week: prevWeek, score: retro.finalScore },
+          reasoning: `Week ${prevWeek} retrospective: ${retro.finalScore}`,
+          result: "success",
+        });
+      }
+    }
+  } catch {
+    // non-fatal — don't block new week analysis
+  }
+
   let matchup;
   try {
     matchup = await yahoo.getMatchup();
@@ -561,15 +1041,16 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
   // Opponent scouting
   let scoutReport = "";
   try {
+    const myRoster = await yahoo.getRoster();
     const [rawBat, rawPit] = await Promise.all([
-      fetchBatterProjections(),
-      fetchPitcherProjections(),
+      fetchBatterProjections(undefined, env),
+      fetchPitcherProjections(undefined, env),
     ]);
-    const projMap = buildProjectionMap(rawBat, rawPit);
+    const rosterPlayers = myRoster.entries.map((e) => e.player);
+    const projMap = buildProjectionMap(rawBat, rawPit, rosterPlayers, env);
     const allVals = computeZScores(projectionsToArray(projMap));
     const valMap = new Map(allVals.map((v) => [v.yahooId, v]));
 
-    const myRoster = await yahoo.getRoster();
     const myVals = myRoster.entries
       .map((e) => valMap.get(e.player.yahooId))
       .filter((v): v is PlayerValuation => !!v);
@@ -583,6 +1064,9 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
   } catch {
     // non-fatal
   }
+
+  // Fetch standings rank (non-fatal)
+  const rankInfo = await getOurRank(yahoo, buildTeamKey(env));
 
   // Reset weekly add budget on Monday
   try {
@@ -612,16 +1096,26 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
   lines.push("");
   lines.push(`<b>Strategy:</b> ${analysis.strategy.benchMessage}`);
 
-  // LLM: generate strategy memo (supplemental — stats engine already decided)
+  // LLM: generate strategy memo with full briefing (supplemental)
   try {
-    const prompt = matchupStrategyPrompt({
-      analysis: JSON.stringify(analysis, null, 2),
-      currentScores: matchup.categories
-        .map((c) => `${c.category}: ${c.myValue} vs ${c.opponentValue}`)
-        .join(", "),
-      daysRemaining: 7,
+    const currentIP = getCurrentIP(matchup);
+    const detailed = analyzeMatchupDetailed(matchup, 7);
+    const ipInfo = getIPStatus(currentIP);
+    const briefing = formatMatchupForLLM({
+      summary: `Week ${matchup.week} vs ${matchup.opponentTeamName}, ${detailed.projectedWins}W-${detailed.projectedLosses}L, 7 days left`,
+      categories: formatDetailedCategories(detailed),
+      worthless:
+        detailed.worthlessCategories.length > 0
+          ? `${detailed.worthlessCategories.join(", ")} — production here is worthless`
+          : "None — all categories still in play",
+      streaming: `${detailed.streamingDecision.reasoning} (quality floor: ${detailed.streamingDecision.qualityFloor})`,
+      ipStatus: `${ipInfo.currentIP.toFixed(1)} IP (${ipInfo.above ? "above" : "below"} ${ipInfo.minimum} min${ipInfo.ipNeeded > 0 ? `, need ${ipInfo.ipNeeded.toFixed(1)} more` : ""})`,
+      opponentScouting: scoutReport || undefined,
+      standings: rankInfo?.label,
+      recentFeedback: getRecentFeedback(env),
     });
-    const strategyMemo = await askLLM(env, prompt.system, prompt.user);
+    const prompt = matchupStrategyPrompt(briefing);
+    const strategyMemo = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
     if (!strategyMemo.startsWith("[")) {
       lines.push("");
       lines.push(`<b>AI Strategy Memo:</b> ${strategyMemo}`);
@@ -680,6 +1174,9 @@ export async function runMidWeekAdjustment(env: Env): Promise<void> {
     return;
   }
 
+  // Fetch standings rank (non-fatal)
+  const rankInfo = await getOurRank(yahoo, buildTeamKey(env));
+
   // Build current category scoreboard
   const catLines: string[] = [];
   for (const cs of matchup.categories) {
@@ -713,16 +1210,25 @@ export async function runMidWeekAdjustment(env: Env): Promise<void> {
     lines.push("<b>Note:</b> Streaming pitchers recommended to chase counting stats.");
   }
 
-  // LLM: mid-week tactical memo (supplemental — stats engine already decided)
+  // LLM: mid-week tactical memo with full briefing (supplemental)
   try {
-    const prompt = matchupStrategyPrompt({
-      analysis: JSON.stringify(analysis, null, 2),
-      currentScores: matchup.categories
-        .map((c) => `${c.category}: ${c.myValue} vs ${c.opponentValue}`)
-        .join(", "),
-      daysRemaining: 4,
+    const currentIP = getCurrentIP(matchup);
+    const detailed = analyzeMatchupDetailed(matchup, 4);
+    const ipInfo = getIPStatus(currentIP);
+    const briefing = formatMatchupForLLM({
+      summary: `Mid-week ${matchup.week} vs ${matchup.opponentTeamName}, ${detailed.projectedWins}W-${detailed.projectedLosses}L, 4 days left`,
+      categories: formatDetailedCategories(detailed),
+      worthless:
+        detailed.worthlessCategories.length > 0
+          ? `${detailed.worthlessCategories.join(", ")} — production here is worthless`
+          : "None — all categories still in play",
+      streaming: `${detailed.streamingDecision.reasoning} (quality floor: ${detailed.streamingDecision.qualityFloor})`,
+      ipStatus: `${ipInfo.currentIP.toFixed(1)} IP (${ipInfo.above ? "above" : "below"} ${ipInfo.minimum} min${ipInfo.ipNeeded > 0 ? `, need ${ipInfo.ipNeeded.toFixed(1)} more` : ""})`,
+      standings: rankInfo?.label,
+      recentFeedback: getRecentFeedback(env),
     });
-    const strategyMemo = await askLLM(env, prompt.system, prompt.user);
+    const prompt = matchupStrategyPrompt(briefing);
+    const strategyMemo = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
     if (!strategyMemo.startsWith("[")) {
       lines.push("");
       lines.push(`<b>AI Mid-Week Tactics:</b> ${strategyMemo}`);
@@ -759,14 +1265,18 @@ export async function runTradeEvaluation(env: Env): Promise<void> {
   const yahoo = new YahooClient(env);
   const lines: string[] = ["<b>Trade Evaluation Scan</b>"];
 
+  // Fetch standings rank (non-fatal)
+  const rankInfo = await getOurRank(yahoo, buildTeamKey(env));
+
   try {
     // 1. Fetch our roster + projections
     const roster = await yahoo.getRoster();
     const [batProj, pitProj] = await Promise.all([
-      fetchBatterProjections(),
-      fetchPitcherProjections(),
+      fetchBatterProjections(undefined, env),
+      fetchPitcherProjections(undefined, env),
     ]);
-    const projMap = buildProjectionMap(batProj, pitProj);
+    const rosterPlayers = roster.entries.map((e) => e.player);
+    const projMap = buildProjectionMap(batProj, pitProj, rosterPlayers, env);
     const projArr = projectionsToArray(projMap);
     const valuations = computeZScores(projArr);
 
@@ -810,13 +1320,15 @@ export async function runTradeEvaluation(env: Env): Promise<void> {
           .slice(0, 3)
           .map((s) => `${s.category}: ${s.players.map((p) => p.name).join(", ")}`)
           .join("; ");
-        const prompt = tradeProposalPrompt({
-          myRoster: rosterSummary,
-          targetRoster: "other team analysis coming soon",
-          categoryNeeds: needs.join(", "),
-          surplusPlayers: surplusDesc,
+        const briefing = formatTradeForLLM({
+          roster: rosterSummary,
+          needs: needs.join(", "),
+          surplus: surplusDesc,
+          targetInfo: "Scouting other teams — target teams with inverse category needs",
+          standings: rankInfo?.label,
         });
-        const tradeIdeas = await askLLM(env, prompt.system, prompt.user);
+        const prompt = tradeProposalPrompt(briefing);
+        const tradeIdeas = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
         if (!tradeIdeas.startsWith("[")) {
           lines.push("");
           lines.push(`<b>AI Trade Ideas:</b> ${tradeIdeas}`);
@@ -837,6 +1349,388 @@ export async function runTradeEvaluation(env: Env): Promise<void> {
     type: "trade",
     action: { routine: "trade_evaluation" },
     reasoning: lines.join(" | "),
+    result: "success",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Real-time news monitor (every 30min)
+// ---------------------------------------------------------------------------
+
+export async function runNewsMonitor(env: Env): Promise<void> {
+  const yahoo = new YahooClient(env);
+  const today = new Date().toISOString().slice(0, 10);
+
+  // Clear stale keys from previous days
+  if (sentAlertDate !== today) {
+    sentAlertKeys.clear();
+    sentAlertDate = today;
+  }
+
+  // 1. Fetch alerts
+  let alerts: NewsAlert[];
+  try {
+    alerts = await getActionableAlerts(env);
+  } catch (e) {
+    console.error("News monitor alert fetch failed:", e);
+    return;
+  }
+  if (alerts.length === 0) return;
+
+  // 1b. Dedup: filter out alerts already sent this process lifetime (same day)
+  alerts = alerts.filter((a) => {
+    const key = `${a.playerName}:${a.type}:${today}`;
+    return !sentAlertKeys.has(key);
+  });
+  if (alerts.length === 0) return;
+
+  // 1c. Fetch today's schedule — only alert if player's game hasn't started yet
+  let games: ScheduledGame[] = [];
+  try {
+    games = await getTodaysGames(today, env);
+  } catch {
+    // If schedule unavailable, skip time filtering (send all)
+  }
+
+  if (games.length > 0) {
+    const now = Date.now();
+    alerts = alerts.filter((a) => {
+      if (!a.team) return true; // no team info = can't filter, send it
+      // Find the game for this player's team
+      const game = games.find((g) => g.homeTeam === a.team || g.awayTeam === a.team);
+      if (!game) return true; // team not playing today = always actionable (e.g., trade/IL move)
+      if (game.status === "final") return false; // game over, too late
+      if (game.gameTime) {
+        const startTime = new Date(game.gameTime).getTime();
+        // Alert is actionable if game hasn't started yet (15min buffer for late scratches)
+        return now < startTime + 15 * 60 * 1000;
+      }
+      // No gameTime available but game isn't final — still actionable
+      return true;
+    });
+    if (alerts.length === 0) return;
+  }
+
+  // 2. Fetch roster for relevance filtering (light call, runs every 30min)
+  let rosterNames: string[] = [];
+  try {
+    const roster = await yahoo.getRoster();
+    rosterNames = roster.entries.map((e) => e.player.name);
+  } catch {
+    // If roster fetch fails, send all alerts unfiltered
+  }
+
+  // 3. Filter + enrich alerts
+  const messageParts: string[] = [];
+  let urgentWaiverFlag = false;
+
+  for (const alert of alerts) {
+    const relevance =
+      rosterNames.length > 0
+        ? classifyAlertRelevance(alert, rosterNames)
+        : ("OUR_PLAYER" as AlertRelevance); // no roster = send everything
+
+    if (!shouldSendAlert(alert, relevance)) continue;
+
+    const tag =
+      relevance === "OUR_PLAYER" ? " [ROSTER]" : relevance === "FREE_AGENT" ? " [FA]" : "";
+    let line = formatAlertForTelegram(alert) + tag;
+
+    // LLM injury assessment for injury + closer_change alerts
+    if (alert.type === "injury" || alert.type === "closer_change") {
+      try {
+        const rosterCtx =
+          relevance === "OUR_PLAYER"
+            ? `ON OUR ROSTER. Team: ${alert.team}. ${alert.fantasyImpact}`
+            : `Free agent. Team: ${alert.team}. ${alert.fantasyImpact}`;
+        const briefing = formatInjuryForLLM({
+          player: alert.playerName,
+          injury: alert.headline,
+          rosterContext: rosterCtx,
+          ilSlots: relevance === "OUR_PLAYER" ? "Check roster" : "N/A",
+        });
+        const prompt = injuryAssessmentPrompt(briefing);
+        const assessment = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
+        if (!assessment.startsWith("[")) {
+          line += `\n  → AI: ${assessment}`;
+        }
+      } catch {
+        // LLM enrichment is supplemental
+      }
+    }
+
+    // Flag closer changes for urgent waiver consideration
+    if (alert.type === "closer_change" && relevance === "FREE_AGENT") {
+      urgentWaiverFlag = true;
+    }
+
+    messageParts.push(line);
+  }
+
+  if (messageParts.length === 0) return;
+
+  // 4. Build and send message
+  const header = urgentWaiverFlag
+    ? "<b>🚨 News Alert (URGENT — closer change detected)</b>"
+    : "<b>News Alert</b>";
+  const msg = [header, ...messageParts].join("\n");
+
+  try {
+    await sendMessage(env, msg);
+    // Mark all alerts as sent after successful delivery
+    for (const alert of alerts) {
+      sentAlertKeys.add(`${alert.playerName}:${alert.type}:${today}`);
+    }
+  } catch (e) {
+    console.error("News monitor send failed:", e);
+  }
+
+  // 5. Log
+  try {
+    logDecision(env, {
+      type: "waiver",
+      action: {
+        routine: "news_monitor",
+        alertCount: messageParts.length,
+        urgentWaiver: urgentWaiverFlag,
+      },
+      reasoning: `News monitor: ${messageParts.length} relevant alerts${urgentWaiverFlag ? " (urgent closer change)" : ""}`,
+      result: "success",
+    });
+  } catch {
+    // best-effort
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sunday tactical analysis (Sunday 10am ET — final day of matchup week)
+// ---------------------------------------------------------------------------
+
+export async function runSundayTactics(env: Env): Promise<void> {
+  const yahoo = new YahooClient(env);
+
+  let matchup;
+  try {
+    matchup = await yahoo.getMatchup();
+  } catch (e) {
+    await sendMessage(
+      env,
+      `<b>Sunday Tactics</b>\nFailed to fetch matchup: ${e instanceof Error ? e.message : "unknown"}`,
+    );
+    return;
+  }
+
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    await yahoo.getRoster(today); // validate roster access
+  } catch (e) {
+    await sendMessage(
+      env,
+      `<b>Sunday Tactics</b>\nRoster fetch failed: ${e instanceof Error ? e.message : "unknown"}`,
+    );
+    return;
+  }
+
+  // Fetch standings rank (non-fatal)
+  const rankInfo = await getOurRank(yahoo, buildTeamKey(env));
+
+  // Detailed matchup analysis with 1 day remaining
+  const detailed = analyzeMatchupDetailed(matchup, 1);
+  const currentIP = getCurrentIP(matchup);
+  const ipInfo = getIPStatus(currentIP);
+
+  // Build category scoreboard with +/- indicators
+  const catLines: string[] = [];
+  for (const cs of matchup.categories) {
+    const indicator =
+      cs.myValue > cs.opponentValue ? "+" : cs.myValue < cs.opponentValue ? "-" : "=";
+    catLines.push(`  ${indicator} ${cs.category}: ${cs.myValue} vs ${cs.opponentValue}`);
+  }
+
+  // Build rich LLM briefing with ALL available data
+  const briefing = formatMatchupForLLM({
+    summary: `FINAL DAY Week ${matchup.week} vs ${matchup.opponentTeamName}, ${detailed.projectedWins}W-${detailed.projectedLosses}L-${detailed.swingCategories.length}T, 1 day left`,
+    categories: formatDetailedCategories(detailed),
+    worthless:
+      detailed.worthlessCategories.length > 0
+        ? `${detailed.worthlessCategories.join(", ")} — production here is worthless`
+        : "None — all categories still in play",
+    streaming: `${detailed.streamingDecision.reasoning} (quality floor: ${detailed.streamingDecision.qualityFloor})`,
+    ipStatus: `${ipInfo.currentIP.toFixed(1)} IP (${ipInfo.above ? "above" : "below"} ${ipInfo.minimum} min${ipInfo.ipNeeded > 0 ? `, need ${ipInfo.ipNeeded.toFixed(1)} more` : ""})`,
+    addBudget: `${getAddBudget(env).addsRemaining} adds remaining`,
+    standings: rankInfo?.label,
+    recentFeedback: getRecentFeedback(env),
+  });
+
+  let aiTactics = "";
+  try {
+    const prompt = matchupStrategyPrompt(briefing);
+    aiTactics = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
+  } catch (e) {
+    aiTactics = `LLM failed: ${e instanceof Error ? e.message : "unknown"}`;
+  }
+
+  const score = `${detailed.projectedWins}-${detailed.projectedLosses}-${detailed.swingCategories.length}`;
+  const lines = [
+    `<b>Sunday Tactics — Week ${matchup.week} Final Day</b>`,
+    `vs. ${matchup.opponentTeamName} | Score: ${score}`,
+    "",
+    ...catLines,
+    "",
+    `IP: ${ipInfo.currentIP.toFixed(1)} / ${ipInfo.minimum} min${ipInfo.ipNeeded > 0 ? ` (need ${ipInfo.ipNeeded.toFixed(1)} more)` : " (met)"}`,
+    "",
+    `<b>AI Tactics:</b> ${aiTactics}`,
+  ];
+
+  try {
+    await sendMessage(env, lines.join("\n"));
+  } catch {
+    try {
+      await sendMessage(env, `Sunday tactics generated for week ${matchup.week} but send failed`);
+    } catch {
+      // truly nothing we can do
+    }
+  }
+
+  logDecision(env, {
+    type: "lineup",
+    action: {
+      routine: "sunday_tactics",
+      week: matchup.week,
+      opponent: matchup.opponentTeamName,
+      score,
+      worthless: detailed.worthlessCategories,
+      swing: detailed.swingCategories,
+      ip: ipInfo.currentIP,
+    },
+    reasoning: `Sunday tactics for week ${matchup.week}: ${score} vs ${matchup.opponentTeamName}`,
+    result: "success",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Friday two-start SP preview (Friday 10am ET)
+// ---------------------------------------------------------------------------
+
+export async function runTwoStartPreview(env: Env): Promise<void> {
+  const yahoo = new YahooClient(env);
+
+  // Compute next week's Mon-Sun date range
+  const today = new Date();
+  const dayOfWeek = today.getDay(); // 0=Sun
+  // Days until next Monday: if Sun=0 -> 1, Mon=1 -> 7, Tue=2 -> 6, etc.
+  const daysUntilMon = dayOfWeek === 0 ? 1 : 8 - dayOfWeek;
+  const nextMon = new Date(today.getTime() + daysUntilMon * 86400000);
+  const nextSun = new Date(nextMon.getTime() + 6 * 86400000);
+  const weekStart = nextMon.toISOString().slice(0, 10);
+  const weekEnd = nextSun.toISOString().slice(0, 10);
+
+  // Current matchup week + 1 for display
+  let currentWeek = 0;
+  try {
+    const matchup = await yahoo.getMatchup();
+    currentWeek = matchup.week;
+  } catch {
+    // non-fatal — just won't show week number
+  }
+  const nextWeek = currentWeek > 0 ? currentWeek + 1 : 0;
+
+  let twoStarters;
+  try {
+    twoStarters = await getTwoStartPitchers(weekStart, weekEnd);
+  } catch (e) {
+    await sendMessage(
+      env,
+      `<b>Two-Start Preview</b>\nFailed to fetch two-start pitchers: ${e instanceof Error ? e.message : "unknown"}`,
+    );
+    return;
+  }
+
+  if (twoStarters.length === 0) {
+    await sendMessage(
+      env,
+      `<b>Two-Start Preview</b>\nNo two-start pitchers identified for ${weekStart} — ${weekEnd}. Probables may not be posted yet.`,
+    );
+    logDecision(env, {
+      type: "stream",
+      action: { routine: "two_start_preview", weekStart, weekEnd, count: 0 },
+      reasoning: "No two-start pitchers found (probables may not be posted)",
+      result: "success",
+    });
+    return;
+  }
+
+  // Fetch free agent SPs from Yahoo
+  let faSPs: Array<{ yahooId: string; name: string }> = [];
+  try {
+    faSPs = await yahoo.getFreeAgents("SP", 50);
+  } catch {
+    // non-fatal — just report all two-starters without availability
+  }
+
+  // Cross-reference: which two-start pitchers are available?
+  const faNames = new Set(faSPs.map((p) => p.name.toLowerCase()));
+  const available = twoStarters.filter((p) => faNames.has(p.name.toLowerCase()));
+  const rostered = twoStarters.filter((p) => !faNames.has(p.name.toLowerCase()));
+
+  // Get add budget
+  const budget = getAddBudget(env);
+
+  const weekLabel = nextWeek > 0 ? ` — Week ${nextWeek}` : "";
+  const lines = [
+    `<b>Two-Start SP Preview${weekLabel}</b>`,
+    `${budget.addsRemaining} adds remaining`,
+    `${weekStart} to ${weekEnd}`,
+    "",
+  ];
+
+  if (available.length > 0) {
+    lines.push(`<b>Available two-start SPs (${available.length}):</b>`);
+    for (const p of available) {
+      const opponents = p.starts.map((s) => `vs ${s.opponent}`).join(" / ");
+      const conf = p.confidence !== "confirmed" ? ` [${p.confidence}]` : "";
+      lines.push(`  • ${p.name} (${p.team}) ${opponents}${conf}`);
+    }
+  } else {
+    lines.push("No two-start SPs available on waivers.");
+  }
+
+  if (rostered.length > 0) {
+    lines.push("");
+    lines.push(`<b>Rostered two-start SPs (${rostered.length}):</b>`);
+    for (const p of rostered.slice(0, 10)) {
+      const opponents = p.starts.map((s) => `vs ${s.opponent}`).join(" / ");
+      const conf = p.confidence !== "confirmed" ? ` [${p.confidence}]` : "";
+      lines.push(`  • ${p.name} (${p.team}) ${opponents}${conf}`);
+    }
+  }
+
+  if (available.length > 0) {
+    lines.push("");
+    lines.push("Consider grabbing before Sunday waivers process.");
+  }
+
+  try {
+    await sendMessage(env, lines.join("\n"));
+  } catch {
+    try {
+      await sendMessage(env, `Two-start preview generated but send failed`);
+    } catch {
+      // truly nothing we can do
+    }
+  }
+
+  logDecision(env, {
+    type: "stream",
+    action: {
+      routine: "two_start_preview",
+      weekStart,
+      weekEnd,
+      totalTwoStarters: twoStarters.length,
+      available: available.map((p) => p.name),
+      rostered: rostered.slice(0, 10).map((p) => p.name),
+    },
+    reasoning: `Two-start preview: ${twoStarters.length} total, ${available.length} available on waivers`,
     result: "success",
   });
 }

@@ -15,9 +15,10 @@ import {
   runWeeklyMatchupAnalysis,
   runMidWeekAdjustment,
   runTradeEvaluation,
+  runNewsMonitor,
+  runSundayTactics,
+  runTwoStartPreview,
 } from "./gm";
-import { getActionableAlerts, formatAlertForTelegram } from "./monitors/news";
-import { sendMessage } from "./notifications/telegram";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -70,6 +71,7 @@ const env: Env = {
   TELEGRAM_CHAT_ID: requireEnvVar(cfg, "TELEGRAM_CHAT_ID"),
   ANTHROPIC_API_KEY: cfg.ANTHROPIC_API_KEY ?? process.env.ANTHROPIC_API_KEY,
   OPENAI_API_KEY: cfg.OPENAI_API_KEY ?? process.env.OPENAI_API_KEY,
+  OPENROUTER_API_KEY: cfg.OPENROUTER_API_KEY ?? process.env.OPENROUTER_API_KEY,
 };
 
 // ---------------------------------------------------------------------------
@@ -164,17 +166,22 @@ cron.schedule("0 14 * * 6", () => {
   runTradeEvaluation(env).catch((e) => console.error("runTradeEvaluation failed:", e));
 });
 
-// News monitor — every 30 min during game hours (1pm-11pm UTC / 9am-7pm ET)
-cron.schedule("*/30 13-23 * * *", async () => {
-  try {
-    const alerts = await getActionableAlerts(env);
-    if (alerts.length > 0) {
-      const msg = ["<b>News Alert</b>", ...alerts.map(formatAlertForTelegram)].join("\n");
-      await sendMessage(env, msg);
-    }
-  } catch (e) {
-    console.error("News monitor failed:", e);
-  }
+// Sunday 10am ET = 14:00 UTC — final day matchup tactics
+cron.schedule("0 14 * * 0", () => {
+  console.log(`[cron] runSundayTactics ${new Date().toISOString()}`);
+  runSundayTactics(env).catch((e) => console.error("runSundayTactics failed:", e));
+});
+
+// Friday 10am ET = 14:00 UTC — two-start SP preview for next week
+cron.schedule("0 14 * * 5", () => {
+  console.log(`[cron] runTwoStartPreview ${new Date().toISOString()}`);
+  runTwoStartPreview(env).catch((e) => console.error("runTwoStartPreview failed:", e));
+});
+
+// News monitor — :15 and :45 past each hour during game hours (avoids 13:00 overlap w/ daily morning)
+cron.schedule("15,45 13-23 * * *", () => {
+  console.log(`[cron] runNewsMonitor ${new Date().toISOString()}`);
+  runNewsMonitor(env).catch((e) => console.error("runNewsMonitor failed:", e));
 });
 
 // ---------------------------------------------------------------------------

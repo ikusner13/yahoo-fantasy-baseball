@@ -1,31 +1,52 @@
 import type { StatcastBatter, PlayerProjection } from "../types";
 
 // ---------------------------------------------------------------------------
-// Research notes
+// Research notes (updated 2026-04)
 // ---------------------------------------------------------------------------
-// - xwOBA has the highest predictive power for short-term future performance
-//   among Statcast metrics (r ~0.5 over 2-week windows vs ~0.3 for AVG)
-// - Hot streaks in baseball have limited predictive value beyond ~2 weeks,
-//   so weight should be modest (default 15%)
-// - Barrel% and hard hit% changes are more "real" than batting average
-//   fluctuations — these reflect process changes, not luck
-// - The 15% default weight is conservative: research shows recent performance
-//   explains ~10-20% of near-term variance (Carleton, 2015; Lichtman, 2019)
+// - Barrel% and hard hit% stabilize in ~50 BIP (~18 games) — far faster
+//   than xwOBA (~300 PA). These reflect PROCESS changes (swing decisions,
+//   bat speed, pitch selection) not spray-chart luck.
+// - Exit velocity on FB/LD explains r²=0.62 of HR/FB variance — stickiest
+//   individual Statcast metric.
+// - K% is the fastest-stabilizing outcome stat (~60 PA).
+// - xwOBA was designed as descriptive, not predictive. Needs hundreds of PA.
+// - Optimal recency weight is 10-20% for process metrics (15% default correct).
+// - Primary value of recency monitoring = structural change detection:
+//   velocity drops, barrel% shifts, mechanical adjustments.
 // ---------------------------------------------------------------------------
+
+// --- League-average baselines (2025 season) ---
+const LEAGUE_AVG_BARREL_PCT = 7.5;
+const LEAGUE_AVG_HARD_HIT_PCT = 37.0;
+const LEAGUE_AVG_EXIT_VELO = 88.5;
+const LEAGUE_AVG_K_PCT = 22.7;
+
+// --- Composite signal weights ---
+const W_BARREL = 0.35;
+const W_HARD_HIT = 0.25;
+const W_EXIT_VELO = 0.20;
+const W_K_PCT = 0.20;
+
+// --- Structural change threshold (in SDs) ---
+const STRUCTURAL_CHANGE_SD = 1.5;
+
+export type StructuralChange = "power-surge" | "power-drop" | "k-rate-spike" | "k-rate-drop";
 
 export interface RecentPerformance {
   mlbId: number;
   name: string;
-  // Recent Statcast (from leaderboard, represents ~current season)
-  recentXwoba: number;
+  // Statcast process metrics (primary signal)
   recentBarrelPct: number;
   recentHardHitPct: number;
   recentExitVelo: number;
-  // Projected xwOBA (from FanGraphs, represents expected performance)
+  recentXwoba: number; // kept for reference/display, de-emphasized in scoring
+  // Projected baseline
   projectedObp: number;
-  // Streak indicators
-  streakScore: number; // positive = hot, negative = cold (-1 to 1 scale)
-  streakConfidence: number; // 0 to 1, how much data backs this
+  // Composite streak score (-1 to 1)
+  streakScore: number;
+  streakConfidence: number; // 0 to 1
+  // Structural change detection
+  structuralChange?: StructuralChange | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -35,10 +56,11 @@ export interface RecentPerformance {
 /**
  * Match Statcast batters to FanGraphs projections and compute hot/cold streaks.
  *
+ * Uses a composite signal weighted toward fast-stabilizing process metrics
+ * (barrel%, hard hit%, exit velo) rather than relying solely on xwOBA.
+ *
  * Matching strategy: StatcastBatter has mlbId, PlayerProjection has yahooId.
  * The caller must supply a lookup map (mlbId -> yahooId) for cross-referencing.
- * If no map is provided, falls back to matching via the optional `names` map
- * (mlbId -> display name matched against projection names).
  */
 export function computeStreaks(
   statcast: StatcastBatter[],
@@ -54,9 +76,16 @@ export function computeStreaks(
     }
   }
 
-  // Collect all xwOBA values to compute stddev for z-score normalization
-  const xwobaValues = statcast.map((s) => s.xwoba).filter((v) => v > 0);
-  const sd = populationStddev(xwobaValues);
+  // Compute population SDs from the leaderboard for z-score normalization
+  const barrelValues = statcast.map((s) => s.barrelPct).filter((v) => v > 0);
+  const hardHitValues = statcast.map((s) => s.hardHitPct).filter((v) => v > 0);
+  const exitVeloValues = statcast.map((s) => s.exitVelo).filter((v) => v > 0);
+  const kPctValues = statcast.map((s) => s.kPct).filter((v): v is number => v != null && v > 0);
+
+  const sdBarrel = populationStddev(barrelValues);
+  const sdHardHit = populationStddev(hardHitValues);
+  const sdExitVelo = populationStddev(exitVeloValues);
+  const sdKPct = populationStddev(kPctValues);
 
   const results: RecentPerformance[] = [];
 
@@ -67,35 +96,100 @@ export function computeStreaks(
     if (!proj?.batting) continue;
 
     const projectedObp = proj.batting.obp;
-    // Convert OBP to approximate wOBA scale: wOBA ~= OBP * 1.15
-    // This is a rough heuristic; true conversion requires league-level constants
-    const projectedWoba = projectedObp * 1.15;
 
-    const rawDelta = sd > 0 ? (sc.xwoba - projectedWoba) / sd : 0;
-    const streakScore = clamp(rawDelta, -1, 1);
+    // --- Composite streak score ---
+    // For each metric: z-score = (recent - baseline) / SD, clamped to [-1, 1]
+    // Barrel%, hardHit%, exitVelo: positive delta = hot (higher is better)
+    // K%: INVERTED — positive delta = cold (higher K% is worse)
+
+    const barrelZ = sdBarrel > 0
+      ? clamp((sc.barrelPct - LEAGUE_AVG_BARREL_PCT) / sdBarrel, -1, 1)
+      : 0;
+    const hardHitZ = sdHardHit > 0
+      ? clamp((sc.hardHitPct - LEAGUE_AVG_HARD_HIT_PCT) / sdHardHit, -1, 1)
+      : 0;
+    const exitVeloZ = sdExitVelo > 0
+      ? clamp((sc.exitVelo - LEAGUE_AVG_EXIT_VELO) / sdExitVelo, -1, 1)
+      : 0;
+
+    // K%: use population avg as baseline when player kPct available, else 0 weight
+    let kPctZ = 0;
+    let effectiveKWeight = 0;
+    if (sc.kPct != null && sdKPct > 0) {
+      // Invert: lower K% = better = positive contribution
+      kPctZ = clamp((LEAGUE_AVG_K_PCT - sc.kPct) / sdKPct, -1, 1);
+      effectiveKWeight = W_K_PCT;
+    }
+
+    // Renormalize weights if kPct unavailable
+    const totalWeight = W_BARREL + W_HARD_HIT + W_EXIT_VELO + effectiveKWeight;
+    const streakScore = totalWeight > 0
+      ? clamp(
+          (barrelZ * W_BARREL + hardHitZ * W_HARD_HIT + exitVeloZ * W_EXIT_VELO + kPctZ * effectiveKWeight) / totalWeight,
+          -1,
+          1,
+        )
+      : 0;
 
     // Confidence: Savant leaderboard min is 25 PA. Scale linearly to 1.0 at 100 PA.
-    // Since the leaderboard doesn't expose PA directly, use a proxy:
-    // if exitVelo > 0 the player has qualifying ABs. Default to 0.5 (moderate confidence)
-    // for leaderboard-sourced data since min=25 PA filter is applied at fetch time.
+    // Since the leaderboard doesn't expose PA directly, use exitVelo as proxy for
+    // qualifying ABs. Default to 0.5 for leaderboard-sourced data (min=25 PA filter).
     const streakConfidence = sc.exitVelo > 0 ? 0.5 : 0.25;
+
+    // --- Structural change detection ---
+    const structuralChange = detectStructuralChange(sc, sdBarrel, sdExitVelo, sdKPct);
 
     const name = mlbIdToName?.get(sc.mlbId) ?? `MLB#${sc.mlbId}`;
 
     results.push({
       mlbId: sc.mlbId,
       name,
-      recentXwoba: sc.xwoba,
       recentBarrelPct: sc.barrelPct,
       recentHardHitPct: sc.hardHitPct,
       recentExitVelo: sc.exitVelo,
+      recentXwoba: sc.xwoba,
       projectedObp,
       streakScore,
       streakConfidence,
+      structuralChange,
     });
   }
 
   return results;
+}
+
+/**
+ * Detect structural changes — the #1 value of recency monitoring.
+ * Flags when barrel%, exit velo, or K% has shifted >1.5 SD from league avg.
+ */
+function detectStructuralChange(
+  sc: StatcastBatter,
+  sdBarrel: number,
+  sdExitVelo: number,
+  sdKPct: number,
+): StructuralChange | null {
+  // Check barrel% first (fastest-stabilizing, most actionable)
+  if (sdBarrel > 0) {
+    const barrelDeviation = (sc.barrelPct - LEAGUE_AVG_BARREL_PCT) / sdBarrel;
+    if (barrelDeviation >= STRUCTURAL_CHANGE_SD) return "power-surge";
+    if (barrelDeviation <= -STRUCTURAL_CHANGE_SD) return "power-drop";
+  }
+
+  // Check exit velo (stickiest metric)
+  if (sdExitVelo > 0) {
+    const veloDeviation = (sc.exitVelo - LEAGUE_AVG_EXIT_VELO) / sdExitVelo;
+    if (veloDeviation >= STRUCTURAL_CHANGE_SD) return "power-surge";
+    if (veloDeviation <= -STRUCTURAL_CHANGE_SD) return "power-drop";
+  }
+
+  // Check K% (inverted: high K% = bad)
+  if (sc.kPct != null && sdKPct > 0) {
+    const kDeviation = (sc.kPct - LEAGUE_AVG_K_PCT) / sdKPct;
+    if (kDeviation >= STRUCTURAL_CHANGE_SD) return "k-rate-spike";
+    if (kDeviation <= -STRUCTURAL_CHANGE_SD) return "k-rate-drop";
+  }
+
+  return null;
 }
 
 /**

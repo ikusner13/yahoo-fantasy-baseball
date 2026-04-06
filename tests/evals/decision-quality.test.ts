@@ -147,6 +147,8 @@ describe("Decision Quality Evals", () => {
       // The matchup analysis should recommend protecting ratios
       const m: Matchup = {
         week: 1,
+        weekStart: "2026-03-30",
+        weekEnd: "2026-04-05",
         opponentTeamKey: "opp",
         opponentTeamName: "Opponent",
         categories: [
@@ -202,6 +204,8 @@ describe("Decision Quality Evals", () => {
     it("should punt lost categories and focus on swing categories", () => {
       const m: Matchup = {
         week: 1,
+        weekStart: "2026-03-30",
+        weekEnd: "2026-04-05",
         opponentTeamKey: "opp",
         opponentTeamName: "Opponent",
         categories: [

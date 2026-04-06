@@ -231,6 +231,8 @@ describe("Matchup analysis with realistic data", () => {
   it("correctly identifies a winning matchup", () => {
     const matchup: Matchup = {
       week: 1,
+      weekStart: "2026-03-30",
+      weekEnd: "2026-04-05",
       opponentTeamKey: "mlb.l.12345.t.5",
       opponentTeamName: "Team Opponent",
       categories: [
@@ -263,6 +265,8 @@ describe("Matchup analysis with realistic data", () => {
   it("identifies swing categories in a tight matchup", () => {
     const matchup: Matchup = {
       week: 2,
+      weekStart: "2026-04-06",
+      weekEnd: "2026-04-12",
       opponentTeamKey: "mlb.l.12345.t.3",
       opponentTeamName: "Team Rival",
       categories: [

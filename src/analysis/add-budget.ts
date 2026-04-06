@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Env } from "../types";
 import type { PickupRecommendation } from "./waivers";
+import { loadTuning } from "../config/tuning";
 
 // --- Interfaces ---
 
@@ -14,22 +15,19 @@ export interface AddBudgetState {
 
 export type AddPriority = "critical" | "high" | "medium" | "low";
 
-// --- Constants ---
-
-const MAX_ADDS_PER_WEEK = 6;
-
 // --- Helpers ---
 
 function budgetPath(env: Env): string {
   return `${env.DATA_DIR}/add-budget.json`;
 }
 
-/** Day-of-week aware reserve calculation. Mon/Tue = 3, Wed/Thu = 2, Fri-Sun = 0. */
+/** Day-of-week aware reserve calculation. Reads thresholds from tuning config. */
 function computeReserve(): number {
+  const { budget } = loadTuning();
   const day = new Date().getDay(); // 0=Sun, 1=Mon, ...
-  if (day === 1 || day === 2) return 3; // Mon-Tue: save more
-  if (day >= 5 || day === 0) return 0; // Fri-Sun: spend freely
-  return 2; // Wed-Thu: default
+  if (day === 1 || day === 2) return budget.reserveMonTue;
+  if (day >= 5 || day === 0) return budget.reserveFriSun;
+  return budget.reserveWedThu;
 }
 
 function readState(env: Env): AddBudgetState {
@@ -43,7 +41,7 @@ function readState(env: Env): AddBudgetState {
     return {
       weekStart,
       addsUsed: 0,
-      addsRemaining: MAX_ADDS_PER_WEEK,
+      addsRemaining: loadTuning().budget.maxAddsPerWeek,
       reserveForReactions: computeReserve(),
     };
   }
@@ -65,15 +63,15 @@ export function getAddBudget(env: Env): AddBudgetState {
   const state = readState(env);
   // Always refresh reserve based on current day
   state.reserveForReactions = computeReserve();
-  state.addsRemaining = MAX_ADDS_PER_WEEK - state.addsUsed;
+  state.addsRemaining = loadTuning().budget.maxAddsPerWeek - state.addsUsed;
   return state;
 }
 
 /** Increment addsUsed and persist. */
 export function recordAdd(env: Env): void {
   const state = readState(env);
-  state.addsUsed = Math.min(state.addsUsed + 1, MAX_ADDS_PER_WEEK);
-  state.addsRemaining = MAX_ADDS_PER_WEEK - state.addsUsed;
+  state.addsUsed = Math.min(state.addsUsed + 1, loadTuning().budget.maxAddsPerWeek);
+  state.addsRemaining = loadTuning().budget.maxAddsPerWeek - state.addsUsed;
   state.reserveForReactions = computeReserve();
   writeState(env, state);
 }
@@ -83,7 +81,7 @@ export function resetWeeklyBudget(env: Env, weekStart: string): void {
   const state: AddBudgetState = {
     weekStart,
     addsUsed: 0,
-    addsRemaining: MAX_ADDS_PER_WEEK,
+    addsRemaining: loadTuning().budget.maxAddsPerWeek,
     reserveForReactions: computeReserve(),
   };
   writeState(env, state);

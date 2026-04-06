@@ -15,7 +15,11 @@ function tokenPath(env: Env): string {
 function readTokens(env: Env): YahooTokens | null {
   const p = tokenPath(env);
   if (!existsSync(p)) return null;
-  return JSON.parse(readFileSync(p, "utf-8")) as YahooTokens;
+  try {
+    return JSON.parse(readFileSync(p, "utf-8")) as YahooTokens;
+  } catch {
+    return null;
+  }
 }
 
 function writeTokens(env: Env, tokens: YahooTokens): void {
