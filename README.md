@@ -1,18 +1,40 @@
 # Fantasy Baseball GM
 
-AI-powered assistant for Yahoo Fantasy Baseball. Runs on Cloudflare Workers with D1 (SQLite), KV, and cron triggers. Analyzes your matchup, optimizes lineups, scouts the waiver wire, evaluates trades, and sends recommendations to Telegram.
+An autonomous AI general manager for Yahoo Fantasy Baseball. It monitors your league 24/7, sets optimal lineups, scouts the waiver wire, evaluates trades, tracks injuries, and sends you actionable recommendations via Telegram — all running serverlessly on Cloudflare Workers.
 
-## What It Does
+Built for **head-to-head categories** leagues. Every decision is driven by LLM analysis layered on top of real statistical data: rest-of-season projections from FanGraphs, Statcast metrics, pitcher/batter splits, park factors, Vegas run lines, and your current matchup context.
 
-- **Daily lineup optimization** — sets your lineup based on projections, matchups, park factors, splits, and recent performance
-- **Waiver wire scouting** — finds pickups, manages weekly add budget, identifies streamers
-- **Trade evaluation** — proposes and evaluates trades with approval flow via Telegram
-- **Matchup analysis** — weekly opponent scouting, category targeting, punt strategies
-- **IL management** — monitors injury news, suggests IL stashes and activations
-- **News monitoring** — polls for player news every 30 min, deduplicates alerts
-- **Retrospectives** — weekly review of decisions and outcomes for self-improvement
+## How It Works
 
-All analysis is powered by LLMs (via OpenRouter) combined with projection data from FanGraphs, Statcast metrics, Vegas lines, and MLB schedule data.
+The GM runs as a Cloudflare Worker with scheduled cron triggers. Each trigger fires a specific analysis task that reads your roster, evaluates the situation, consults an LLM, and sends you a Telegram message with what it found and what it recommends.
+
+**Daily:**
+
+- **Morning analysis** — reviews your lineup for the day, checks projected starters, identifies optimal sits/starts based on matchups, park factors, and recent performance
+- **Late scratch check** — catches last-minute lineup changes before games lock
+
+**Weekly:**
+
+- **Monday** — full matchup breakdown against your opponent, identifies category targets and punt candidates
+- **Wednesday** — mid-week adjustment based on how the matchup is trending
+- **Friday** — two-start pitcher preview for the upcoming week
+- **Saturday** — trade evaluation, proposes and analyzes potential deals
+- **Sunday** — end-of-week tactics for close categories
+
+**Continuous:**
+
+- **News monitoring** (every 30 min) — player news alerts with deduplication so you don't get spammed
+
+All decisions are logged to a database with reasoning, and the GM runs weekly retrospectives to learn from outcomes.
+
+### Telegram Integration
+
+The GM sends all recommendations to Telegram. For trades, it sends messages with inline **Approve / Reject** buttons so you stay in control of roster-altering moves.
+
+Commands you can send to the bot:
+
+- `/status` — confirm the GM is running
+- `/feedback good|bad|note <text>` — tell the GM what it got right or wrong (feeds into the learning loop)
 
 ## Architecture
 
@@ -30,38 +52,22 @@ Cloudflare Worker (Hono)
   |-- Odds API ------- Vegas lines for run environment context
 ```
 
-### Cron Schedule (UTC)
-
-| Schedule           | Task                             |
-| ------------------ | -------------------------------- |
-| `0 13 * * *`       | Daily morning analysis + lineup  |
-| `0 22 * * *`       | Late scratch check               |
-| `0 14 * * 1`       | Monday matchup analysis          |
-| `0 19 * * 3`       | Wednesday mid-week adjustment    |
-| `0 14 * * 5`       | Friday two-start pitcher preview |
-| `0 14 * * 6`       | Saturday trade evaluation        |
-| `0 14 * * SUN`     | Sunday tactics                   |
-| `*/30 13-23 * * *` | News monitoring                  |
-
-### Telegram Commands
-
-| Command                            | Description                    |
-| ---------------------------------- | ------------------------------ |
-| `/status`                          | Health check                   |
-| `/feedback good\|bad\|note <text>` | Log feedback for learning loop |
-
-Trade proposals are sent with inline approve/reject buttons.
+Everything runs on Cloudflare's free tier.
 
 ## Setup
 
 ### Prerequisites
 
-- [Node.js](https://nodejs.org/) (v20+)
-- [pnpm](https://pnpm.io/)
-- A [Cloudflare](https://cloudflare.com) account
-- A [Yahoo Developer](https://developer.yahoo.com/) app (OAuth2 credentials)
-- A [Telegram Bot](https://core.telegram.org/bots#botfather) token
-- An [OpenRouter](https://openrouter.ai/) API key
+You'll need accounts/keys for the following services:
+
+| Service                                                  | What it's used for                       | How to get it                                                            |
+| -------------------------------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------ |
+| [Cloudflare](https://dash.cloudflare.com/sign-up)        | Hosting (Workers, D1 database, KV store) | Sign up for free                                                         |
+| [Yahoo Developer](https://developer.yahoo.com/apps/)     | Accessing your fantasy league data       | Create an app, select "Fantasy Sports" API, use `oob` as redirect URI    |
+| [Telegram Bot](https://core.telegram.org/bots#botfather) | Receiving recommendations                | Message [@BotFather](https://t.me/botfather) on Telegram, send `/newbot` |
+| [OpenRouter](https://openrouter.ai/)                     | LLM API access                           | Sign up, add credits, copy API key                                       |
+
+You'll also need [Node.js](https://nodejs.org/) v20+ and [pnpm](https://pnpm.io/).
 
 ### 1. Clone and install
 
@@ -71,58 +77,9 @@ cd yahoo-fantasy-baseball
 pnpm install
 ```
 
-### 2. Configure Cloudflare resources
+### 2. Configure your league
 
-Log in to Cloudflare:
-
-```sh
-npx wrangler login
-```
-
-Create the D1 database and KV namespace:
-
-```sh
-npx wrangler d1 create fantasy-baseball
-npx wrangler kv namespace create KV
-```
-
-Update `wrangler.jsonc` with the IDs from the output:
-
-- `d1_databases[0].database_id` -- from `d1 create`
-- `kv_namespaces[0].id` -- from `kv namespace create`
-
-If you have multiple Cloudflare accounts, set `CLOUDFLARE_ACCOUNT_ID` in your `.env`.
-
-### 3. Generate and apply database migrations
-
-```sh
-pnpm db:generate          # generate migration SQL from Drizzle schema
-pnpm db:migrate:local     # test locally
-pnpm db:migrate:remote    # apply to production D1
-```
-
-### 4. Set secrets
-
-Pipe values to avoid trailing newlines:
-
-```sh
-echo -n "your-value" | npx wrangler secret put YAHOO_CLIENT_ID
-echo -n "your-value" | npx wrangler secret put YAHOO_CLIENT_SECRET
-echo -n "your-value" | npx wrangler secret put TELEGRAM_BOT_TOKEN
-echo -n "your-value" | npx wrangler secret put OPENROUTER_API_KEY
-```
-
-Optional:
-
-```sh
-echo -n "your-value" | npx wrangler secret put ANTHROPIC_API_KEY
-echo -n "your-value" | npx wrangler secret put OPENAI_API_KEY
-echo -n "your-value" | npx wrangler secret put ODDS_API_KEY
-```
-
-### 5. Configure your league
-
-Edit the `vars` section in `wrangler.jsonc`:
+Edit the `vars` section in `wrangler.jsonc` with your league details:
 
 ```jsonc
 "vars": {
@@ -132,9 +89,93 @@ Edit the `vars` section in `wrangler.jsonc`:
 }
 ```
 
-### 6. Local development
+**Finding these values:**
 
-Create a `.env` file for local secrets:
+- **Yahoo League ID** — go to your league on Yahoo Fantasy, the URL looks like `https://baseball.fantasysports.yahoo.com/b2/62744` — the number at the end is your league ID
+- **Yahoo Team ID** — click on your team, the URL looks like `.../62744/12` — the last number is your team ID
+- **Telegram Chat ID** — message [@userinfobot](https://t.me/userinfobot) on Telegram, it replies with your chat ID
+
+### 3. Create Cloudflare resources
+
+```sh
+npx wrangler login
+npx wrangler d1 create fantasy-baseball
+npx wrangler kv namespace create KV
+```
+
+Each command outputs an ID. Update `wrangler.jsonc` with them:
+
+- `d1_databases[0].database_id` — from `d1 create`
+- `kv_namespaces[0].id` — from `kv namespace create`
+
+If you have multiple Cloudflare accounts, set `CLOUDFLARE_ACCOUNT_ID` in a `.env` file.
+
+### 4. Set up the database
+
+```sh
+pnpm db:generate          # generate migration SQL from Drizzle schema
+pnpm db:migrate:local     # test locally
+pnpm db:migrate:remote    # apply to production D1
+```
+
+### 5. Set secrets
+
+These are sensitive values that get encrypted on Cloudflare's side. Pipe values with `echo -n` to avoid trailing newline issues:
+
+```sh
+echo -n "your-yahoo-client-id"     | npx wrangler secret put YAHOO_CLIENT_ID
+echo -n "your-yahoo-client-secret" | npx wrangler secret put YAHOO_CLIENT_SECRET
+echo -n "your-telegram-bot-token"  | npx wrangler secret put TELEGRAM_BOT_TOKEN
+echo -n "your-openrouter-api-key"  | npx wrangler secret put OPENROUTER_API_KEY
+```
+
+Optional (for direct API access instead of OpenRouter, or for Vegas odds):
+
+```sh
+echo -n "your-value" | npx wrangler secret put ANTHROPIC_API_KEY
+echo -n "your-value" | npx wrangler secret put OPENAI_API_KEY
+echo -n "your-value" | npx wrangler secret put ODDS_API_KEY
+```
+
+### 6. Deploy
+
+```sh
+npx wrangler deploy
+```
+
+### 7. Post-deploy setup
+
+**Connect Telegram** — point your bot's webhook to the worker (replace `<TOKEN>` and `<subdomain>`):
+
+```sh
+curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://fantasy-baseball.<subdomain>.workers.dev/telegram"
+```
+
+**Connect Yahoo** — visit this URL in your browser to complete the OAuth flow:
+
+```
+https://fantasy-baseball.<subdomain>.workers.dev/auth
+```
+
+Your `<subdomain>` is your Cloudflare account name (visible in the deploy output).
+
+### 8. Verify
+
+```sh
+curl https://fantasy-baseball.<subdomain>.workers.dev/health
+```
+
+Then send `/status` to your Telegram bot — it should reply **"GM is online"**.
+
+To watch live logs:
+
+```sh
+npx wrangler tail
+```
+
+## Local Development
+
+Create a `.env` file with your secrets for local use:
 
 ```
 YAHOO_CLIENT_ID=...
@@ -147,50 +188,15 @@ OPENROUTER_API_KEY=...
 pnpm dev                  # starts wrangler dev server at localhost:8787
 ```
 
-- `http://localhost:8787/health` -- health check
-- `http://localhost:8787/auth` -- start Yahoo OAuth flow
-- `http://localhost:8787/test` -- run read-only test suite
+- `http://localhost:8787/health` — health check
+- `http://localhost:8787/auth` — Yahoo OAuth flow
+- `http://localhost:8787/test` — read-only test suite
 
-Simulate a cron trigger:
+Simulate a cron trigger locally:
 
 ```sh
 curl "http://localhost:8787/__scheduled?cron=0+13+*+*+*"
 ```
-
-### 7. Deploy
-
-```sh
-npx wrangler deploy
-```
-
-### 8. Post-deploy setup
-
-Set the Telegram webhook:
-
-```sh
-curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://fantasy-baseball.<subdomain>.workers.dev/telegram"
-```
-
-Authenticate with Yahoo by visiting:
-
-```
-https://fantasy-baseball.<subdomain>.workers.dev/auth
-```
-
-### 9. Verify
-
-```sh
-# health check
-curl https://fantasy-baseball.<subdomain>.workers.dev/health
-
-# tail live logs
-npx wrangler tail
-
-# trigger a test run
-curl https://fantasy-baseball.<subdomain>.workers.dev/test
-```
-
-Send `/status` to your Telegram bot -- it should reply "GM is online".
 
 ## Project Structure
 
@@ -198,10 +204,9 @@ Send `/status` to your Telegram bot -- it should reply "GM is online".
 src/
   worker.tsx            # Cloudflare Worker entry point (Hono routes + scheduled handler)
   cron.ts               # Cron pattern dispatcher
-  gm.ts                 # Game manager -- orchestrates all analysis tasks
+  gm.ts                 # Game manager — orchestrates all analysis tasks
   types.ts              # Core TypeScript interfaces
   test-harness.ts       # Read-only test suite
-  simulation.ts         # Simulation utilities
   db/schema.ts          # Drizzle ORM table definitions (D1/SQLite)
   config/tuning.ts      # Tuning parameters
   ai/                   # LLM integration, prompts, data formatting
@@ -226,10 +231,10 @@ src/
 
 ## Tech Stack
 
-- [Cloudflare Workers](https://developers.cloudflare.com/workers/) -- compute
-- [Cloudflare D1](https://developers.cloudflare.com/d1/) -- SQLite database
-- [Cloudflare KV](https://developers.cloudflare.com/kv/) -- key-value store
-- [Hono](https://hono.dev/) -- web framework
-- [Drizzle ORM](https://orm.drizzle.team/) -- type-safe SQL
-- [OpenRouter](https://openrouter.ai/) -- LLM gateway
+- [Cloudflare Workers](https://developers.cloudflare.com/workers/) — serverless compute
+- [Cloudflare D1](https://developers.cloudflare.com/d1/) — SQLite at the edge
+- [Cloudflare KV](https://developers.cloudflare.com/kv/) — key-value store
+- [Hono](https://hono.dev/) — web framework
+- [Drizzle ORM](https://orm.drizzle.team/) — type-safe SQL
+- [OpenRouter](https://openrouter.ai/) — LLM gateway
 - TypeScript
