@@ -69,6 +69,8 @@ import {
 } from "./data/matchup-data";
 import { buildRetrospective, formatRetrospectiveForTelegram } from "./analysis/retrospective";
 import { loadTuning } from "./config/tuning";
+import { logDecisionEvent, logError } from "./observability/log";
+import { buildMemoryContext, generateReflection } from "./ai/memory";
 import { eq, desc } from "drizzle-orm";
 import {
   feedback as feedbackTable,
@@ -87,7 +89,8 @@ async function getRecentFeedback(env: Env, limit: number = 5): Promise<string | 
       .all();
     if (rows.length === 0) return undefined;
     return rows.map((r) => `\u2022 [${r.type}] ${r.message}`).join("\n");
-  } catch {
+  } catch (e) {
+    logError("feedback_fetch", e);
     return undefined;
   }
 }
@@ -99,7 +102,8 @@ async function getSentAlertKeys(env: Env): Promise<Set<string>> {
   try {
     const raw = (await env.KV.get(ALERT_KV_KEY, "json")) as string[] | null;
     return new Set(raw ?? []);
-  } catch {
+  } catch (e) {
+    logError("alert_keys_fetch", e);
     return new Set();
   }
 }
@@ -182,7 +186,8 @@ async function getOurRank(
       rank: us.rank,
       label: `#${us.rank} (${us.wins}-${us.losses}-${us.ties})`,
     };
-  } catch {
+  } catch (e) {
+    logError("standings_fetch", e);
     return undefined;
   }
 }
@@ -244,7 +249,8 @@ async function buildProjectionMap(
       });
       try {
         await upsertPlayerIds(env, rows);
-      } catch {
+      } catch (e) {
+        logError("player_ids_upsert", e);
         // non-fatal — DB write failure shouldn't break projection flow
       }
     }
@@ -318,24 +324,28 @@ export async function runDailyMorning(env: Env): Promise<void> {
         // Run injury alerts through LLM injury assessment
         if (alert.type === "injury" && alert.playerName) {
           try {
+            const injuryMemory = await buildMemoryContext(env, "injury");
             const briefing = formatInjuryForLLM({
               player: alert.playerName,
               injury: alert.headline,
               rosterContext: `Team: ${alert.team}. ${alert.fantasyImpact}`,
               ilSlots: "Check roster for availability",
+              memory: injuryMemory,
             });
             const prompt = injuryAssessmentPrompt(briefing);
             const assessment = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
             if (!assessment.startsWith("[")) {
               summaryLines.push(`  → AI: ${assessment}`);
             }
-          } catch {
+          } catch (e) {
+            logError("injury_assessment", e);
             // supplemental
           }
         }
       }
     }
-  } catch {
+  } catch (e) {
+    logError("news_alerts", e);
     // non-fatal
   }
 
@@ -345,6 +355,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
     roster = await yahoo.getRoster(today);
     summaryLines.push(`Roster: ${roster.entries.length} players`);
   } catch (e) {
+    logError("roster_fetch", e);
     const msg = `Roster fetch failed: ${e instanceof Error ? e.message : "unknown"}`;
     summaryLines.push(msg);
     await sendMessage(env, summaryLines.join("\n"));
@@ -358,6 +369,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
     summaryLines.push(`Games today: ${games.length}`);
     appendProbablePitchers(summaryLines, games);
   } catch (e) {
+    logError("games_fetch", e);
     summaryLines.push(`Games fetch failed: ${e instanceof Error ? e.message : "unknown"}`);
   }
 
@@ -377,7 +389,8 @@ export async function runDailyMorning(env: Env): Promise<void> {
     if (edgeTeams.length > 0) {
       summaryLines.push(`7-game teams this week: ${edgeTeams.join(", ")}`);
     }
-  } catch {
+  } catch (e) {
+    logError("week_schedule", e);
     // non-fatal
   }
 
@@ -399,6 +412,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
     valuations = computeZScores(allProjections);
     summaryLines.push(`Valuations: ${valuations.length} players scored`);
   } catch (e) {
+    logError("projections_fetch", e);
     summaryLines.push(`Projections failed: ${e instanceof Error ? e.message : "unknown"}`);
   }
 
@@ -410,7 +424,8 @@ export async function runDailyMorning(env: Env): Promise<void> {
     if (matchup.categories.length > 0) {
       matchupAnalysis = analyzeMatchup(matchup);
     }
-  } catch {
+  } catch (e) {
+    logError("matchup_fetch", e);
     // non-fatal, lineup optimization works without matchup context
   }
 
@@ -488,6 +503,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
       summaryLines.push("Statcast: skipped (no mlbId mappings)");
     }
   } catch (e) {
+    logError("statcast_fetch", e);
     summaryLines.push(
       `Statcast: failed (${e instanceof Error ? e.message : "unknown"}) — continuing without`,
     );
@@ -510,7 +526,8 @@ export async function runDailyMorning(env: Env): Promise<void> {
     if (contextMap.size > 0) {
       summaryLines.push(`Park factors: ${contextMap.size} players in context`);
     }
-  } catch {
+  } catch (e) {
+    logError("park_factors", e);
     // Park factors are static — this should never fail, but be safe
     contextMap = undefined;
   }
@@ -599,6 +616,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
       );
     }
   } catch (e) {
+    logError("platoon_splits", e);
     summaryLines.push(
       `Platoon: failed (${e instanceof Error ? e.message : "unknown"}) — continuing without`,
     );
@@ -628,6 +646,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
           await sendMessage(env, ilMsg);
           summaryLines.push(`IL moves notified: ${ilMoves.length}`);
         } catch (e) {
+          logError("il_notification", e);
           summaryLines.push(
             `IL notification failed: ${e instanceof Error ? e.message : "unknown"}`,
           );
@@ -643,6 +662,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
       result: ilActions.length > 0 ? "notified" : "success",
     });
   } catch (e) {
+    logError("il_check", e);
     summaryLines.push(`IL check failed: ${e instanceof Error ? e.message : "unknown"}`);
   }
 
@@ -662,6 +682,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
 
     // AI: explain lineup decisions (supplemental — stats engine already decided)
     try {
+      const lineupMemory = await buildMemoryContext(env, "lineup");
       const starters = moves.filter((m) => m.position !== "BN" && m.position !== "IL");
       const benched = moves.filter((m) => m.position === "BN");
       const briefing = formatLineupForLLM({
@@ -676,13 +697,15 @@ export async function runDailyMorning(env: Env): Promise<void> {
         strategy: matchupAnalysis?.strategy.benchMessage,
         swingCategories: matchupAnalysis?.swingCategories.join(", "),
         streaks: streakSummaryText || undefined,
+        memory: lineupMemory,
       });
       const prompt = lineupSummaryPrompt(briefing);
       const aiNotes = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
       if (!aiNotes.startsWith("[")) {
         summaryLines.push(`\n<b>AI Notes:</b> ${aiNotes}`);
       }
-    } catch {
+    } catch (e) {
+      logError("lineup_ai_notes", e);
       // supplemental — don't fail
     }
 
@@ -693,6 +716,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
       result: moves.length > 0 ? "notified" : "success",
     });
   } catch (e) {
+    logError("lineup_optimization", e);
     summaryLines.push(`Lineup optimization failed: ${e instanceof Error ? e.message : "unknown"}`);
   }
 
@@ -766,6 +790,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
             await sendMessage(env, pickupMsg);
             summaryLines.push(`  -> ${pickupNotifications.length} pickup(s) notified`);
           } catch (e) {
+            logError("pickup_notification", e);
             summaryLines.push(
               `  -> Pickup notification failed: ${e instanceof Error ? e.message : "unknown"}`,
             );
@@ -774,6 +799,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
 
         // LLM: commentary on waiver recommendations (supplemental — stats engine already decided)
         try {
+          const waiverMemory = await buildMemoryContext(env, "waiver");
           const rosterNeeds =
             valuations.length > 0 ? identifyCategoryNeeds(valuations).join(", ") : "unknown";
           const swingCats = matchupAnalysis?.swingCategories.join(", ") ?? "unknown";
@@ -782,13 +808,15 @@ export async function runDailyMorning(env: Env): Promise<void> {
             addBudget: `${budget.addsRemaining} adds remaining (${budget.addsUsed} used)`,
             recommendations: pickups.map((r) => r.reasoning).join("\n"),
             rosterNeeds,
+            memory: waiverMemory,
           });
           const prompt = waiverWirePrompt(briefing);
           const waiverInsight = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
           if (!waiverInsight.startsWith("[")) {
             summaryLines.push(`\n<b>AI Waiver Notes:</b> ${waiverInsight}`);
           }
-        } catch {
+        } catch (e) {
+          logError("waiver_ai_notes", e);
           // supplemental — don't fail
         }
       } else {
@@ -798,6 +826,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
       summaryLines.push("Waivers: skipped (no FAs or valuations)");
     }
   } catch (e) {
+    logError("waiver_scan", e);
     summaryLines.push(`Waiver scan failed: ${e instanceof Error ? e.message : "unknown"}`);
   }
 
@@ -897,6 +926,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
                 result: "notified",
               });
             } catch (e) {
+              logError("stream_notification", e);
               summaryLines.push(
                 `  -> Stream notification failed: ${e instanceof Error ? e.message : "unknown"}`,
               );
@@ -916,6 +946,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
       summaryLines.push("Streaming: skipped (no FA pitchers or games)");
     }
   } catch (e) {
+    logError("streaming_analysis", e);
     summaryLines.push(`Streaming analysis failed: ${e instanceof Error ? e.message : "unknown"}`);
   }
 
@@ -923,13 +954,15 @@ export async function runDailyMorning(env: Env): Promise<void> {
   try {
     await sendMessage(env, summaryLines.join("\n"));
   } catch (e) {
+    logError("telegram_summary", e);
     // last-resort: try a simpler message
     try {
       await sendMessage(
         env,
         `GM report generated but Telegram formatting failed: ${e instanceof Error ? e.message : "unknown"}`,
       );
-    } catch {
+    } catch (e) {
+      logError("telegram_summary_fallback", e);
       // truly nothing we can do
     }
   }
@@ -938,7 +971,8 @@ export async function runDailyMorning(env: Env): Promise<void> {
   for (const d of decisions) {
     try {
       await logDecision(env, d);
-    } catch {
+    } catch (e) {
+      logError("decision_logging", e);
       // db logging is best-effort
     }
   }
@@ -949,7 +983,8 @@ export async function runDailyMorning(env: Env): Promise<void> {
       reasoning: `Morning routine completed for ${today}`,
       result: "success",
     });
-  } catch {
+  } catch (e) {
+    logError("completion_logging", e);
     // best-effort
   }
 }
@@ -968,10 +1003,12 @@ export async function runLateScratchCheck(env: Env): Promise<void> {
     [roster, games] = await Promise.all([yahoo.getRoster(today), getTodaysGames(today, env)]);
   } catch (e) {
     const msg = `Late scratch check failed: ${e instanceof Error ? e.message : "unknown"}`;
+    logError("late_scratch_fetch", e);
     console.error(msg);
     try {
       await sendMessage(env, `<b>Late Scratch Error</b>\n${msg}`);
-    } catch {
+    } catch (e) {
+      logError("late_scratch_telegram", e);
       // telegram send itself failed
     }
     return;
@@ -998,6 +1035,7 @@ export async function runLateScratchCheck(env: Env): Promise<void> {
         changes.push(`Lineup re-optimization notified: ${moves.length} moves`);
       }
     } catch (e) {
+      logError("late_scratch_reoptimize", e);
       changes.push(`Re-optimization failed: ${e instanceof Error ? e.message : "unknown"}`);
     }
   }
@@ -1061,16 +1099,24 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
           reasoning: `Week ${prevWeek} retrospective: ${retro.finalScore}`,
           result: "success",
         });
+
+        // Generate compressed reflection from recent decisions + retrospective
+        try {
+          await generateReflection(env, []);
+        } catch (e) {
+          logError("reflection_generation", e);
+        }
       }
     }
-  } catch {
-    // non-fatal — don't block new week analysis
+  } catch (e) {
+    logError("weekly_retrospective", e);
   }
 
   let matchup;
   try {
     matchup = await yahoo.getMatchup();
   } catch (e) {
+    logError("matchup_fetch", e);
     await sendMessage(
       env,
       `<b>Weekly Matchup</b>\nFailed to fetch matchup: ${e instanceof Error ? e.message : "unknown"}`,
@@ -1082,6 +1128,7 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
   try {
     analysis = analyzeMatchup(matchup);
   } catch (e) {
+    logError("matchup_analysis", e);
     await sendMessage(
       env,
       `<b>Weekly Matchup</b>\nAnalysis failed: ${e instanceof Error ? e.message : "unknown"}`,
@@ -1112,8 +1159,8 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
       const needs = identifyCategoryNeeds(myVals);
       scoutReport = `\n<b>Our weakest cats:</b> ${needs.slice(0, 3).join(", ")}`;
     }
-  } catch {
-    // non-fatal
+  } catch (e) {
+    logError("opponent_scouting", e);
   }
 
   // Fetch standings rank (non-fatal)
@@ -1123,7 +1170,9 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
   try {
     const today = new Date().toISOString().slice(0, 10);
     await resetWeeklyBudget(env, today);
-  } catch {}
+  } catch (e) {
+    logError("weekly_budget_reset", e);
+  }
 
   const lines = [
     `<b>Weekly Matchup Preview — Week ${matchup.week}</b>`,
@@ -1149,6 +1198,7 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
 
   // LLM: generate strategy memo with full briefing (supplemental)
   try {
+    const matchupMemory = await buildMemoryContext(env, "matchup");
     const currentIP = getCurrentIP(matchup);
     const detailed = analyzeMatchupDetailed(matchup, 7);
     const ipInfo = getIPStatus(currentIP);
@@ -1164,6 +1214,7 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
       opponentScouting: scoutReport || undefined,
       standings: rankInfo?.label,
       recentFeedback: await getRecentFeedback(env),
+      memory: matchupMemory,
     });
     const prompt = matchupStrategyPrompt(briefing);
     const strategyMemo = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
@@ -1171,14 +1222,14 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
       lines.push("");
       lines.push(`<b>AI Strategy Memo:</b> ${strategyMemo}`);
     }
-  } catch {
-    // supplemental — don't fail
+  } catch (e) {
+    logError("matchup_strategy_llm", e);
   }
 
   try {
     await sendMessage(env, lines.join("\n"));
-  } catch {
-    // fallback
+  } catch (e) {
+    logError("matchup_send", e);
     await sendMessage(env, `Week ${matchup.week} analysis generated but send failed`);
   }
 
@@ -1207,6 +1258,7 @@ export async function runMidWeekAdjustment(env: Env): Promise<void> {
   try {
     matchup = await yahoo.getMatchup();
   } catch (e) {
+    logError("midweek_matchup_fetch", e);
     await sendMessage(
       env,
       `<b>Mid-Week Adjustment</b>\nFailed to fetch matchup: ${e instanceof Error ? e.message : "unknown"}`,
@@ -1218,6 +1270,7 @@ export async function runMidWeekAdjustment(env: Env): Promise<void> {
   try {
     analysis = analyzeMatchup(matchup);
   } catch (e) {
+    logError("midweek_analysis", e);
     await sendMessage(
       env,
       `<b>Mid-Week Adjustment</b>\nAnalysis failed: ${e instanceof Error ? e.message : "unknown"}`,
@@ -1263,6 +1316,7 @@ export async function runMidWeekAdjustment(env: Env): Promise<void> {
 
   // LLM: mid-week tactical memo with full briefing (supplemental)
   try {
+    const midweekMemory = await buildMemoryContext(env, "matchup");
     const currentIP = getCurrentIP(matchup);
     const detailed = analyzeMatchupDetailed(matchup, 4);
     const ipInfo = getIPStatus(currentIP);
@@ -1277,6 +1331,7 @@ export async function runMidWeekAdjustment(env: Env): Promise<void> {
       ipStatus: `${ipInfo.currentIP.toFixed(1)} IP (${ipInfo.above ? "above" : "below"} ${ipInfo.minimum} min${ipInfo.ipNeeded > 0 ? `, need ${ipInfo.ipNeeded.toFixed(1)} more` : ""})`,
       standings: rankInfo?.label,
       recentFeedback: await getRecentFeedback(env),
+      memory: midweekMemory,
     });
     const prompt = matchupStrategyPrompt(briefing);
     const strategyMemo = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
@@ -1284,13 +1339,14 @@ export async function runMidWeekAdjustment(env: Env): Promise<void> {
       lines.push("");
       lines.push(`<b>AI Mid-Week Tactics:</b> ${strategyMemo}`);
     }
-  } catch {
-    // supplemental — don't fail
+  } catch (e) {
+    logError("midweek_tactics_llm", e);
   }
 
   try {
     await sendMessage(env, lines.join("\n"));
-  } catch {
+  } catch (e) {
+    logError("midweek_send", e);
     await sendMessage(env, `Week ${matchup.week} mid-week adjustment generated but send failed`);
   }
 
@@ -1364,6 +1420,7 @@ export async function runTradeEvaluation(env: Env): Promise<void> {
 
       // LLM: evaluate trade opportunities (supplemental — stats engine identified needs/surplus)
       try {
+        const tradeMemory = await buildMemoryContext(env, "trade");
         const rosterSummary = roster.entries
           .map((e) => `${e.player.name} (${e.player.positions.join("/")})`)
           .join(", ");
@@ -1377,6 +1434,7 @@ export async function runTradeEvaluation(env: Env): Promise<void> {
           surplus: surplusDesc,
           targetInfo: "Scouting other teams — target teams with inverse category needs",
           standings: rankInfo?.label,
+          memory: tradeMemory,
         });
         const prompt = tradeProposalPrompt(briefing);
         const tradeIdeas = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
@@ -1384,13 +1442,14 @@ export async function runTradeEvaluation(env: Env): Promise<void> {
           lines.push("");
           lines.push(`<b>AI Trade Ideas:</b> ${tradeIdeas}`);
         }
-      } catch {
-        // supplemental — don't fail
+      } catch (e) {
+        logError("trade_ideas_llm", e);
       }
     } else {
       lines.push("\nRoster is balanced — no urgent trade needs.");
     }
   } catch (e) {
+    logError("trade_evaluation", e);
     lines.push(`\nError: ${e instanceof Error ? e.message : "unknown"}`);
   }
 
@@ -1417,7 +1476,7 @@ export async function runNewsMonitor(env: Env): Promise<void> {
   try {
     alerts = await getActionableAlerts(env);
   } catch (e) {
-    console.error("News monitor alert fetch failed:", e);
+    logError("news_alert_fetch", e);
     return;
   }
   if (alerts.length === 0) return;
@@ -1434,8 +1493,8 @@ export async function runNewsMonitor(env: Env): Promise<void> {
   let games: ScheduledGame[] = [];
   try {
     games = await getTodaysGames(today, env);
-  } catch {
-    // If schedule unavailable, skip time filtering (send all)
+  } catch (e) {
+    logError("news_schedule_fetch", e);
   }
 
   if (games.length > 0) {
@@ -1462,8 +1521,8 @@ export async function runNewsMonitor(env: Env): Promise<void> {
   try {
     const roster = await yahoo.getRoster();
     rosterNames = roster.entries.map((e) => e.player.name);
-  } catch {
-    // If roster fetch fails, send all alerts unfiltered
+  } catch (e) {
+    logError("news_roster_fetch", e);
   }
 
   // 3. Filter + enrich alerts
@@ -1485,6 +1544,7 @@ export async function runNewsMonitor(env: Env): Promise<void> {
     // LLM injury assessment for injury + closer_change alerts
     if (alert.type === "injury" || alert.type === "closer_change") {
       try {
+        const newsInjuryMemory = await buildMemoryContext(env, "injury");
         const rosterCtx =
           relevance === "OUR_PLAYER"
             ? `ON OUR ROSTER. Team: ${alert.team}. ${alert.fantasyImpact}`
@@ -1494,14 +1554,15 @@ export async function runNewsMonitor(env: Env): Promise<void> {
           injury: alert.headline,
           rosterContext: rosterCtx,
           ilSlots: relevance === "OUR_PLAYER" ? "Check roster" : "N/A",
+          memory: newsInjuryMemory,
         });
         const prompt = injuryAssessmentPrompt(briefing);
         const assessment = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
         if (!assessment.startsWith("[")) {
           line += `\n  → AI: ${assessment}`;
         }
-      } catch {
-        // LLM enrichment is supplemental
+      } catch (e) {
+        logError("news_injury_llm", e);
       }
     }
 
@@ -1527,7 +1588,7 @@ export async function runNewsMonitor(env: Env): Promise<void> {
     const newKeys = alerts.map((a) => `${a.playerName}:${a.type}:${today}`);
     await addSentAlertKeys(env, newKeys);
   } catch (e) {
-    console.error("News monitor send failed:", e);
+    logError("news_monitor_send", e);
   }
 
   // 5. Log
@@ -1542,8 +1603,8 @@ export async function runNewsMonitor(env: Env): Promise<void> {
       reasoning: `News monitor: ${messageParts.length} relevant alerts${urgentWaiverFlag ? " (urgent closer change)" : ""}`,
       result: "success",
     });
-  } catch {
-    // best-effort
+  } catch (e) {
+    logError("news_monitor_log", e);
   }
 }
 
@@ -1558,6 +1619,7 @@ export async function runSundayTactics(env: Env): Promise<void> {
   try {
     matchup = await yahoo.getMatchup();
   } catch (e) {
+    logError("sunday_matchup_fetch", e);
     await sendMessage(
       env,
       `<b>Sunday Tactics</b>\nFailed to fetch matchup: ${e instanceof Error ? e.message : "unknown"}`,
@@ -1569,6 +1631,7 @@ export async function runSundayTactics(env: Env): Promise<void> {
     const today = new Date().toISOString().slice(0, 10);
     await yahoo.getRoster(today); // validate roster access
   } catch (e) {
+    logError("sunday_roster_fetch", e);
     await sendMessage(
       env,
       `<b>Sunday Tactics</b>\nRoster fetch failed: ${e instanceof Error ? e.message : "unknown"}`,
@@ -1593,6 +1656,7 @@ export async function runSundayTactics(env: Env): Promise<void> {
   }
 
   // Build rich LLM briefing with ALL available data
+  const sundayMemory = await buildMemoryContext(env, "matchup");
   const briefing = formatMatchupForLLM({
     summary: `FINAL DAY Week ${matchup.week} vs ${matchup.opponentTeamName}, ${detailed.projectedWins}W-${detailed.projectedLosses}L-${detailed.swingCategories.length}T, 1 day left`,
     categories: formatDetailedCategories(detailed),
@@ -1605,6 +1669,7 @@ export async function runSundayTactics(env: Env): Promise<void> {
     addBudget: `${(await getAddBudget(env)).addsRemaining} adds remaining`,
     standings: rankInfo?.label,
     recentFeedback: await getRecentFeedback(env),
+    memory: sundayMemory,
   });
 
   let aiTactics = "";
@@ -1612,6 +1677,7 @@ export async function runSundayTactics(env: Env): Promise<void> {
     const prompt = matchupStrategyPrompt(briefing);
     aiTactics = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
   } catch (e) {
+    logError("sunday_tactics_llm", e);
     aiTactics = `LLM failed: ${e instanceof Error ? e.message : "unknown"}`;
   }
 
@@ -1629,11 +1695,12 @@ export async function runSundayTactics(env: Env): Promise<void> {
 
   try {
     await sendMessage(env, lines.join("\n"));
-  } catch {
+  } catch (e) {
+    logError("sunday_send", e);
     try {
       await sendMessage(env, `Sunday tactics generated for week ${matchup.week} but send failed`);
-    } catch {
-      // truly nothing we can do
+    } catch (e) {
+      logError("sunday_send_fallback", e);
     }
   }
 
@@ -1675,8 +1742,8 @@ export async function runTwoStartPreview(env: Env): Promise<void> {
   try {
     const matchup = await yahoo.getMatchup();
     currentWeek = matchup.week;
-  } catch {
-    // non-fatal — just won't show week number
+  } catch (e) {
+    logError("two_start_week_fetch", e);
   }
   const nextWeek = currentWeek > 0 ? currentWeek + 1 : 0;
 
@@ -1684,6 +1751,7 @@ export async function runTwoStartPreview(env: Env): Promise<void> {
   try {
     twoStarters = await getTwoStartPitchers(weekStart, weekEnd);
   } catch (e) {
+    logError("two_start_fetch", e);
     await sendMessage(
       env,
       `<b>Two-Start Preview</b>\nFailed to fetch two-start pitchers: ${e instanceof Error ? e.message : "unknown"}`,
@@ -1709,8 +1777,8 @@ export async function runTwoStartPreview(env: Env): Promise<void> {
   let faSPs: Array<{ yahooId: string; name: string }> = [];
   try {
     faSPs = await yahoo.getFreeAgents("SP", 50);
-  } catch {
-    // non-fatal — just report all two-starters without availability
+  } catch (e) {
+    logError("two_start_fa_fetch", e);
   }
 
   // Cross-reference: which two-start pitchers are available?
@@ -1757,11 +1825,12 @@ export async function runTwoStartPreview(env: Env): Promise<void> {
 
   try {
     await sendMessage(env, lines.join("\n"));
-  } catch {
+  } catch (e) {
+    logError("two_start_send", e);
     try {
       await sendMessage(env, `Two-start preview generated but send failed`);
-    } catch {
-      // truly nothing we can do
+    } catch (e) {
+      logError("two_start_send_fallback", e);
     }
   }
 
@@ -1785,6 +1854,7 @@ export async function runTwoStartPreview(env: Env): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export async function logDecision(env: Env, decision: Decision): Promise<void> {
+  logDecisionEvent(decision.type, decision.action, decision.result);
   await env.db.insert(decisionsTable).values({
     type: decision.type,
     action: JSON.stringify(decision.action),

@@ -6,6 +6,7 @@ import { handleTelegramWebhook } from "./notifications/telegram";
 import { getAuthUrl, handleCallback } from "./yahoo/auth";
 import { runTestSuite } from "./test-harness";
 import { dispatchCron } from "./cron";
+import { useWorkersLogger } from "workers-tagged-logger";
 
 // Cloudflare bindings (raw, before we wrap into our Env)
 type CloudflareBindings = {
@@ -41,6 +42,8 @@ function buildAppEnv(cfEnv: CloudflareBindings): Env {
 }
 
 const app = new Hono<{ Bindings: CloudflareBindings }>();
+
+app.use("*", useWorkersLogger("fantasy-gm"));
 
 // GET /auth — redirect to Yahoo OAuth (oob flow)
 app.get("/auth", (c) => {

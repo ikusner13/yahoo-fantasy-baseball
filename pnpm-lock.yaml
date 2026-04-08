@@ -24,6 +24,9 @@ importers:
       hono:
         specifier: ^4.12.10
         version: 4.12.10
+      workers-tagged-logger:
+        specifier: ^1.0.0
+        version: 1.0.0
     devDependencies:
       '@cloudflare/workers-types':
         specifier: ^4.20250620.0
@@ -2251,6 +2254,9 @@ packages:
     engines: {node: '>=16'}
     hasBin: true
 
+  workers-tagged-logger@1.0.0:
+    resolution: {integrity: sha512-tp5PAs48hSpF2GIbH0S186MBXuMe8u9uuHZR0Jmw/I8+NIiQblor5EpYJ5lOaE8u9s84mVme6Iv+ueC1C/beog==}
+
   wrangler@4.80.0:
     resolution: {integrity: sha512-2ZKF7uPeOZy65BGk3YfvqBCPo/xH1MrAlMmH9mVP+tCNBrTUMnwOHSj1HrZHgR8LttkAqhko0fGz+I4ax1rzyQ==}
     engines: {node: '>=20.3.0'}
@@ -2305,6 +2311,9 @@ packages:
 
   youch@4.1.0-beta.10:
     resolution: {integrity: sha512-rLfVLB4FgQneDr0dv1oddCVZmKjcJ6yX6mS4pU82Mq/Dt9a3cLZQ62pDBL4AUO+uVrCvtWz3ZFUL2HFAFJ/BXQ==}
+
+  zod@4.3.6:
+    resolution: {integrity: sha512-rftlrkhHZOcjDwkGlnUtZZkvaPHCsDATp4pGpuOOMDaTdDDXF91wuVDJoWoPsKX/3YPQ5fHuF3STjcYyKr+Qhg==}
 
 snapshots:
 
@@ -4103,6 +4112,12 @@ snapshots:
       '@cloudflare/workerd-linux-arm64': 1.20260401.1
       '@cloudflare/workerd-windows-64': 1.20260401.1
 
+  workers-tagged-logger@1.0.0:
+    dependencies:
+      zod: 4.3.6
+    optionalDependencies:
+      hono: 4.12.10
+
   wrangler@4.80.0(@cloudflare/workers-types@4.20260405.1):
     dependencies:
       '@cloudflare/kv-asset-handler': 0.4.2
@@ -4147,3 +4162,5 @@ snapshots:
       '@speed-highlight/core': 1.2.15
       cookie: 1.1.1
       youch-core: 0.3.3
+
+  zod@4.3.6: {}

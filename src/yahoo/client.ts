@@ -10,6 +10,7 @@ import type {
   TradeProposal,
 } from "../types";
 import { getValidToken } from "./auth";
+import { logApiCall } from "../observability/log";
 
 // --- Yahoo league transaction types ---
 
@@ -98,11 +99,17 @@ export class YahooClient {
       headers["Content-Type"] = "application/xml";
     }
 
+    const start = Date.now();
     const res = await fetch(url, { method, headers, body });
+    const durationMs = Date.now() - start;
+
     if (!res.ok) {
       const text = await res.text();
+      logApiCall(`yahoo:${method}:${path}`, durationMs, res.status);
       throw new Error(`Yahoo API ${method} ${path} failed (${res.status}): ${text}`);
     }
+
+    logApiCall(`yahoo:${method}:${path}`, durationMs, res.status);
 
     if (isGet) {
       return res.json();

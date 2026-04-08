@@ -17,6 +17,7 @@ export interface MatchupBriefing {
   standings?: string; // "#4 (6-4-3), need wins for playoffs"
   addBudget?: string; // "3 adds remaining this week"
   recentFeedback?: string; // user feedback from /feedback command
+  memory?: string; // decision history + retrospective lessons
 }
 
 export interface WaiverBriefing {
@@ -25,6 +26,7 @@ export interface WaiverBriefing {
   recommendations: string; // engine's ranked pickups with z-scores
   rosterNeeds: string;
   standings?: string;
+  memory?: string;
 }
 
 export interface TradeBriefing {
@@ -34,6 +36,7 @@ export interface TradeBriefing {
   targetInfo: string;
   standings?: string;
   streaks?: string; // sell-high / buy-low candidates
+  memory?: string;
 }
 
 export interface InjuryBriefing {
@@ -43,6 +46,7 @@ export interface InjuryBriefing {
   ilSlots: string;
   matchupImpact?: string; // "Losing X hurts HR which is a swing category"
   replacementOptions?: string;
+  memory?: string;
 }
 
 export interface LineupBriefing {
@@ -52,6 +56,7 @@ export interface LineupBriefing {
   strategy?: string;
   swingCategories?: string;
   streaks?: string; // "Hot: Schwarber (.410 xwOBA). Cold: Clement (.240)"
+  memory?: string;
 }
 
 // --- Formatters: briefing → structured text for LLM user prompt ---
@@ -69,6 +74,7 @@ export function formatMatchupForLLM(b: MatchupBriefing): string {
   if (b.standings) sections.push(`STANDINGS: ${b.standings}`);
   if (b.addBudget) sections.push(`ADD BUDGET: ${b.addBudget}`);
   if (b.recentFeedback) sections.push(`\nRECENT FEEDBACK:\n${b.recentFeedback}`);
+  if (b.memory) sections.push(`\nMEMORY:\n${b.memory}`);
   return sections.join("\n");
 }
 
@@ -81,6 +87,7 @@ export function formatWaiverForLLM(b: WaiverBriefing): string {
     `RECOMMENDATIONS:\n${b.recommendations}`,
   ];
   if (b.standings) sections.push(`STANDINGS: ${b.standings}`);
+  if (b.memory) sections.push(`\nMEMORY:\n${b.memory}`);
   return sections.join("\n");
 }
 
@@ -94,6 +101,7 @@ export function formatTradeForLLM(b: TradeBriefing): string {
   ];
   if (b.standings) sections.push(`STANDINGS: ${b.standings}`);
   if (b.streaks) sections.push(`STREAKS: ${b.streaks}`);
+  if (b.memory) sections.push(`\nMEMORY:\n${b.memory}`);
   return sections.join("\n");
 }
 
@@ -106,6 +114,7 @@ export function formatInjuryForLLM(b: InjuryBriefing): string {
   ];
   if (b.matchupImpact) sections.push(`MATCHUP IMPACT: ${b.matchupImpact}`);
   if (b.replacementOptions) sections.push(`REPLACEMENTS: ${b.replacementOptions}`);
+  if (b.memory) sections.push(`\nMEMORY:\n${b.memory}`);
   return sections.join("\n");
 }
 
@@ -114,5 +123,6 @@ export function formatLineupForLLM(b: LineupBriefing): string {
   if (b.strategy) sections.push(`STRATEGY: ${b.strategy}`);
   if (b.swingCategories) sections.push(`SWING CATEGORIES: ${b.swingCategories}`);
   if (b.streaks) sections.push(`STREAKS: ${b.streaks}`);
+  if (b.memory) sections.push(`\nMEMORY:\n${b.memory}`);
   return sections.join("\n");
 }

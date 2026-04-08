@@ -1,4 +1,5 @@
 import type { Env } from "../types";
+import { logLLM, logError } from "../observability/log";
 
 // --- Touchpoint → Model routing ---
 
@@ -60,7 +61,7 @@ async function callOpenRouter(
     });
 
     if (!res.ok) {
-      console.error(`OpenRouter error (${model.openRouterId}): ${res.status}`);
+      logError("openrouter", `${model.openRouterId} returned ${res.status}`);
       return null;
     }
 
@@ -69,7 +70,7 @@ async function callOpenRouter(
     };
     return data.choices?.[0]?.message?.content?.trim() ?? null;
   } catch (e) {
-    console.error("OpenRouter call failed:", e);
+    logError("openrouter", e);
     return null;
   }
 }
@@ -114,19 +115,27 @@ export async function askLLM(
   touchpoint?: Touchpoint,
 ): Promise<string> {
   const model = touchpoint ? MODEL_ROUTING[touchpoint] : DEFAULT_MODEL;
+  const start = Date.now();
 
   // Primary: OpenRouter with per-touchpoint model routing
   if (env.OPENROUTER_API_KEY) {
     const result = await callOpenRouter(env.OPENROUTER_API_KEY, model, systemPrompt, userPrompt);
-    if (result) return result;
+    if (result) {
+      logLLM(model.openRouterId, touchpoint, Date.now() - start, true, false);
+      return result;
+    }
   }
 
   // Fallback: Anthropic API (Haiku — cheap)
   if (env.ANTHROPIC_API_KEY) {
     const result = await callAnthropicFallback(env.ANTHROPIC_API_KEY, systemPrompt, userPrompt);
-    if (result) return result;
+    if (result) {
+      logLLM("claude-haiku-4-5", touchpoint, Date.now() - start, true, true);
+      return result;
+    }
   }
 
+  logLLM(model.openRouterId, touchpoint, Date.now() - start, false, false);
   return "[LLM unavailable — set OPENROUTER_API_KEY or ANTHROPIC_API_KEY]";
 }
 

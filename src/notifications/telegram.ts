@@ -1,6 +1,7 @@
 import { eq, desc, sql } from "drizzle-orm";
 import type { Env } from "../types";
 import { decisions, feedback } from "../db/schema";
+import { logTelegram, logError } from "../observability/log";
 
 const TG_API = "https://api.telegram.org/bot";
 
@@ -135,27 +136,35 @@ function splitMessage(text: string, maxLen: number): string[] {
 /** Send a message to the configured chat via Telegram API. */
 export async function sendMessage(env: Env, text: string): Promise<void> {
   const chunks = splitMessage(text, 4000);
+  const start = Date.now();
 
-  for (const chunk of chunks) {
-    const res = await fetch(`${TG_API}${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: env.TELEGRAM_CHAT_ID,
-        text: chunk,
-        parse_mode: "HTML",
-      }),
-    });
+  try {
+    for (const chunk of chunks) {
+      const res = await fetch(`${TG_API}${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: env.TELEGRAM_CHAT_ID,
+          text: chunk,
+          parse_mode: "HTML",
+        }),
+      });
 
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`Telegram sendMessage failed (${res.status}): ${body}`);
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`Telegram sendMessage failed (${res.status}): ${body}`);
+      }
     }
+    logTelegram(text.slice(0, 100), chunks.length, true, Date.now() - start);
+  } catch (e) {
+    logTelegram(text.slice(0, 100), chunks.length, false, Date.now() - start);
+    throw e;
   }
 }
 
 /** Send a trade approval message with inline approve/reject buttons. */
 export async function sendTradeApproval(env: Env, tradeId: string, summary: string): Promise<void> {
+  const start = Date.now();
   const replyMarkup = {
     inline_keyboard: [
       [
@@ -165,20 +174,26 @@ export async function sendTradeApproval(env: Env, tradeId: string, summary: stri
     ],
   };
 
-  const res = await fetch(`${TG_API}${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: env.TELEGRAM_CHAT_ID,
-      text: summary,
-      parse_mode: "HTML",
-      reply_markup: replyMarkup,
-    }),
-  });
+  try {
+    const res = await fetch(`${TG_API}${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: env.TELEGRAM_CHAT_ID,
+        text: summary,
+        parse_mode: "HTML",
+        reply_markup: replyMarkup,
+      }),
+    });
 
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Telegram sendTradeApproval failed (${res.status}): ${body}`);
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`Telegram sendTradeApproval failed (${res.status}): ${body}`);
+    }
+    logTelegram(`trade_approval:${tradeId}`, 1, true, Date.now() - start);
+  } catch (e) {
+    logTelegram(`trade_approval:${tradeId}`, 1, false, Date.now() - start);
+    throw e;
   }
 }
 
@@ -194,7 +209,7 @@ async function sendReply(env: Env, chatId: number, text: string): Promise<void> 
   });
   if (!res.ok) {
     const body = await res.text();
-    console.error(`[telegram] sendReply failed (${res.status}): ${body}`);
+    logError("telegram_sendReply", `sendReply failed (${res.status}): ${body}`);
   }
 }
 

@@ -87,6 +87,13 @@ export const feedback = sqliteTable(
   (t) => [index("idx_feedback_week").on(t.week)],
 );
 
+export const gmReflections = sqliteTable("gm_reflections", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  createdAt: text("created_at").notNull().default("(datetime('now'))"),
+  reflection: text("reflection").notNull(),
+  runsCovered: text("runs_covered").notNull(),
+});
+
 export const parkFactors = sqliteTable("park_factors", {
   team: text("team").primaryKey(),
   parkName: text("park_name"),
