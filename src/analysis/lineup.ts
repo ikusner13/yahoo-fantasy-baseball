@@ -5,6 +5,7 @@ import type {
   LineupMove,
   Matchup,
   PlayerProjection,
+  PitcherStats,
   Category,
   ScheduledGame,
 } from "../types";
@@ -17,16 +18,97 @@ import type { BvPStats, ParkFactor, PlatoonSplit } from "../data/matchup-data";
 
 type CategoryWeights = Record<Category, number>;
 
+// --- Marginal rate impact ---
+
+export type RateStatState = "won" | "swing" | "lost";
+
+export interface MarginalRateImpact {
+  eraImpact: number; // change to team ERA if this pitcher starts (negative = improves)
+  whipImpact: number; // change to team WHIP
+  netRateValue: number; // combined value considering matchup state
+}
+
+export interface TeamRateContext {
+  teamCurrentER: number; // accumulated earned runs this week
+  teamCurrentIP: number; // accumulated innings pitched this week
+  teamCurrentWhipNum: number; // accumulated (H + BB) this week
+  eraState: RateStatState;
+  whipState: RateStatState;
+}
+
+/**
+ * Compute the marginal impact of starting a pitcher on team rate stats.
+ * Returns the change to team ERA/WHIP and a net value score that accounts
+ * for matchup state (won/swing/lost).
+ */
+export function computeMarginalRateImpact(
+  pitcherProjection: PitcherStats,
+  teamCurrentER: number,
+  teamCurrentIP: number,
+  teamCurrentWhipNum: number,
+  matchupState: { eraState: RateStatState; whipState: RateStatState },
+): MarginalRateImpact {
+  const projIP = pitcherProjection.ip;
+  // Derive projected earned runs and WHIP numerator from pitcher's rate stats
+  const projER = (pitcherProjection.era * projIP) / 9;
+  const projWhipNum = pitcherProjection.whip * projIP;
+
+  // Current team rates (handle 0 IP — treat as undefined baseline)
+  const currentERA = teamCurrentIP > 0 ? (9 * teamCurrentER) / teamCurrentIP : 0;
+  const currentWHIP = teamCurrentIP > 0 ? teamCurrentWhipNum / teamCurrentIP : 0;
+
+  // New team rates after adding this pitcher's projected outing
+  const newIP = teamCurrentIP + projIP;
+  const newERA = newIP > 0 ? (9 * (teamCurrentER + projER)) / newIP : 0;
+  const newWHIP = newIP > 0 ? (teamCurrentWhipNum + projWhipNum) / newIP : 0;
+
+  const eraImpact = newERA - currentERA;
+  const whipImpact = newWHIP - currentWHIP;
+
+  // Net value: weight each impact by matchup state
+  // "won" → heavily penalize increases (protect the lead), reward decreases mildly
+  // "swing" → full cost/benefit
+  // "lost" → zero cost (already conceded)
+  const eraValue = applyStateWeight(eraImpact, matchupState.eraState);
+  const whipValue = applyStateWeight(whipImpact, matchupState.whipState);
+
+  // Both ERA and WHIP are inverse stats — negative impact is good.
+  // Negate so positive netRateValue = beneficial to start.
+  const netRateValue = -(eraValue + whipValue) || 0; // normalize -0
+
+  return { eraImpact, whipImpact, netRateValue };
+}
+
+/**
+ * Apply matchup-state weighting to a rate stat impact.
+ * Positive impact = stat gets worse; negative = improves.
+ */
+function applyStateWeight(impact: number, state: RateStatState): number {
+  switch (state) {
+    case "won":
+      // Protect lead: heavily penalize worsening (3x), mild reward for improving
+      return impact > 0 ? impact * 3.0 : impact * 0.5;
+    case "swing":
+      return impact;
+    case "lost":
+      // Already conceded — no cost or benefit
+      return 0;
+  }
+}
+
 // --- Scoring context ---
 
 export interface ScoringContext {
   matchupWeights?: CategoryWeights;
+  zScore?: number;
   bvp?: BvPStats;
   platoon?: PlatoonSplit;
   parkFactor?: ParkFactor;
   streak?: RecentPerformance;
   opposingPitcherHand?: "L" | "R";
   vegasMultiplier?: number;
+  /** Pitcher-only: team rate stat context for marginal impact scoring */
+  teamRateContext?: TeamRateContext;
 }
 
 // League-average OBP used as baseline for BvP adjustment
@@ -50,13 +132,13 @@ export function getCategoryWeights(matchup?: Matchup): Record<string, number> {
     const ratio = diff / total;
 
     if (ratio < 0.1) {
-      // Swing category -- close race
-      weights[cs.category] = 1.5;
+      // Swing category — close race, prioritize heavily
+      weights[cs.category] = 2.0;
     } else if (cs.myValue < cs.opponentValue && ratio > 0.25) {
-      // Lost cause -- way behind
-      weights[cs.category] = 0.5;
+      // Lost cause — conceded, don't waste roster spots chasing
+      weights[cs.category] = 0;
     }
-    // else keep 1.0
+    // else keep 1.0 (safe lead or modest gap)
   }
 
   return weights;
@@ -74,26 +156,36 @@ export function scorePlayerForToday(
   if (!projection) return 0.1; // warm body > empty slot
 
   const isBatter = projection.playerType === "batter";
-  const weights = context?.matchupWeights ?? defaultWeights();
 
-  let baseScore = 0;
+  // Use z-score as base when available — properly ranks players by quality
+  // Z-scores can be negative (below-average), so shift to positive range for multiplier math
+  let baseScore: number;
 
-  if (isBatter && projection.batting) {
-    const rates = getRateStats(projection.batting);
-    for (const cat of BATTING_CATEGORIES as readonly string[]) {
-      const w = weights[cat as Category] ?? 1.0;
-      baseScore += (rates[cat] ?? 0) * w;
-    }
-  } else if (!isBatter && projection.pitching) {
-    const rates = getPitcherRateStats(projection.pitching);
-    for (const cat of PITCHING_CATEGORIES as readonly string[]) {
-      const w = weights[cat as Category] ?? 1.0;
-      const val = rates[cat] ?? 0;
-      // For inverse categories lower is better, so subtract from score
-      if (cat === "ERA" || cat === "WHIP") {
-        baseScore -= val * w;
-      } else {
-        baseScore += val * w;
+  if (context?.zScore != null) {
+    // Shift z-score so the worst starter is still positive (multipliers are multiplicative)
+    // Typical z-scores range from -3 to +5; shifting by 4 puts them in [1, 9] range
+    baseScore = context.zScore + 4;
+  } else {
+    // Fallback: sum per-PA rates (less accurate, but works without valuations)
+    const weights = context?.matchupWeights ?? defaultWeights();
+    baseScore = 0;
+
+    if (isBatter && projection.batting) {
+      const rates = getRateStats(projection.batting);
+      for (const cat of BATTING_CATEGORIES as readonly string[]) {
+        const w = weights[cat as Category] ?? 1.0;
+        baseScore += (rates[cat] ?? 0) * w;
+      }
+    } else if (!isBatter && projection.pitching) {
+      const rates = getPitcherRateStats(projection.pitching);
+      for (const cat of PITCHING_CATEGORIES as readonly string[]) {
+        const w = weights[cat as Category] ?? 1.0;
+        const val = rates[cat] ?? 0;
+        if (cat === "ERA" || cat === "WHIP") {
+          baseScore -= val * w;
+        } else {
+          baseScore += val * w;
+        }
       }
     }
   }
@@ -103,7 +195,21 @@ export function scorePlayerForToday(
   const platoonMult = computePlatoonMultiplier(context?.platoon, context?.opposingPitcherHand);
   const parkMult = computeParkMultiplier(context?.parkFactor, isBatter);
   const vegasMult = computeVegasMultiplierForPlayer(context?.vegasMultiplier, isBatter);
-  const adjusted = baseScore * bvpMult * platoonMult * parkMult * vegasMult;
+  let adjusted = baseScore * bvpMult * platoonMult * parkMult * vegasMult;
+
+  // --- Marginal rate impact for pitchers ---
+  // Additive: shifts score based on how this pitcher affects team ERA/WHIP given matchup state
+  if (!isBatter && projection.pitching && context?.teamRateContext) {
+    const rc = context.teamRateContext;
+    const impact = computeMarginalRateImpact(
+      projection.pitching,
+      rc.teamCurrentER,
+      rc.teamCurrentIP,
+      rc.teamCurrentWhipNum,
+      { eraState: rc.eraState, whipState: rc.whipState },
+    );
+    adjusted += impact.netRateValue;
+  }
 
   // Streak adjustment (already built in recent-performance module)
   return adjustScoreForRecency(adjusted, context?.streak, 0.15);

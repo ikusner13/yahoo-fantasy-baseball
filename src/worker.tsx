@@ -6,6 +6,16 @@ import { handleTelegramWebhook } from "./notifications/telegram";
 import { getAuthUrl, handleCallback } from "./yahoo/auth";
 import { runTestSuite } from "./test-harness";
 import { dispatchCron } from "./cron";
+import {
+  runDailyMorning,
+  runLateScratchCheck,
+  runWeeklyMatchupAnalysis,
+  runMidWeekAdjustment,
+  runTradeEvaluation,
+  runNewsMonitor,
+  runSundayTactics,
+  runTwoStartPreview,
+} from "./gm";
 import { useWorkersLogger } from "workers-tagged-logger";
 
 // Cloudflare bindings (raw, before we wrap into our Env)
@@ -90,6 +100,73 @@ app.get("/test", async (c) => {
   const dryRun = c.req.query("apply") !== "1";
   const date = c.req.query("date") ?? undefined;
   return runTestSuite(env, dryRun, date);
+});
+
+// --- Manual routine triggers ---
+
+const ROUTINES: Record<string, (env: Env) => Promise<void>> = {
+  daily: runDailyMorning,
+  "late-scratch": runLateScratchCheck,
+  matchup: runWeeklyMatchupAnalysis,
+  midweek: runMidWeekAdjustment,
+  trade: runTradeEvaluation,
+  news: runNewsMonitor,
+  sunday: runSundayTactics,
+  "two-start": runTwoStartPreview,
+};
+
+// GET /run/:routine — run a routine for real (sends to Telegram)
+app.get("/run/:routine", async (c) => {
+  const name = c.req.param("routine");
+  const fn = ROUTINES[name];
+  if (!fn) {
+    const available = Object.keys(ROUTINES).join(", ");
+    return c.text(`Unknown routine "${name}". Available: ${available}`, 400);
+  }
+  const env = buildAppEnv(c.env);
+  const start = Date.now();
+  try {
+    await fn(env);
+    return c.text(`${name}: completed in ${Date.now() - start}ms (messages sent to Telegram)`);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return c.text(`${name}: FAILED in ${Date.now() - start}ms\n${msg}`, 500);
+  }
+});
+
+// GET /preview/:routine — run a routine but capture messages instead of sending
+app.get("/preview/:routine", async (c) => {
+  const name = c.req.param("routine");
+  const fn = ROUTINES[name];
+  if (!fn) {
+    const available = Object.keys(ROUTINES).join(", ");
+    return c.text(`Unknown routine "${name}". Available: ${available}`, 400);
+  }
+  const env = buildAppEnv(c.env);
+  env._messageBuffer = [];
+  const start = Date.now();
+  try {
+    await fn(env);
+    const elapsed = Date.now() - start;
+    const messages = env._messageBuffer;
+    const header = `=== PREVIEW: ${name} (${elapsed}ms, ${messages.length} messages) ===\n`;
+    const body =
+      messages.length > 0
+        ? messages.map((m, i) => `--- Message ${i + 1} ---\n${m}`).join("\n\n")
+        : "(no messages produced)";
+    return c.text(header + "\n" + body);
+  } catch (e) {
+    const elapsed = Date.now() - start;
+    const msg = e instanceof Error ? e.message : String(e);
+    const captured = env._messageBuffer;
+    const header = `=== PREVIEW: ${name} FAILED (${elapsed}ms) ===\nError: ${msg}\n`;
+    const body =
+      captured.length > 0
+        ? "\nMessages captured before failure:\n" +
+          captured.map((m, i) => `--- Message ${i + 1} ---\n${m}`).join("\n\n")
+        : "";
+    return c.text(header + body, 500);
+  }
 });
 
 // GET /health

@@ -3,6 +3,7 @@ import type {
   BatterStats,
   PitcherStats,
   PlayerValuation,
+  VarianceAdjustedValuation,
   Category,
 } from "../types";
 import { BATTING_CATEGORIES, PITCHING_CATEGORIES, INVERSE_CATEGORIES } from "../types";
@@ -103,16 +104,50 @@ export function computeZScores(projections: PlayerProjection[]): PlayerValuation
   const batters = projections.filter((p) => p.playerType === "batter" && p.batting);
   const pitchers = projections.filter((p) => p.playerType === "pitcher" && p.pitching);
 
+  // Pre-compute pool averages for rate stat time-weighting
+  const poolAvgOBP =
+    batters.length > 0
+      ? batters.reduce((sum, p) => sum + p.batting!.obp, 0) / batters.length
+      : 0.31;
+  const poolAvgERA =
+    pitchers.length > 0
+      ? pitchers.reduce((sum, p) => sum + p.pitching!.era, 0) / pitchers.length
+      : 4.2;
+  const poolAvgWHIP =
+    pitchers.length > 0
+      ? pitchers.reduce((sum, p) => sum + p.pitching!.whip, 0) / pitchers.length
+      : 1.3;
+
   const batterVals = computeGroupZScores(
     batters,
     BATTING_CATEGORIES as readonly string[],
-    (p, cat) => getBatterCatValue(p.batting!, cat),
+    (p, cat) => {
+      if (cat === "OBP") {
+        // Time-weighted: (OBP - pool avg) × PA = "on-base events above average"
+        return (p.batting!.obp - poolAvgOBP) * p.batting!.pa;
+      }
+      return getBatterCatValue(p.batting!, cat);
+    },
+    // OBP is now a counting equivalent (positive = good), skip inverse flip
+    new Set(["OBP"]),
   );
 
   const pitcherVals = computeGroupZScores(
     pitchers,
     PITCHING_CATEGORIES as readonly string[],
-    (p, cat) => getPitcherCatValue(p.pitching!, cat),
+    (p, cat) => {
+      if (cat === "ERA") {
+        // Time-weighted: "earned runs saved below average" (positive = good)
+        return ((poolAvgERA - p.pitching!.era) * p.pitching!.ip) / 9;
+      }
+      if (cat === "WHIP") {
+        // Time-weighted: "baserunners saved below average" (positive = good)
+        return (poolAvgWHIP - p.pitching!.whip) * p.pitching!.ip;
+      }
+      return getPitcherCatValue(p.pitching!, cat);
+    },
+    // ERA/WHIP are now counting equivalents (positive = good), skip inverse flip
+    new Set(["ERA", "WHIP"]),
   );
 
   return [...batterVals, ...pitcherVals].sort((a, b) => b.totalZScore - a.totalZScore);
@@ -122,6 +157,7 @@ function computeGroupZScores(
   players: PlayerProjection[],
   categories: readonly string[],
   getValue: (p: PlayerProjection, cat: string) => number,
+  skipInverse?: Set<string>,
 ): PlayerValuation[] {
   // Pre-compute mean/stddev per category
   const stats = new Map<string, { mean: number; sd: number }>();
@@ -139,7 +175,8 @@ function computeGroupZScores(
       const raw = getValue(p, cat);
       let z = zScore(raw, m, sd);
       // Inverse categories: lower is better, so flip sign
-      if (isInverse(cat)) z = -z;
+      // Skip for time-weighted rate stats (already converted to "positive = good")
+      if (isInverse(cat) && !skipInverse?.has(cat)) z = -z;
       categoryZScores[cat as Category] = z;
       total += z;
     }
@@ -152,6 +189,96 @@ function computeGroupZScores(
       positionAdjustment: 1.0,
     };
   });
+}
+
+// --- Variance adjustment for H2H weekly consistency ---
+
+/** Counting stats where Poisson variance model applies */
+const COUNTING_BATTER_CATS = ["R", "H", "HR", "RBI", "SB", "TB"] as const;
+const COUNTING_PITCHER_CATS = ["OUT", "K", "QS", "SVHD"] as const;
+
+const DEFAULT_REMAINING_WEEKS = 22;
+const CONSISTENCY_WEIGHT = 0.15;
+
+/**
+ * Penalize boom-or-bust players and reward consistent weekly contributors.
+ * Uses Poisson assumption: weekly variance ≈ weekly expected value for counting stats.
+ * CV = 1/sqrt(weeklyExpected), so low-volume players have higher CV (less consistent).
+ */
+export function applyVarianceAdjustment(
+  valuations: PlayerValuation[],
+  projections: PlayerProjection[],
+  remainingWeeks: number = DEFAULT_REMAINING_WEEKS,
+): VarianceAdjustedValuation[] {
+  const projMap = new Map(projections.map((p) => [p.yahooId, p]));
+
+  // Compute per-player CV
+  const playerCVs: { yahooId: string; cv: number }[] = [];
+
+  for (const v of valuations) {
+    const proj = projMap.get(v.yahooId);
+    if (!proj) {
+      playerCVs.push({ yahooId: v.yahooId, cv: 0 });
+      continue;
+    }
+
+    const countingCats =
+      proj.playerType === "batter" ? COUNTING_BATTER_CATS : COUNTING_PITCHER_CATS;
+
+    const getCatTotal = (cat: string): number => {
+      if (proj.playerType === "batter" && proj.batting) {
+        return getBatterCatValue(proj.batting, cat);
+      }
+      if (proj.playerType === "pitcher" && proj.pitching) {
+        return getPitcherCatValue(proj.pitching, cat);
+      }
+      return 0;
+    };
+
+    const cvs: number[] = [];
+    for (const cat of countingCats) {
+      const weeklyExpected = getCatTotal(cat) / remainingWeeks;
+      if (weeklyExpected > 0) {
+        // Poisson: CV = 1/sqrt(expected)
+        cvs.push(1 / Math.sqrt(weeklyExpected));
+      }
+    }
+
+    const avgCV = cvs.length > 0 ? cvs.reduce((a, b) => a + b, 0) / cvs.length : 0;
+    playerCVs.push({ yahooId: v.yahooId, cv: avgCV });
+  }
+
+  // Compute median CV across all players
+  const sortedCVs = playerCVs
+    .map((p) => p.cv)
+    .filter((c) => c > 0)
+    .sort((a, b) => a - b);
+  const medianCV =
+    sortedCVs.length > 0
+      ? sortedCVs.length % 2 === 1
+        ? sortedCVs[Math.floor(sortedCVs.length / 2)]
+        : (sortedCVs[sortedCVs.length / 2 - 1] + sortedCVs[sortedCVs.length / 2]) / 2
+      : 0;
+
+  const cvMap = new Map(playerCVs.map((p) => [p.yahooId, p.cv]));
+
+  return valuations
+    .map((v): VarianceAdjustedValuation => {
+      const cv = cvMap.get(v.yahooId) ?? 0;
+      // consistencyFactor > 1 for consistent (low CV), < 1 for volatile (high CV)
+      const consistencyFactor = 1.0 + (medianCV - cv) * CONSISTENCY_WEIGHT;
+      // Clamp to [0.85, 1.15] to prevent extreme adjustments
+      const clamped = Math.max(0.85, Math.min(1.15, consistencyFactor));
+
+      return {
+        ...v,
+        rawZScore: v.totalZScore,
+        totalZScore: v.totalZScore * clamped,
+        consistencyFactor: clamped,
+        weeklyVariance: cv,
+      };
+    })
+    .sort((a, b) => b.totalZScore - a.totalZScore);
 }
 
 // --- Positional scarcity ---

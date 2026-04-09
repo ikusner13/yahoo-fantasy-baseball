@@ -6,6 +6,7 @@ import { projections } from "../db/schema";
 
 export interface RawBatterProjection {
   fangraphsId: number;
+  mlbId?: number;
   name: string;
   team: string;
   pa: number;
@@ -20,6 +21,7 @@ export interface RawBatterProjection {
 
 export interface RawPitcherProjection {
   fangraphsId: number;
+  mlbId?: number;
   name: string;
   team: string;
   ip: number;
@@ -55,6 +57,7 @@ export async function fetchBatterProjections(
 
   const result = rows.map((r) => ({
     fangraphsId: Number(r.playerid),
+    mlbId: r.mlbamid ? Number(r.mlbamid) : undefined,
     name: String(r.PlayerName ?? ""),
     team: String(r.Team ?? ""),
     pa: Number(r.PA ?? 0),
@@ -90,6 +93,7 @@ export async function fetchPitcherProjections(
 
   const result = rows.map((r) => ({
     fangraphsId: Number(r.playerid),
+    mlbId: r.mlbamid ? Number(r.mlbamid) : undefined,
     name: String(r.PlayerName ?? ""),
     team: String(r.Team ?? ""),
     ip: Number(r.IP ?? 0),

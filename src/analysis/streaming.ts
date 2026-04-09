@@ -39,8 +39,10 @@ export function scoreStreamingPitcher(
   // Park factor: pitcher-friendly parks have factor < 1.0
   const parkAdjustment = 1.0 - parkFactor;
 
-  // QS probability bonus
-  const qsBonus = proj.ip > 5.5 && proj.era < 4.5 ? 1.0 : 0;
+  // QS probability bonus — use projected QS rate, not season IP (always > 5.5)
+  const estimatedGS = proj.ip >= 30 ? Math.round(proj.ip / 6) : 0;
+  const qsRate = estimatedGS > 0 ? proj.qs / estimatedGS : 0;
+  const qsBonus = qsRate > 0.25 && proj.era < 4.5 ? 1.0 : 0;
 
   return kRate * 2.0 + eraScore * 1.5 + opponentWeakness * 3.0 + parkAdjustment * 0.5 + qsBonus;
 }

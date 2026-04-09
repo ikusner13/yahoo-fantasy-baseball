@@ -135,6 +135,12 @@ function splitMessage(text: string, maxLen: number): string[] {
 
 /** Send a message to the configured chat via Telegram API. */
 export async function sendMessage(env: Env, text: string): Promise<void> {
+  // Preview mode: capture messages instead of sending
+  if (env._messageBuffer) {
+    env._messageBuffer.push(text);
+    return;
+  }
+
   const chunks = splitMessage(text, 4000);
   const start = Date.now();
 

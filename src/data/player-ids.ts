@@ -102,8 +102,8 @@ export async function seedFromYahooRoster(env: Env, players: Player[]): Promise<
         .insert(playerIds)
         .values({
           yahooId: p.yahooId,
-          mlbId: null,
-          fangraphsId: null,
+          mlbId: p.mlbId ?? null,
+          fangraphsId: p.fangraphsId ?? null,
           name: p.name,
           positions: p.positions.join(","),
           team: p.team,
@@ -111,6 +111,9 @@ export async function seedFromYahooRoster(env: Env, players: Player[]): Promise<
         .onConflictDoUpdate({
           target: playerIds.yahooId,
           set: {
+            // Preserve existing mlbId/fangraphsId if new value is null
+            ...(p.mlbId != null ? { mlbId: p.mlbId } : {}),
+            ...(p.fangraphsId != null ? { fangraphsId: p.fangraphsId } : {}),
             name: p.name,
             positions: p.positions.join(","),
             team: p.team,

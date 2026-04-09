@@ -16,6 +16,8 @@ export interface Env {
   OPENAI_API_KEY?: string;
   OPENROUTER_API_KEY?: string;
   ODDS_API_KEY?: string;
+  /** When set, sendMessage captures here instead of sending to Telegram */
+  _messageBuffer?: string[];
 }
 
 // --- Roster positions ---
@@ -217,4 +219,10 @@ export interface PlayerValuation {
   totalZScore: number;
   categoryZScores: Partial<Record<Category, number>>;
   positionAdjustment: number;
+}
+
+export interface VarianceAdjustedValuation extends PlayerValuation {
+  rawZScore: number;
+  consistencyFactor: number;
+  weeklyVariance: number;
 }
