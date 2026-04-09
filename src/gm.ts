@@ -73,6 +73,7 @@ import {
 } from "./recommendation/probability-engine";
 import { scoreRecommendationConfidence, summarizeConfidence } from "./recommendation/confidence";
 import { evaluateMatchupPickups } from "./recommendation/pickups";
+import { buildWatchlistRecommendations } from "./recommendation/watchlist";
 import { logDecisionEvent, logError } from "./observability/log";
 import { buildMemoryContext, generateReflection } from "./ai/memory";
 import { eq, desc } from "drizzle-orm";
@@ -1718,11 +1719,71 @@ export async function runNewsMonitor(env: Env): Promise<void> {
 
   // 2. Fetch roster for relevance filtering (light call, runs every 30min)
   let rosterNames: string[] = [];
+  let liveRoster: Roster | undefined;
   try {
-    const roster = await yahoo.getRoster();
-    rosterNames = roster.entries.map((e) => e.player.name);
+    liveRoster = await yahoo.getRoster();
+    rosterNames = liveRoster.entries.map((e) => e.player.name);
   } catch (e) {
     logError("news_roster_fetch", e);
+  }
+
+  const candidateWatchAlerts = alerts.filter(
+    (alert) => alert.type === "closer_change" || alert.type === "callup",
+  );
+  let watchlistLines = new Map<string, string>();
+  let urgentWatchFlag = false;
+
+  if (liveRoster && candidateWatchAlerts.length > 0) {
+    try {
+      const freeAgents = await yahoo.getFreeAgents(undefined, 100);
+      const [rawBatters, rawPitchers, matchup] = await Promise.all([
+        fetchBatterProjections(undefined, env),
+        fetchPitcherProjections(undefined, env),
+        yahoo.getMatchup(),
+      ]);
+
+      const rosterPlayers = liveRoster.entries.map((entry) => entry.player);
+      const rosterProjectionMap = await buildProjectionMap(rawBatters, rawPitchers, rosterPlayers, env);
+      const rosterValuations = new Map(
+        applyVarianceAdjustment(
+          computeZScores([...rosterProjectionMap.values()]),
+          [...rosterProjectionMap.values()],
+        ).map((valuation) => [valuation.yahooId, valuation]),
+      );
+      const freeAgentProjectionMap = await buildProjectionMap(rawBatters, rawPitchers, freeAgents, env);
+      const weekSchedule = await getWeekSchedule(matchup.weekStart, matchup.weekEnd);
+      const pickupRecommendations = evaluateMatchupPickups({
+        roster: liveRoster,
+        freeAgents,
+        rosterValuations,
+        rosterProjectionMap,
+        freeAgentProjectionMap,
+        matchup,
+        weekSchedule,
+        asOf: getEnvNow(env),
+        simulations: 300,
+        seed: 31,
+        limit: 8,
+      });
+
+      const watchlist = buildWatchlistRecommendations(
+        candidateWatchAlerts,
+        freeAgents,
+        pickupRecommendations,
+      );
+
+      for (const recommendation of watchlist) {
+        if (recommendation.tier === "monitor") continue;
+        const prefix = recommendation.tier === "must_add_now" ? "  → MUST ADD: " : "  → WATCH: ";
+        watchlistLines.set(
+          `${recommendation.alert.playerName}:${recommendation.alert.type}`,
+          `${prefix}${recommendation.summary}`,
+        );
+        if (recommendation.tier === "must_add_now") urgentWatchFlag = true;
+      }
+    } catch (e) {
+      logError("news_watchlist_eval", e);
+    }
   }
 
   // 3. Filter + enrich alerts
@@ -1735,7 +1796,10 @@ export async function runNewsMonitor(env: Env): Promise<void> {
         ? classifyAlertRelevance(alert, rosterNames)
         : ("OUR_PLAYER" as AlertRelevance); // no roster = send everything
 
-    if (!shouldSendAlert(alert, relevance)) continue;
+    const watchKey = `${alert.playerName}:${alert.type}`;
+    const watchlistLine = watchlistLines.get(watchKey);
+
+    if (!shouldSendAlert(alert, relevance) && !watchlistLine) continue;
 
     const tag =
       relevance === "OUR_PLAYER" ? " [ROSTER]" : relevance === "FREE_AGENT" ? " [FA]" : "";
@@ -1771,6 +1835,10 @@ export async function runNewsMonitor(env: Env): Promise<void> {
       urgentWaiverFlag = true;
     }
 
+    if (watchlistLine) {
+      line += `\n${watchlistLine}`;
+    }
+
     messageParts.push(line);
   }
 
@@ -1779,6 +1847,8 @@ export async function runNewsMonitor(env: Env): Promise<void> {
   // 4. Build and send message
   const header = urgentWaiverFlag
     ? "<b>🚨 News Alert (URGENT — closer change detected)</b>"
+    : urgentWatchFlag
+      ? "<b>🚨 News Alert (URGENT — must-add candidate detected)</b>"
     : "<b>News Alert</b>";
   const msg = [header, ...messageParts].join("\n");
 
