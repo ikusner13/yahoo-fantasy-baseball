@@ -1,7 +1,11 @@
 import { eq, desc, sql } from "drizzle-orm";
 import type { Env } from "../types";
-import { decisions, feedback } from "../db/schema";
+import { decisions, feedback, retrospectives } from "../db/schema";
 import { logTelegram, logError } from "../observability/log";
+import {
+  formatRetrospectiveForTelegram,
+  type WeeklyRetrospective,
+} from "../analysis/retrospective";
 
 const TG_API = "https://api.telegram.org/bot";
 
@@ -56,6 +60,8 @@ export async function handleTelegramWebhook(request: Request, env: Env): Promise
   if (chatId) {
     if (text === "/status") {
       await sendReply(env, chatId, "GM is online");
+    } else if (text.startsWith("/scorecard")) {
+      await handleScorecardCommand(env, chatId, text);
     } else if (text === "/roster") {
       await sendReply(env, chatId, "roster coming soon");
     } else if (text.startsWith("/feedback ")) {
@@ -105,6 +111,45 @@ async function handleFeedbackCommand(env: Env, chatId: number, text: string): Pr
       env,
       chatId,
       `Failed to save feedback: ${e instanceof Error ? e.message : "unknown"}`,
+    );
+  }
+}
+
+async function handleScorecardCommand(env: Env, chatId: number, text: string): Promise<void> {
+  const match = text.match(/^\/scorecard(?:\s+(\d+))?$/);
+  if (!match) {
+    await sendReply(env, chatId, "Usage: /scorecard or /scorecard <week>");
+    return;
+  }
+
+  const requestedWeek = match[1] ? Number(match[1]) : undefined;
+
+  try {
+    const latest = requestedWeek
+      ? await env.db
+          .select({ data: retrospectives.data })
+          .from(retrospectives)
+          .where(eq(retrospectives.week, requestedWeek))
+          .get()
+      : await env.db
+          .select({ data: retrospectives.data })
+          .from(retrospectives)
+          .orderBy(desc(retrospectives.week))
+          .limit(1)
+          .get();
+
+    if (!latest) {
+      await sendReply(env, chatId, "No retrospective available yet.");
+      return;
+    }
+
+    const retro = JSON.parse(latest.data) as WeeklyRetrospective;
+    await sendReply(env, chatId, formatRetrospectiveForTelegram(retro));
+  } catch (e) {
+    await sendReply(
+      env,
+      chatId,
+      `Failed to load scorecard: ${e instanceof Error ? e.message : "unknown"}`,
     );
   }
 }

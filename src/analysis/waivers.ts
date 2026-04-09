@@ -10,6 +10,7 @@ export interface PickupRecommendation {
   reasoning: string;
   winProbabilityDelta?: number;
   expectedCategoryWinsDelta?: number;
+  targetCategories?: Category[];
 }
 
 interface DroppableCandidate {

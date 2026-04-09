@@ -74,9 +74,10 @@ import {
 import { scoreRecommendationConfidence, summarizeConfidence } from "./recommendation/confidence";
 import { evaluateMatchupPickups } from "./recommendation/pickups";
 import { buildWatchlistRecommendations } from "./recommendation/watchlist";
+import { extractMentionedCategories } from "./recommendation/category-signals";
 import { logDecisionEvent, logError } from "./observability/log";
 import { buildMemoryContext, generateReflection } from "./ai/memory";
-import { eq, desc } from "drizzle-orm";
+import { eq, desc, sql } from "drizzle-orm";
 import { getEnvNow, getTodayIso } from "./time";
 import {
   feedback as feedbackTable,
@@ -117,6 +118,31 @@ function formatShortDate(date: string): string {
     day: "numeric",
     timeZone: "UTC",
   });
+}
+
+async function getDecisionsForDateRange(
+  env: Env,
+  startDate: string,
+  endDate: string,
+): Promise<Array<{ timestamp?: string; type: string; action: string; reasoning?: string | null }>> {
+  const rows = await env.db
+    .select({
+      timestamp: decisionsTable.timestamp,
+      type: decisionsTable.type,
+      action: decisionsTable.action,
+      reasoning: decisionsTable.reasoning,
+    })
+    .from(decisionsTable)
+    .orderBy(desc(decisionsTable.timestamp))
+    .limit(400)
+    .all();
+
+  return rows
+    .filter((row) => {
+      const date = row.timestamp?.slice(0, 10);
+      return !!date && date >= startDate && date <= endDate;
+    })
+    .sort((a, b) => (a.timestamp ?? "").localeCompare(b.timestamp ?? ""));
 }
 
 async function getSentAlertKeys(env: Env): Promise<Set<string>> {
@@ -459,6 +485,12 @@ export async function runDailyMorning(env: Env): Promise<void> {
     // non-fatal, lineup optimization works without matchup context
   }
 
+  const dailyDecisionContext = {
+    date: today,
+    week: matchup?.week,
+    opponent: matchup?.opponentTeamName,
+  };
+
   // 5b. Statcast recent performance + park factors (contextual multipliers for lineup optimizer)
   let streakMap: Map<number, RecentPerformance> | undefined;
   let streakSummaryText = "";
@@ -685,7 +717,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
   // 6. IL moves
   try {
     const ilActions = getILMoves(roster);
-    if (ilActions.length > 0) {
+      if (ilActions.length > 0) {
       for (const a of ilActions) {
         actionItems.push(`IL: ${a.reasoning}`);
       }
@@ -711,7 +743,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
     }
     decisions.push({
       type: "il",
-      action: { ilActions },
+      action: { routine: "daily_il", ...dailyDecisionContext, ilActions },
       reasoning: ilActions.map((a) => a.reasoning).join("; ") || "no moves",
       result: ilActions.length > 0 ? "notified" : "success",
     });
@@ -767,7 +799,12 @@ export async function runDailyMorning(env: Env): Promise<void> {
 
     decisions.push({
       type: "lineup",
-      action: { moves: moves.length },
+      action: {
+        routine: "daily_lineup",
+        ...dailyDecisionContext,
+        moves: moves.length,
+        targetCategories: matchupAnalysis?.swingCategories ?? [],
+      },
       reasoning: `Set ${moves.length} lineup moves`,
       result: moves.length > 0 ? "notified" : "success",
     });
@@ -862,11 +899,14 @@ export async function runDailyMorning(env: Env): Promise<void> {
           decisions.push({
             type: "waiver",
             action: {
+              routine: "daily_waiver",
+              ...dailyDecisionContext,
               add: rec.add.name,
               drop: rec.drop.name,
               net: rec.netValue,
               winProbabilityDelta: rec.winProbabilityDelta,
               expectedCategoryWinsDelta: rec.expectedCategoryWinsDelta,
+              targetCategories: rec.targetCategories ?? extractMentionedCategories(rec.reasoning),
             },
             reasoning: rec.reasoning,
             result: "notified",
@@ -1048,9 +1088,12 @@ export async function runDailyMorning(env: Env): Promise<void> {
                 decisions.push({
                   type: "stream",
                   action: {
+                    routine: "daily_stream",
+                    ...dailyDecisionContext,
                     add: top.player.name,
                     drop: dropEntry.player.name,
                     score: top.totalScore,
+                    targetCategories: extractMentionedCategories(top.reasoning, streamReasoning),
                     starts: top.starts.map((s) => ({
                       date: s.date,
                       opponent: s.opponent,
@@ -1152,7 +1195,17 @@ export async function runDailyMorning(env: Env): Promise<void> {
   try {
     await logDecision(env, {
       type: "lineup",
-      action: { routine: "daily_morning", date: today, gamesCount: games.length },
+      action: {
+        routine: "daily_morning",
+        ...dailyDecisionContext,
+        gamesCount: games.length,
+        winProbability: probabilitySnapshot?.winProbability,
+        expectedCategoryWins: probabilitySnapshot?.expectedCategoryWins,
+        confidence: matchupConfidence,
+        safe: matchupAnalysis?.safeCategories ?? [],
+        swing: matchupAnalysis?.swingCategories ?? [],
+        lost: matchupAnalysis?.lostCategories ?? [],
+      },
       reasoning: `Morning routine completed for ${today}`,
       result: "success",
     });
@@ -1251,7 +1304,12 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
 
       if (!existing) {
         const prevMatchup = await yahoo.getMatchup(prevWeek);
-        const retro = buildRetrospective(prevMatchup);
+        const prevWeekDecisions = await getDecisionsForDateRange(
+          env,
+          prevMatchup.weekStart,
+          prevMatchup.weekEnd,
+        );
+        const retro = buildRetrospective(prevMatchup, undefined, prevWeekDecisions);
 
         // Store retrospective
         await env.db
@@ -1428,9 +1486,13 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
       action: {
         routine: "weekly_matchup",
         week: matchup.week,
+        weekStart: matchup.weekStart,
+        weekEnd: matchup.weekEnd,
         opponent: matchup.opponentTeamName,
         projected: `${analysis.projectedWins}-${analysis.projectedLosses}`,
+        safe: analysis.safeCategories,
         swing: analysis.swingCategories,
+        lost: analysis.lostCategories,
         winProbability: probabilitySnapshot?.winProbability,
         expectedCategoryWins: probabilitySnapshot?.expectedCategoryWins,
       },

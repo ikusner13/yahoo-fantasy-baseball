@@ -12,15 +12,47 @@ function parseCsv(text: string): Record<string, string>[] {
   const clean = text.replace(/^\uFEFF/, "").trim();
   const lines = clean.split("\n").filter((l) => l.trim());
   if (lines.length < 2) return [];
-  const headers = lines[0].split(",").map((h) => h.trim());
+  const headers = parseCsvLine(lines[0]);
   return lines.slice(1).map((line) => {
-    const values = line.split(",");
+    const values = parseCsvLine(line);
     const row: Record<string, string> = {};
     for (let i = 0; i < headers.length; i++) {
       row[headers[i]] = (values[i] ?? "").trim();
     }
     return row;
   });
+}
+
+function parseCsvLine(line: string): string[] {
+  const values: string[] = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    const next = line[i + 1];
+
+    if (char === '"') {
+      if (inQuotes && next === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (char === "," && !inQuotes) {
+      values.push(current);
+      current = "";
+      continue;
+    }
+
+    current += char;
+  }
+
+  values.push(current);
+  return values;
 }
 
 function num(val: string | undefined): number {

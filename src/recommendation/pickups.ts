@@ -1,7 +1,15 @@
 import type { TeamWeekSchedule } from "../analysis/game-count";
 import { rankDroppablePlayers, type PickupRecommendation } from "../analysis/waivers";
 import { estimateMatchupWinProbability } from "./probability-engine";
-import type { Matchup, Player, PlayerProjection, PlayerValuation, Roster, RosterEntry } from "../types";
+import type {
+  Category,
+  Matchup,
+  Player,
+  PlayerProjection,
+  PlayerValuation,
+  Roster,
+  RosterEntry,
+} from "../types";
 
 export interface MatchupPickupOptions {
   roster: Roster;
@@ -39,7 +47,7 @@ function isPitcher(projection: PlayerProjection | undefined, player: Player): bo
 function topCategoryGains(
   baseline: ReturnType<typeof estimateMatchupWinProbability>,
   upgraded: ReturnType<typeof estimateMatchupWinProbability>,
-): string[] {
+): Category[] {
   const baselineMap = new Map(
     baseline.categoryWinProbabilities.map((category) => [category.category, category.winProbability]),
   );
@@ -150,6 +158,7 @@ export function evaluateMatchupPickups(options: MatchupPickupOptions): PickupRec
         netValue: winProbabilityDelta * 100,
         winProbabilityDelta,
         expectedCategoryWinsDelta,
+        targetCategories: gains,
         reasoning: formatPickupReasoning(baseline, upgraded),
       };
 
