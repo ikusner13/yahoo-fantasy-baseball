@@ -80,6 +80,5 @@ export function scoreRecommendationConfidence(input: ConfidenceInput): Confidenc
 }
 
 export function summarizeConfidence(assessment: ConfidenceAssessment): string {
-  const percent = Math.min(99, Math.round(assessment.score * 100));
-  return `${assessment.band} (${percent}%)`;
+  return assessment.band;
 }

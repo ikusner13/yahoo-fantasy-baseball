@@ -39,7 +39,7 @@ describe("scoreRecommendationConfidence", () => {
     expect(result.band).toBe("high");
     expect(result.breakdown.deltaMagnitude).toBeGreaterThan(0.8);
     expect(result.breakdown.uncertaintyPenalty).toBeLessThan(0.2);
-    expect(summarizeConfidence(result)).toMatch(/^high \(\d+%\)$/);
+    expect(summarizeConfidence(result)).toBe("high");
   });
 
   it("returns medium confidence for a positive but noisy edge", () => {
@@ -88,4 +88,3 @@ describe("scoreRecommendationConfidence", () => {
     expect(result.breakdown.agreementBonus).toBeCloseTo(0.95);
   });
 });
-
