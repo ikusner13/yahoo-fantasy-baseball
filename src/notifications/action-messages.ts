@@ -139,6 +139,8 @@ export interface PickupNotificationItem {
   addName: string;
   dropName: string;
   netValue: number;
+  winProbabilityDelta?: number;
+  expectedCategoryWinsDelta?: number;
   priority: string;
   reasoning: string;
   method: "waiver" | "add/drop";
@@ -158,8 +160,16 @@ export function formatPickupNotification(
 
   for (let i = 0; i < pickups.length; i++) {
     const p = pickups[i];
+    const headline =
+      p.winProbabilityDelta != null
+        ? `${p.winProbabilityDelta >= 0 ? "+" : ""}${(p.winProbabilityDelta * 100).toFixed(1)}pp win odds`
+        : `+${p.netValue.toFixed(1)} value`;
+    const catDelta =
+      p.expectedCategoryWinsDelta != null
+        ? ` | ${p.expectedCategoryWinsDelta >= 0 ? "+" : ""}${p.expectedCategoryWinsDelta.toFixed(2)} cats`
+        : "";
     lines.push(
-      `${i + 1}. Add <b>${esc(p.addName)}</b>, drop <b>${esc(p.dropName)}</b> (+${p.netValue.toFixed(1)}) [${p.priority}]`,
+      `${i + 1}. Add <b>${esc(p.addName)}</b>, drop <b>${esc(p.dropName)}</b> (${headline}${catDelta}) [${p.priority}]`,
     );
     lines.push(`   ${esc(p.reasoning)}`);
     lines.push(`   via ${p.method}`);

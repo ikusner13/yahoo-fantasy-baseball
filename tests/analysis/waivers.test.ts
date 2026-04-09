@@ -230,6 +230,23 @@ describe("waiver evaluation", () => {
     });
   });
 
+  describe("shouldUseWaiverPriority", () => {
+    it("uses matchup win-probability delta when available", () => {
+      const shouldUse = shouldUseWaiverPriority(
+        {
+          add: { yahooId: "fa1", name: "fa1", team: "NYY", positions: ["OF"] },
+          drop: { yahooId: "r1", name: "r1", team: "NYY", positions: ["OF"] },
+          netValue: 0.2,
+          reasoning: "small z upgrade but strong matchup swing",
+          winProbabilityDelta: 0.03,
+        },
+        5,
+      );
+
+      expect(shouldUse).toBe(true);
+    });
+  });
+
   describe("findDroppablePlayer", () => {
     it("protects sole holder of scarce position (position scarcity)", () => {
       // Only one catcher on roster — should never be dropped

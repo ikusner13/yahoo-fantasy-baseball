@@ -1,6 +1,7 @@
 import type { Env } from "../types";
 import type { PickupRecommendation } from "./waivers";
 import { loadTuning } from "../config/tuning";
+import { loadLeagueSettings } from "../config/league";
 
 // --- Interfaces ---
 
@@ -65,6 +66,10 @@ function computeReserve(): number {
   return budget.reserveWedThu;
 }
 
+function getMaxAddsPerWeek(): number {
+  return loadLeagueSettings().transactions.addsPerWeek;
+}
+
 /**
  * Compute dynamic budget allocation for the current day of week,
  * remaining adds, and optional matchup context.
@@ -76,7 +81,7 @@ export function computeAllocation(
 ): AddBudgetAllocation {
   const now = nowOverride ?? new Date();
   const day = now.getDay();
-  const max = loadTuning().budget.maxAddsPerWeek;
+  const max = getMaxAddsPerWeek();
   const totalUsed = state.streamingAddsUsed + state.waiverAddsUsed + state.emergencyAddsUsed;
   const remaining = Math.max(0, max - totalUsed);
 
@@ -132,7 +137,7 @@ async function readState(env: Env): Promise<AddBudgetState> {
       return {
         weekStart: raw.weekStart as string,
         addsUsed: (raw.addsUsed as number) ?? 0,
-        addsRemaining: (raw.addsRemaining as number) ?? loadTuning().budget.maxAddsPerWeek,
+        addsRemaining: (raw.addsRemaining as number) ?? getMaxAddsPerWeek(),
         reserveForReactions: (raw.reserveForReactions as number) ?? computeReserve(),
         streamingAddsUsed: (raw.streamingAddsUsed as number) ?? 0,
         waiverAddsUsed: (raw.waiverAddsUsed as number) ?? 0,
@@ -147,7 +152,7 @@ async function readState(env: Env): Promise<AddBudgetState> {
   return {
     weekStart,
     addsUsed: 0,
-    addsRemaining: loadTuning().budget.maxAddsPerWeek,
+    addsRemaining: getMaxAddsPerWeek(),
     reserveForReactions: computeReserve(),
     streamingAddsUsed: 0,
     waiverAddsUsed: 0,
@@ -167,7 +172,7 @@ async function writeState(env: Env, state: AddBudgetState): Promise<void> {
  */
 export async function getAddBudget(env: Env): Promise<AddBudgetState> {
   const state = await readState(env);
-  const max = loadTuning().budget.maxAddsPerWeek;
+  const max = getMaxAddsPerWeek();
   state.reserveForReactions = computeReserve();
   state.addsUsed = state.streamingAddsUsed + state.waiverAddsUsed + state.emergencyAddsUsed;
   state.addsRemaining = max - state.addsUsed;
@@ -179,7 +184,7 @@ export async function getAddBudget(env: Env): Promise<AddBudgetState> {
  */
 export async function recordAdd(env: Env, type?: AddType): Promise<void> {
   const state = await readState(env);
-  const max = loadTuning().budget.maxAddsPerWeek;
+  const max = getMaxAddsPerWeek();
 
   if (type === "streaming") {
     state.streamingAddsUsed += 1;
@@ -206,7 +211,7 @@ export async function resetWeeklyBudget(env: Env, weekStart: string): Promise<vo
   const state: AddBudgetState = {
     weekStart,
     addsUsed: 0,
-    addsRemaining: loadTuning().budget.maxAddsPerWeek,
+    addsRemaining: getMaxAddsPerWeek(),
     reserveForReactions: computeReserve(),
     streamingAddsUsed: 0,
     waiverAddsUsed: 0,
@@ -242,7 +247,7 @@ export function canSpendAdd(
   matchupNeeds?: MatchupNeeds,
   nowOverride?: Date,
 ): boolean {
-  const max = loadTuning().budget.maxAddsPerWeek;
+  const max = getMaxAddsPerWeek();
   const totalUsed = budget.streamingAddsUsed + budget.waiverAddsUsed + budget.emergencyAddsUsed;
   const totalRemaining = max - totalUsed;
 

@@ -1,6 +1,7 @@
 import type { Matchup, CategoryScore, Category } from "../types";
 import { INVERSE_CATEGORIES } from "../types";
 import { loadTuning } from "../config/tuning";
+import { loadLeagueSettings } from "../config/league";
 
 // --- Interfaces ---
 
@@ -302,7 +303,7 @@ export function getWorthlessCategories(categories: DetailedCategoryState[]): Cat
 export function computeStreamingDecision(
   categories: DetailedCategoryState[],
   currentIP: number,
-  minimumIP: number = 20,
+  minimumIP: number = loadLeagueSettings().pitching.minimumInningsPerWeek,
 ): StreamingDecision {
   // Must start pitchers to hit IP minimum regardless
   if (currentIP < minimumIP) {
@@ -390,7 +391,7 @@ export function analyzeMatchupDetailed(
   matchup: Matchup,
   daysRemaining: number,
   currentIP: number = 0,
-  minimumIP: number = 20,
+  minimumIP: number = loadLeagueSettings().pitching.minimumInningsPerWeek,
 ): DetailedMatchupAnalysis {
   // Compute base analysis (preserves existing behavior)
   const base = analyzeMatchup(matchup);

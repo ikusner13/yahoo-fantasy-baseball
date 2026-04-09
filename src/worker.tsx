@@ -17,6 +17,7 @@ import {
   runTwoStartPreview,
 } from "./gm";
 import { useWorkersLogger } from "workers-tagged-logger";
+import { setEnvNowOverride } from "./time";
 
 // Cloudflare bindings (raw, before we wrap into our Env)
 type CloudflareBindings = {
@@ -124,6 +125,7 @@ app.get("/run/:routine", async (c) => {
     return c.text(`Unknown routine "${name}". Available: ${available}`, 400);
   }
   const env = buildAppEnv(c.env);
+  setEnvNowOverride(env, c.req.query("date") ?? c.req.query("now") ?? undefined);
   const start = Date.now();
   try {
     await fn(env);
@@ -144,6 +146,7 @@ app.get("/preview/:routine", async (c) => {
   }
   const env = buildAppEnv(c.env);
   env._messageBuffer = [];
+  setEnvNowOverride(env, c.req.query("date") ?? c.req.query("now") ?? undefined);
   const start = Date.now();
   try {
     await fn(env);

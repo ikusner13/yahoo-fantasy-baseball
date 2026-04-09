@@ -1,5 +1,6 @@
 import type { Player, PitcherStats, ScheduledGame, Category } from "../types";
 import type { MatchupAnalysis, DetailedCategoryState } from "./matchup";
+import { loadLeagueSettings } from "../config/league";
 
 // --- Constants ---
 
@@ -241,7 +242,7 @@ export function estimateStreamingImpact(
  */
 export function getIPStatus(
   currentIP: number,
-  minimum: number = 20,
+  minimum: number = loadLeagueSettings().pitching.minimumInningsPerWeek,
 ): {
   currentIP: number;
   minimum: number;

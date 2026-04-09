@@ -18,6 +18,8 @@ export interface Env {
   ODDS_API_KEY?: string;
   /** When set, sendMessage captures here instead of sending to Telegram */
   _messageBuffer?: string[];
+  /** Optional ISO date or datetime override for deterministic previews/tests */
+  _nowIso?: string;
 }
 
 // --- Roster positions ---

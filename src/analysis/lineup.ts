@@ -310,6 +310,76 @@ function isEligible(player: Player, slot: string): boolean {
   return player.positions.includes(slot);
 }
 
+function expandSlots(slotOrder: readonly string[]): string[] {
+  return slotOrder.flatMap((slot) => Array.from({ length: ROSTER_SLOTS[slot] ?? 0 }, () => slot));
+}
+
+function assignOptimalSlots(
+  scoredPlayers: Array<{ entry: RosterEntry; score: number }>,
+  slots: string[],
+  games: ScheduledGame[],
+): { moves: LineupMove[]; assignedIds: Set<string> } {
+  if (slots.length === 0 || scoredPlayers.length === 0) {
+    return { moves: [], assignedIds: new Set() };
+  }
+
+  const memo = new Map<string, { total: number; picks: Array<number | null> }>();
+
+  function slotBonus(slot: string, player: Player): number {
+    if (slot === "SP" && isProbableStarter(player, games)) return 0.05;
+    return 0;
+  }
+
+  function solve(slotIndex: number, usedMask: number): { total: number; picks: Array<number | null> } {
+    if (slotIndex >= slots.length) return { total: 0, picks: [] };
+    const key = `${slotIndex}:${usedMask}`;
+    const cached = memo.get(key);
+    if (cached) return cached;
+
+    let best: { total: number; picks: Array<number | null> } = { total: -Infinity, picks: [] };
+    const slot = slots[slotIndex]!;
+    let foundCandidate = false;
+
+    for (let candidateIndex = 0; candidateIndex < scoredPlayers.length; candidateIndex++) {
+      const bit = 1 << candidateIndex;
+      if ((usedMask & bit) !== 0) continue;
+
+      const candidate = scoredPlayers[candidateIndex]!;
+      if (!isEligible(candidate.entry.player, slot)) continue;
+      foundCandidate = true;
+
+      const next = solve(slotIndex + 1, usedMask | bit);
+      const total = candidate.score + slotBonus(slot, candidate.entry.player) + next.total;
+      if (total > best.total) {
+        best = { total, picks: [candidateIndex, ...next.picks] };
+      }
+    }
+
+    if (!foundCandidate) {
+      const next = solve(slotIndex + 1, usedMask);
+      best = { total: next.total, picks: [null, ...next.picks] };
+    }
+
+    memo.set(key, best);
+    return best;
+  }
+
+  const solved = solve(0, 0);
+  const moves: LineupMove[] = [];
+  const assignedIds = new Set<string>();
+
+  for (let slotIndex = 0; slotIndex < solved.picks.length; slotIndex++) {
+    const candidateIndex = solved.picks[slotIndex];
+    if (candidateIndex == null) continue;
+    const candidate = scoredPlayers[candidateIndex];
+    if (!candidate) continue;
+    moves.push({ playerId: candidate.entry.player.yahooId, position: slots[slotIndex]! });
+    assignedIds.add(candidate.entry.player.yahooId);
+  }
+
+  return { moves, assignedIds };
+}
+
 // --- Core optimizer ---
 
 export function optimizeLineup(
@@ -359,7 +429,7 @@ export function optimizeLineup(
     return proj?.playerType === "pitcher";
   });
 
-  // Sort by score descending for greedy assignment
+  // Sort by score descending before exact assignment to keep tie-breaking stable.
   batters.sort((a, b) => b.score - a.score);
   pitchers.sort((a, b) => {
     // Probable starters get priority for SP slots
@@ -372,60 +442,16 @@ export function optimizeLineup(
   const moves: LineupMove[] = [];
   const assigned = new Set<string>(); // yahooIds already placed
 
-  // Assign batters greedily by slot scarcity
-  for (const slot of BATTING_SLOT_ORDER) {
-    const count = ROSTER_SLOTS[slot] ?? 0;
-    let filled = 0;
-    for (const s of batters) {
-      if (filled >= count) break;
-      if (assigned.has(s.entry.player.yahooId)) continue;
-      if (!isEligible(s.entry.player, slot)) continue;
-      // Only start players with a game (score > 0) unless no choice
-      if (s.score === 0 && filled < count) {
-        // defer bench candidates, but fill if we must
-        continue;
-      }
-      moves.push({ playerId: s.entry.player.yahooId, position: slot });
-      assigned.add(s.entry.player.yahooId);
-      filled++;
-    }
-    // Backfill with zero-score players if slots remain
-    if (filled < count) {
-      for (const s of batters) {
-        if (filled >= count) break;
-        if (assigned.has(s.entry.player.yahooId)) continue;
-        if (!isEligible(s.entry.player, slot)) continue;
-        moves.push({ playerId: s.entry.player.yahooId, position: slot });
-        assigned.add(s.entry.player.yahooId);
-        filled++;
-      }
-    }
+  const batterAssignment = assignOptimalSlots(batters, expandSlots(BATTING_SLOT_ORDER), games);
+  for (const move of batterAssignment.moves) {
+    moves.push(move);
+    assigned.add(move.playerId);
   }
 
-  // Assign pitchers greedily
-  for (const slot of PITCHING_SLOT_ORDER) {
-    const count = ROSTER_SLOTS[slot] ?? 0;
-    let filled = 0;
-    for (const s of pitchers) {
-      if (filled >= count) break;
-      if (assigned.has(s.entry.player.yahooId)) continue;
-      if (!isEligible(s.entry.player, slot)) continue;
-      if (s.score === 0) continue; // skip pitchers w/o game for active slots
-      moves.push({ playerId: s.entry.player.yahooId, position: slot });
-      assigned.add(s.entry.player.yahooId);
-      filled++;
-    }
-    // Backfill
-    if (filled < count) {
-      for (const s of pitchers) {
-        if (filled >= count) break;
-        if (assigned.has(s.entry.player.yahooId)) continue;
-        if (!isEligible(s.entry.player, slot)) continue;
-        moves.push({ playerId: s.entry.player.yahooId, position: slot });
-        assigned.add(s.entry.player.yahooId);
-        filled++;
-      }
-    }
+  const pitcherAssignment = assignOptimalSlots(pitchers, expandSlots(PITCHING_SLOT_ORDER), games);
+  for (const move of pitcherAssignment.moves) {
+    moves.push(move);
+    assigned.add(move.playerId);
   }
 
   // IL slots

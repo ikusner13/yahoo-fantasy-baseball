@@ -161,6 +161,28 @@ interface RotationSlot {
   projectedStarter?: { mlbId: number; name: string };
 }
 
+function uniqueSortedDates(dates: string[]): string[] {
+  return [...new Set(dates)].sort((a, b) => a.localeCompare(b));
+}
+
+function limitStarts(
+  starts: Array<{ date: string; opponent: string }>,
+  maxStarts: number,
+): Array<{ date: string; opponent: string }> {
+  const seen = new Set<string>();
+  const ordered = [...starts].sort((a, b) => a.date.localeCompare(b.date));
+  const deduped: Array<{ date: string; opponent: string }> = [];
+
+  for (const start of ordered) {
+    if (seen.has(start.date)) continue;
+    seen.add(start.date);
+    deduped.push(start);
+    if (deduped.length >= maxStarts) break;
+  }
+
+  return deduped;
+}
+
 /**
  * Fetch recent starts for a team and infer the 5-man rotation order,
  * then project forward.
@@ -190,7 +212,7 @@ export async function getRotationProjection(
     .map(([mlbId, info]) => ({ mlbId, name: info.name }));
 
   // Fetch team's game dates for the projection window
-  const projEnd = addDays(startDate, daysAhead);
+  const projEnd = addDays(startDate, Math.max(0, daysAhead - 1));
   const teamId = ABBR_TO_ID[team];
   if (!teamId) return [];
 
@@ -291,17 +313,22 @@ export async function getTwoStartPitchers(
     }
 
     // Count how many times this pitcher appears in the projection
-    const projectedDates = projection
+    const projectedDates = uniqueSortedDates(
+      projection
       .filter((s) => s.projectedStarter?.mlbId === mlbId && s.date !== info.date)
-      .map((s) => s.date);
+      .map((s) => s.date),
+    ).slice(0, 1);
 
     if (projectedDates.length > 0) {
       // Determine confidence: "probable" if one start is confirmed + one projected,
       // Stays "probable" since one date is from the API
-      const starts = [
-        { date: info.date, opponent: info.opponent },
-        ...projectedDates.map((d) => ({ date: d, opponent: "TBD" })),
-      ];
+      const starts = limitStarts(
+        [
+          { date: info.date, opponent: info.opponent },
+          ...projectedDates.map((d) => ({ date: d, opponent: "TBD" })),
+        ],
+        2,
+      );
       confirmed.push({
         mlbId,
         name: info.name,
@@ -336,7 +363,10 @@ export async function getTwoStartPitchers(
           mlbId,
           name: dates[0].name,
           team,
-          starts: dates.map((d) => ({ date: d.date, opponent: "TBD" })),
+          starts: limitStarts(
+            dates.map((d) => ({ date: d.date, opponent: "TBD" })),
+            2,
+          ),
           confidence: "projected",
         });
       }

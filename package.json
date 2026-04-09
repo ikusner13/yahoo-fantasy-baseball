@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.worker.json",
     "test": "vp test run",
     "test:watch": "vp test",
+    "test:real-data": "RUN_REAL_DATA=1 vp test run tests/integration/recommendation-real-data.test.ts",
     "eval": "evalite",
     "eval:watch": "evalite watch",
     "eval:waiver": "evalite tests/evals/waiver-wire.eval.ts",

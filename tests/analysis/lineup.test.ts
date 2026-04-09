@@ -200,4 +200,25 @@ describe("optimizeLineup", () => {
     const unique = new Set(ids);
     expect(unique.size).toBe(ids.length);
   });
+
+  it("uses exact slot assignment for multi-eligible hitters", () => {
+    const specialRoster: Roster = {
+      entries: [
+        makeEntry(makePlayer("multi", ["1B", "3B"], "NYY"), "BN"),
+        makeEntry(makePlayer("only3b", ["3B"], "BOS"), "BN"),
+        makeEntry(makePlayer("only1b", ["1B"], "LAD"), "BN"),
+      ],
+      date: "2026-04-04",
+    };
+
+    const specialProjections = new Map<string, PlayerProjection>([
+      ["multi", makeBatterProj("multi", 600, 35)],
+      ["only3b", makeBatterProj("only3b", 620, 40)],
+      ["only1b", makeBatterProj("only1b", 380, 2)],
+    ]);
+
+    const moves = optimizeLineup(specialRoster, specialProjections, games);
+    expect(moves.find((move) => move.playerId === "only3b")?.position).toBe("3B");
+    expect(moves.find((move) => move.playerId === "multi")?.position).not.toBe("3B");
+  });
 });

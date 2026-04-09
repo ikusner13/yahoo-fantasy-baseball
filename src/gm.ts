@@ -38,7 +38,7 @@ import { analyzeMatchup, analyzeMatchupDetailed, classifyCategory } from "./anal
 import type { MatchupAnalysis, DetailedMatchupAnalysis } from "./analysis/matchup";
 import { rankStreamingOptions, getIPStatus } from "./analysis/streaming";
 import { rankPitcherPickups } from "./analysis/pitcher-pickups";
-import { findBestPickups, findDroppablePlayer, shouldUseWaiverPriority } from "./analysis/waivers";
+import { findBestPickups, findDroppablePlayer } from "./analysis/waivers";
 import { fetchBatterProjections, fetchPitcherProjections } from "./data/projections";
 import { identifyCategoryNeeds, identifySurplus } from "./analysis/trades";
 import { askLLM } from "./ai/llm";
@@ -48,7 +48,6 @@ import { getWeekSchedule, findGameCountEdge } from "./analysis/game-count";
 import { getTwoStartPitchers } from "./analysis/two-start";
 import {
   getAddBudget,
-  recordAdd,
   canSpendAdd,
   classifyAddPriority,
   resetWeeklyBudget,
@@ -68,9 +67,16 @@ import {
 import { buildRetrospective, formatRetrospectiveForTelegram } from "./analysis/retrospective";
 import { getImpliedRunsMap } from "./data/vegas";
 import { loadTuning } from "./config/tuning";
+import {
+  estimateMatchupWinProbability,
+  type MatchupProbabilitySnapshot,
+} from "./recommendation/probability-engine";
+import { scoreRecommendationConfidence, summarizeConfidence } from "./recommendation/confidence";
+import { evaluateMatchupPickups } from "./recommendation/pickups";
 import { logDecisionEvent, logError } from "./observability/log";
 import { buildMemoryContext, generateReflection } from "./ai/memory";
 import { eq, desc } from "drizzle-orm";
+import { getEnvNow, getTodayIso } from "./time";
 import {
   feedback as feedbackTable,
   decisions as decisionsTable,
@@ -96,6 +102,21 @@ async function getRecentFeedback(env: Env, limit: number = 5): Promise<string | 
 
 // KV-backed alert dedup for news monitor
 const ALERT_KV_KEY = "sent-alert-keys";
+
+function formatWinOdds(probability: number): string {
+  if (probability >= 0.995) return ">99%";
+  if (probability <= 0.005) return "<1%";
+  return `${Math.round(probability * 100)}%`;
+}
+
+function formatShortDate(date: string): string {
+  const parsed = new Date(`${date}T12:00:00Z`);
+  return parsed.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  });
+}
 
 async function getSentAlertKeys(env: Env): Promise<Set<string>> {
   try {
@@ -311,10 +332,12 @@ function projectionsToArray(map: Map<string, PlayerProjection>): PlayerProjectio
 
 export async function runDailyMorning(env: Env): Promise<void> {
   const yahoo = new YahooClient(env);
-  const today = new Date().toISOString().slice(0, 10);
+  const today = getTodayIso(env);
   const actionItems: string[] = []; // things the user needs to DO
   const summaryLines: string[] = []; // background context
   const decisions: Decision[] = [];
+  let probabilitySnapshot: MatchupProbabilitySnapshot | null = null;
+  let matchupConfidence: string | null = null;
 
   // 0. Fetch news alerts (filtered after roster is available)
   let rawAlerts: NewsAlert[] = [];
@@ -376,12 +399,14 @@ export async function runDailyMorning(env: Env): Promise<void> {
   let projectionMap = new Map<string, PlayerProjection>();
   let allProjections: PlayerProjection[] = [];
   let valuations: PlayerValuation[] = [];
+  let rawBatterProjections: Awaited<ReturnType<typeof fetchBatterProjections>> = [];
   let rawPitcherProjections: Awaited<ReturnType<typeof fetchPitcherProjections>> = [];
   try {
     const [rawBatters, rawPitchers] = await Promise.all([
       fetchBatterProjections(undefined, env),
       fetchPitcherProjections(undefined, env),
     ]);
+    rawBatterProjections = rawBatters;
     rawPitcherProjections = rawPitchers;
     const rosterForMatch = roster?.entries.map((e) => e.player) ?? [];
     projectionMap = await buildProjectionMap(rawBatters, rawPitchers, rosterForMatch, env);
@@ -402,6 +427,31 @@ export async function runDailyMorning(env: Env): Promise<void> {
     matchup = await yahoo.getMatchup();
     if (matchup.categories.length > 0) {
       matchupAnalysis = analyzeMatchup(matchup);
+      if (projectionMap.size > 0) {
+        const weekSchedule = await getWeekSchedule(matchup.weekStart, matchup.weekEnd);
+        probabilitySnapshot = estimateMatchupWinProbability(matchup, roster, projectionMap, weekSchedule, {
+          asOf: getEnvNow(env),
+          simulations: 500,
+          seed: 42,
+        });
+
+        const swingCategoryRate =
+          probabilitySnapshot.categoryWinProbabilities.filter(
+            (category) => category.winProbability >= 0.4 && category.winProbability <= 0.6,
+          ).length / Math.max(probabilitySnapshot.categoryWinProbabilities.length, 1);
+        const dataQuality = Math.min(
+          1,
+          projectionMap.size / Math.max(roster.entries.length, 1),
+        );
+        const assessment = scoreRecommendationConfidence({
+          delta: Math.abs(probabilitySnapshot.winProbability - 0.5),
+          deltaScale: 0.25,
+          dataQuality,
+          uncertainty: Math.min(1, swingCategoryRate * 0.7),
+          signalAgreement: matchupAnalysis ? 0.75 : 0.6,
+        });
+        matchupConfidence = summarizeConfidence(assessment);
+      }
     }
   } catch (e) {
     logError("matchup_fetch", e);
@@ -712,26 +762,6 @@ export async function runDailyMorning(env: Env): Promise<void> {
         benchReasons,
       );
       await sendMessage(env, lineupMsg);
-
-      // Action items: always show bench (most actionable), only list starter changes if few
-      if (benchMoves.length > 0) {
-        actionItems.push(
-          `Bench: ${benchMoves
-            .map((m) => {
-              const name = findPlayerName(roster, m.playerId);
-              const reason = benchReasons.get(m.playerId);
-              return reason ? `${name} (${reason})` : name;
-            })
-            .join(", ")}`,
-        );
-      }
-      if (!freshLineup && changedStarters.length > 0) {
-        actionItems.push(
-          `Lineup: start ${changedStarters.map((m) => `${findPlayerName(roster, m.playerId)} (${m.position})`).join(", ")}`,
-        );
-      } else if (freshLineup) {
-        actionItems.push(`Lineup: set ${starterMoves.length} starters — open Yahoo`);
-      }
     }
 
     decisions.push({
@@ -754,18 +784,48 @@ export async function runDailyMorning(env: Env): Promise<void> {
       const valMap = new Map<string, PlayerValuation>();
       for (const v of valuations) valMap.set(v.yahooId, v);
 
-      // Build FA valuations from the z-score list (match by yahooId)
-      const faValuations = valuations.filter((v) =>
-        freeAgents.some((fa) => fa.yahooId === v.yahooId),
-      );
-
-      const pickups = findBestPickups(
-        faValuations,
-        roster.entries,
-        valMap,
-        5,
-        matchupAnalysis ?? undefined,
-      );
+      let pickups = [];
+      if (matchup) {
+        const freeAgentProjectionMap = await buildProjectionMap(
+          rawBatterProjections,
+          rawPitcherProjections,
+          freeAgents,
+          env,
+        );
+        const weekSchedule = await getWeekSchedule(matchup.weekStart, matchup.weekEnd);
+        pickups = evaluateMatchupPickups({
+          roster,
+          freeAgents,
+          rosterValuations: valMap,
+          rosterProjectionMap: projectionMap,
+          freeAgentProjectionMap,
+          matchup,
+          weekSchedule,
+          asOf: getEnvNow(env),
+          simulations: 350,
+          seed: 23,
+          limit: 5,
+        });
+      } else {
+        const freeAgentProjectionMap = await buildProjectionMap(
+          rawBatterProjections,
+          rawPitcherProjections,
+          freeAgents,
+          env,
+        );
+        const faProjectionValues = [...freeAgentProjectionMap.values()];
+        const faValuations = applyVarianceAdjustment(
+          computeZScores(faProjectionValues),
+          faProjectionValues,
+        );
+        pickups = findBestPickups(
+          faValuations,
+          roster.entries,
+          valMap,
+          5,
+          matchupAnalysis ?? undefined,
+        );
+      }
 
       if (pickups.length > 0) {
         const pickupNotifications: PickupNotificationItem[] = [];
@@ -783,24 +843,30 @@ export async function runDailyMorning(env: Env): Promise<void> {
           if (!canSpendAdd(budget, "waiver", priority)) continue;
 
           actionItems.push(
-            `Pickup: add ${rec.add.name}, drop ${rec.drop.name} (+${rec.netValue.toFixed(1)})`,
+            rec.winProbabilityDelta != null
+              ? `Pickup: add ${rec.add.name}, drop ${rec.drop.name} (${rec.winProbabilityDelta >= 0 ? "+" : ""}${(rec.winProbabilityDelta * 100).toFixed(1)}pp win odds)`
+              : `Pickup: add ${rec.add.name}, drop ${rec.drop.name} (+${rec.netValue.toFixed(1)})`,
           );
 
-          const method = shouldUseWaiverPriority(rec, 5)
-            ? ("waiver" as const)
-            : ("add/drop" as const);
           pickupNotifications.push({
             addName: rec.add.name,
             dropName: rec.drop.name,
             netValue: rec.netValue,
+            winProbabilityDelta: rec.winProbabilityDelta,
+            expectedCategoryWinsDelta: rec.expectedCategoryWinsDelta,
             priority,
             reasoning: rec.reasoning,
-            method,
+            method: "waiver",
           });
-          await recordAdd(env, "waiver");
           decisions.push({
             type: "waiver",
-            action: { add: rec.add.name, drop: rec.drop.name, net: rec.netValue },
+            action: {
+              add: rec.add.name,
+              drop: rec.drop.name,
+              net: rec.netValue,
+              winProbabilityDelta: rec.winProbabilityDelta,
+              expectedCategoryWinsDelta: rec.expectedCategoryWinsDelta,
+            },
             reasoning: rec.reasoning,
             result: "notified",
           });
@@ -893,11 +959,12 @@ export async function runDailyMorning(env: Env): Promise<void> {
       }
 
       // Compute matchup window end date + streaming decision
-      const dow = new Date().getDay();
+      const now = getEnvNow(env);
+      const dow = now.getDay();
       const daysRemaining = dow === 0 ? 1 : 8 - dow;
       const matchupEnd =
         matchup?.weekEnd ??
-        new Date(Date.now() + daysRemaining * 86400000).toISOString().slice(0, 10);
+        new Date(now.getTime() + daysRemaining * 86400000).toISOString().slice(0, 10);
 
       let canStream = true;
       let minScore = 3.0;
@@ -977,7 +1044,6 @@ export async function runDailyMorning(env: Env): Promise<void> {
                   metricsStr,
                 );
                 await sendMessage(env, streamMsg);
-                await recordAdd(env, "streaming");
                 decisions.push({
                   type: "stream",
                   action: {
@@ -1008,20 +1074,24 @@ export async function runDailyMorning(env: Env): Promise<void> {
 
   // 10. Build and send action-first summary
   const finalLines: string[] = [`<b>Today's Plan — ${today}</b>`];
+  if (probabilitySnapshot) {
+    const confidenceLine = matchupConfidence ? ` | <b>Confidence:</b> ${matchupConfidence}` : "";
+    finalLines.push(
+      "",
+      `<b>Win Odds:</b> ${formatWinOdds(probabilitySnapshot.winProbability)} | <b>Expected Cats:</b> ${probabilitySnapshot.expectedCategoryWins.toFixed(1)}${confidenceLine}`,
+    );
+  }
+
   if (actionItems.length > 0) {
     finalLines.push("");
     for (const item of actionItems) finalLines.push(`• ${item}`);
-  } else {
-    finalLines.push("", "No changes needed today.");
   }
 
   // Strategy section: what to do to win the week
   if (matchupAnalysis) {
     const { swingCategories, lostCategories, safeCategories, strategy } = matchupAnalysis;
     finalLines.push("");
-    finalLines.push(
-      `<b>Strategy (${matchupAnalysis.projectedWins}W-${matchupAnalysis.projectedLosses}L):</b>`,
-    );
+    finalLines.push(`<b>Strategy:</b>`);
     if (swingCategories.length > 0) {
       finalLines.push(`Chase: ${swingCategories.join(", ")}`);
     }
@@ -1029,23 +1099,33 @@ export async function runDailyMorning(env: Env): Promise<void> {
       finalLines.push(`Protect: ${safeCategories.join(", ")}`);
     }
     if (lostCategories.length > 0) {
-      finalLines.push(`Give up: ${lostCategories.join(", ")}`);
+      finalLines.push(`Ignore today: ${lostCategories.join(", ")}`);
     }
 
     // Concrete actions from strategy flags
     const actions: string[] = [];
+    const avoid: string[] = [];
     if (strategy.protectRatios) actions.push("sit risky SPs to protect ERA/WHIP");
     if (strategy.chaseStrikeouts) actions.push("start high-K pitchers");
     if (strategy.prioritizePower) actions.push("start power bats");
     if (strategy.prioritizeSpeed) actions.push("start speed guys");
     if (strategy.streamPitchers) actions.push("stream pitchers for counting stats");
+    if (strategy.protectRatios) avoid.push("risky SPs");
+    if (lostCategories.length > 0) avoid.push("low-impact moves in ignored cats");
     if (actions.length > 0) {
       finalLines.push(`Today: ${actions.join(", ")}`);
+    }
+    if (avoid.length > 0) {
+      finalLines.push(`Avoid: ${avoid.join(", ")}`);
     }
   }
   // Append AI context if available (already filtered to non-empty)
   if (summaryLines.length > 0) {
     finalLines.push("", ...summaryLines);
+  }
+
+  if (finalLines.length === 1) {
+    finalLines.push("", "No changes needed today.");
   }
 
   try {
@@ -1087,7 +1167,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
 
 export async function runLateScratchCheck(env: Env): Promise<void> {
   const yahoo = new YahooClient(env);
-  const today = new Date().toISOString().slice(0, 10);
+  const today = getTodayIso(env);
 
   let roster;
   let games: ScheduledGame[];
@@ -1217,6 +1297,13 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
   }
 
   let analysis: MatchupAnalysis | null = null;
+  let probabilitySnapshot:
+    | {
+        winProbability: number;
+        expectedCategoryWins: number;
+        daysRemaining: number;
+      }
+    | undefined;
   try {
     analysis = analyzeMatchup(matchup);
   } catch (e) {
@@ -1240,6 +1327,12 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
     const projMap = await buildProjectionMap(rawBat, rawPit, rosterPlayers, env);
     const allVals = computeZScores(projectionsToArray(projMap));
     const valMap = new Map(allVals.map((v) => [v.yahooId, v]));
+    const weekSchedule = await getWeekSchedule(matchup.weekStart, matchup.weekEnd);
+
+    probabilitySnapshot = estimateMatchupWinProbability(matchup, myRoster, projMap, weekSchedule, {
+      simulations: 1000,
+      seed: 42,
+    });
 
     const myVals = myRoster.entries
       .map((e) => valMap.get(e.player.yahooId))
@@ -1260,7 +1353,7 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
 
   // Reset weekly add budget on Monday
   try {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = getTodayIso(env);
     await resetWeeklyBudget(env, today);
   } catch (e) {
     logError("weekly_budget_reset", e);
@@ -1270,7 +1363,9 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
     `<b>Weekly Matchup Preview — Week ${matchup.week}</b>`,
     `vs. ${matchup.opponentTeamName}`,
     "",
-    `<b>Projected:</b> ${analysis.projectedWins}W - ${analysis.projectedLosses}L - ${analysis.swingCategories.length} swing`,
+    probabilitySnapshot
+      ? `<b>Win Odds:</b> ${(probabilitySnapshot.winProbability * 100).toFixed(0)}% | <b>Expected Cats:</b> ${probabilitySnapshot.expectedCategoryWins.toFixed(1)}`
+      : `<b>Current Read:</b> ${analysis.projectedWins}W - ${analysis.projectedLosses}L - ${analysis.swingCategories.length} swing`,
     "",
   ];
 
@@ -1295,7 +1390,9 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
     const detailed = analyzeMatchupDetailed(matchup, 7);
     const ipInfo = getIPStatus(currentIP);
     const briefing = formatMatchupForLLM({
-      summary: `Week ${matchup.week} vs ${matchup.opponentTeamName}, ${detailed.projectedWins}W-${detailed.projectedLosses}L, 7 days left`,
+      summary: probabilitySnapshot
+        ? `Week ${matchup.week} vs ${matchup.opponentTeamName}, ${(probabilitySnapshot.winProbability * 100).toFixed(0)}% win odds, ${probabilitySnapshot.expectedCategoryWins.toFixed(1)} expected categories, ${probabilitySnapshot.daysRemaining} days left`
+        : `Week ${matchup.week} vs ${matchup.opponentTeamName}, ${detailed.projectedWins}W-${detailed.projectedLosses}L, 7 days left`,
       categories: formatDetailedCategories(detailed),
       worthless:
         detailed.worthlessCategories.length > 0
@@ -1327,14 +1424,18 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
 
   await logDecision(env, {
     type: "lineup",
-    action: {
-      routine: "weekly_matchup",
-      week: matchup.week,
-      opponent: matchup.opponentTeamName,
-      projected: `${analysis.projectedWins}-${analysis.projectedLosses}`,
-      swing: analysis.swingCategories,
-    },
-    reasoning: `Week ${matchup.week} matchup analysis vs ${matchup.opponentTeamName}: ${analysis.projectedWins}W-${analysis.projectedLosses}L`,
+      action: {
+        routine: "weekly_matchup",
+        week: matchup.week,
+        opponent: matchup.opponentTeamName,
+        projected: `${analysis.projectedWins}-${analysis.projectedLosses}`,
+        swing: analysis.swingCategories,
+        winProbability: probabilitySnapshot?.winProbability,
+        expectedCategoryWins: probabilitySnapshot?.expectedCategoryWins,
+      },
+    reasoning: probabilitySnapshot
+      ? `Week ${matchup.week} matchup analysis vs ${matchup.opponentTeamName}: ${(probabilitySnapshot.winProbability * 100).toFixed(0)}% win odds, ${probabilitySnapshot.expectedCategoryWins.toFixed(1)} expected categories`
+      : `Week ${matchup.week} matchup analysis vs ${matchup.opponentTeamName}: ${analysis.projectedWins}W-${analysis.projectedLosses}L`,
     result: "success",
   });
 }
@@ -1568,7 +1669,7 @@ export async function runTradeEvaluation(env: Env): Promise<void> {
 
 export async function runNewsMonitor(env: Env): Promise<void> {
   const yahoo = new YahooClient(env);
-  const today = new Date().toISOString().slice(0, 10);
+  const today = getTodayIso(env);
 
   // 1. Fetch alerts
   let alerts: NewsAlert[];
@@ -1597,7 +1698,7 @@ export async function runNewsMonitor(env: Env): Promise<void> {
   }
 
   if (games.length > 0) {
-    const now = Date.now();
+    const now = getEnvNow(env).getTime();
     alerts = alerts.filter((a) => {
       if (!a.team) return true; // no team info = can't filter, send it
       // Find the game for this player's team
@@ -1727,7 +1828,7 @@ export async function runSundayTactics(env: Env): Promise<void> {
   }
 
   try {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = getTodayIso(env);
     await yahoo.getRoster(today); // validate roster access
   } catch (e) {
     logError("sunday_roster_fetch", e);
@@ -1827,7 +1928,7 @@ export async function runTwoStartPreview(env: Env): Promise<void> {
   const yahoo = new YahooClient(env);
 
   // Compute next week's Mon-Sun date range
-  const today = new Date();
+  const today = getEnvNow(env);
   const dayOfWeek = today.getDay(); // 0=Sun
   // Days until next Monday: if Sun=0 -> 1, Mon=1 -> 7, Tue=2 -> 6, etc.
   const daysUntilMon = dayOfWeek === 0 ? 1 : 8 - dayOfWeek;
@@ -1899,27 +2000,17 @@ export async function runTwoStartPreview(env: Env): Promise<void> {
   if (available.length > 0) {
     lines.push(`<b>Available two-start SPs (${available.length}):</b>`);
     for (const p of available) {
-      const opponents = p.starts.map((s) => `vs ${s.opponent}`).join(" / ");
+      const opponents = p.starts
+        .map((s) => `${formatShortDate(s.date)} vs ${s.opponent}`)
+        .join(" / ");
       const conf = p.confidence !== "confirmed" ? ` [${p.confidence}]` : "";
       lines.push(`  • ${p.name} (${p.team}) ${opponents}${conf}`);
     }
-  } else {
-    lines.push("No two-start SPs available on waivers.");
-  }
-
-  if (rostered.length > 0) {
-    lines.push("");
-    lines.push(`<b>Rostered two-start SPs (${rostered.length}):</b>`);
-    for (const p of rostered.slice(0, 10)) {
-      const opponents = p.starts.map((s) => `vs ${s.opponent}`).join(" / ");
-      const conf = p.confidence !== "confirmed" ? ` [${p.confidence}]` : "";
-      lines.push(`  • ${p.name} (${p.team}) ${opponents}${conf}`);
-    }
-  }
-
-  if (available.length > 0) {
     lines.push("");
     lines.push("Consider grabbing before Sunday waivers process.");
+  } else {
+    lines.push("No actionable two-start SP adds on waivers right now.");
+    lines.push("Hold your adds unless the waiver pool changes.");
   }
 
   try {

@@ -8,6 +8,15 @@ export interface PickupRecommendation {
   drop: Player;
   netValue: number;
   reasoning: string;
+  winProbabilityDelta?: number;
+  expectedCategoryWinsDelta?: number;
+}
+
+interface DroppableCandidate {
+  entry: RosterEntry;
+  val: PlayerValuation;
+  hasGameToday: boolean;
+  depth: number;
 }
 
 // --- Constants ---
@@ -168,22 +177,17 @@ function positionDepthScore(entry: RosterEntry, roster: RosterEntry[]): number {
  *   2. Players at positions with the most depth
  *   3. Lowest z-score as final tiebreaker
  */
-export function findDroppablePlayer(
+export function rankDroppablePlayers(
   roster: RosterEntry[],
   valuations: Map<string, PlayerValuation>,
   positionFilter?: string | string[],
   options?: { eliteOverride?: boolean; teamsPlayingToday?: Set<string> },
-): RosterEntry | null {
+): RosterEntry[] {
   const eliteOverride = options?.eliteOverride ?? false;
   const teamsPlaying = options?.teamsPlayingToday;
   const coreThreshold = corePlayerThreshold(roster, valuations);
 
-  const droppable: Array<{
-    entry: RosterEntry;
-    val: PlayerValuation;
-    hasGameToday: boolean;
-    depth: number;
-  }> = [];
+  const droppable: DroppableCandidate[] = [];
 
   for (const entry of roster) {
     if (entry.currentPosition === "IL") continue;
@@ -208,7 +212,7 @@ export function findDroppablePlayer(
     droppable.push({ entry, val, hasGameToday, depth });
   }
 
-  if (droppable.length === 0) return null;
+  if (droppable.length === 0) return [];
 
   // Sort: prefer no-game-today, then most depth, then lowest z-score
   droppable.sort((a, b) => {
@@ -217,7 +221,16 @@ export function findDroppablePlayer(
     return a.val.totalZScore - b.val.totalZScore;
   });
 
-  return droppable[0]!.entry;
+  return droppable.map((candidate) => candidate.entry);
+}
+
+export function findDroppablePlayer(
+  roster: RosterEntry[],
+  valuations: Map<string, PlayerValuation>,
+  positionFilter?: string | string[],
+  options?: { eliteOverride?: boolean; teamsPlayingToday?: Set<string> },
+): RosterEntry | null {
+  return rankDroppablePlayers(roster, valuations, positionFilter, options)[0] ?? null;
 }
 
 /**
@@ -324,7 +337,14 @@ export function shouldUseWaiverPriority(
   recommendation: PickupRecommendation,
   priorityPosition: number,
 ): boolean {
-  const { netValue } = recommendation;
+  const { netValue, winProbabilityDelta } = recommendation;
+  const winDeltaPct = (winProbabilityDelta ?? 0) * 100;
+
+  if (winProbabilityDelta != null) {
+    if (priorityPosition <= 3) return winDeltaPct >= 1.0 || netValue > 0.5;
+    if (priorityPosition <= 8) return winDeltaPct >= 2.5 || netValue > 1.5;
+    return winDeltaPct >= 5.0 || netValue > 3.0;
+  }
 
   if (priorityPosition <= 3) return netValue > 0.5;
   if (priorityPosition <= 8) return netValue > 1.5;
