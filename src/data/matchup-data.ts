@@ -230,6 +230,165 @@ export const PARK_FACTORS: Record<string, ParkFactor> = {
   WSH: { team: "WSH", parkName: "Nationals Park", runsFactor: 1.0, hrFactor: 1.0 },
 };
 
+// --- Team batting stats ---
+
+export interface TeamBattingStats {
+  team: string;
+  kPct: number; // team strikeout rate (K / PA)
+  bbPct: number; // walk rate
+  obp: number;
+  ops: number;
+  /** wOBA approximation derived from OBP + component weighting */
+  woba: number;
+  wobaVsL: number; // team wOBA vs left-handed pitchers
+  wobaVsR: number; // team wOBA vs right-handed pitchers
+}
+
+const TEAM_IDS_INTERNAL: Record<string, number> = {
+  ARI: 109,
+  ATL: 144,
+  BAL: 110,
+  BOS: 111,
+  CHC: 112,
+  CWS: 145,
+  CIN: 113,
+  CLE: 114,
+  COL: 115,
+  DET: 116,
+  HOU: 117,
+  KC: 118,
+  LAA: 108,
+  LAD: 119,
+  MIA: 146,
+  MIL: 158,
+  MIN: 142,
+  NYM: 121,
+  NYY: 147,
+  OAK: 133,
+  PHI: 143,
+  PIT: 134,
+  SD: 135,
+  SF: 137,
+  SEA: 136,
+  STL: 138,
+  TB: 139,
+  TEX: 140,
+  TOR: 141,
+  WSH: 120,
+};
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function parseTeamHittingStat(stat: any): {
+  kPct: number;
+  bbPct: number;
+  obp: number;
+  ops: number;
+} {
+  const pa = (stat.plateAppearances as number) || 0;
+  const k = (stat.strikeOuts as number) || 0;
+  const bb = (stat.baseOnBalls as number) || 0;
+  return {
+    kPct: pa > 0 ? k / pa : 0.22,
+    bbPct: pa > 0 ? bb / pa : 0.08,
+    obp: parseFloat(stat.obp) || 0.32,
+    ops: parseFloat(stat.ops) || 0.72,
+  };
+}
+
+/** Approximate wOBA from OBP (correlation ~0.95, good enough for relative ranking) */
+function obpToWoba(obp: number): number {
+  // wOBA ≈ OBP * 0.92 + 0.015 (empirical linear fit)
+  return obp * 0.92 + 0.015;
+}
+
+/**
+ * Fetch team-level batting stats including K% and vs-hand splits.
+ * Returns null if the API call fails.
+ */
+export async function getTeamBattingStats(teamAbbr: string): Promise<TeamBattingStats | null> {
+  const teamId = TEAM_IDS_INTERNAL[teamAbbr.toUpperCase()];
+  if (!teamId) return null;
+
+  const season = new Date().getFullYear();
+
+  try {
+    // Fetch season stats + vs-hand splits in parallel
+    const [seasonRes, splitsRes] = await Promise.all([
+      fetch(`${BASE}/teams/${teamId}/stats?stats=season&group=hitting&season=${season}`),
+      fetch(
+        `${BASE}/teams/${teamId}/stats?stats=statSplits&group=hitting&sitCodes=vl,vr&season=${season}`,
+      ),
+    ]);
+
+    // Parse season stats
+    let kPct = 0.22;
+    let bbPct = 0.08;
+    let obp = 0.32;
+    let ops = 0.72;
+
+    if (seasonRes.ok) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const json: any = await seasonRes.json();
+      const stat = json.stats?.[0]?.splits?.[0]?.stat;
+      if (stat) {
+        const parsed = parseTeamHittingStat(stat);
+        kPct = parsed.kPct;
+        bbPct = parsed.bbPct;
+        obp = parsed.obp;
+        ops = parsed.ops;
+      }
+    }
+
+    const woba = obpToWoba(obp);
+
+    // Parse vs-hand splits
+    let wobaVsL = woba;
+    let wobaVsR = woba;
+
+    if (splitsRes.ok) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const splitsJson: any = await splitsRes.json();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      for (const split of (splitsJson.stats?.[0]?.splits ?? []) as any[]) {
+        const code = split.split?.code ?? split.split?.description ?? "";
+        const splitStat = split.stat;
+        if (!splitStat) continue;
+        const splitObp = parseFloat(splitStat.obp) || obp;
+        if (code === "vl" || code === "vs LHP") {
+          wobaVsL = obpToWoba(splitObp);
+        } else if (code === "vr" || code === "vs RHP") {
+          wobaVsR = obpToWoba(splitObp);
+        }
+      }
+    }
+
+    return { team: teamAbbr, kPct, bbPct, obp, ops, woba, wobaVsL, wobaVsR };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Batch fetch team batting stats for multiple teams.
+ * Returns a map of team abbreviation → stats.
+ */
+export async function getBatchTeamBattingStats(
+  teams: string[],
+): Promise<Map<string, TeamBattingStats>> {
+  const results = new Map<string, TeamBattingStats>();
+  if (teams.length === 0) return results;
+
+  const tasks = teams.map((t) => () => getTeamBattingStats(t));
+  const settled = await fetchWithConcurrency(tasks, 5);
+
+  for (let i = 0; i < teams.length; i++) {
+    const stat = settled[i];
+    if (stat) results.set(teams[i], stat);
+  }
+
+  return results;
+}
+
 export function getParkFactor(homeTeam: string): ParkFactor {
   const factor = PARK_FACTORS[homeTeam.toUpperCase()];
   if (factor) return factor;

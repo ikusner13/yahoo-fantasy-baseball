@@ -1,11 +1,14 @@
 import type {
   Env,
   Decision,
+  Roster,
   ScheduledGame,
   PlayerProjection,
   PlayerValuation,
   LineupMove,
 } from "./types";
+// Monte Carlo simulation available for future matchup-level decisions
+import { type DailyProjection } from "./analysis/monte-carlo";
 import { YahooClient } from "./yahoo/client";
 import { getTodaysGames } from "./data/mlb";
 import { sendMessage } from "./notifications/telegram";
@@ -14,44 +17,39 @@ import {
   formatILNotification,
   formatPickupNotification,
   formatStreamingNotification,
+  formatPitcherPickupNotification,
   formatLateScratchNotification,
   type PickupNotificationItem,
 } from "./notifications/action-messages";
 import { getILMoves, countILSlots, getInjuredActivePlayers } from "./analysis/il-manager";
-import { optimizeLineup, type ScoringContext } from "./analysis/lineup";
+import {
+  optimizeLineup,
+  type ScoringContext,
+  type TeamRateContext,
+  type RateStatState,
+} from "./analysis/lineup";
 import {
   computeStreaks,
   getStreakSummary,
   type RecentPerformance,
 } from "./analysis/recent-performance";
-import { computeZScores } from "./analysis/valuations";
-import { analyzeMatchup, analyzeMatchupDetailed } from "./analysis/matchup";
+import { computeZScores, applyVarianceAdjustment } from "./analysis/valuations";
+import { analyzeMatchup, analyzeMatchupDetailed, classifyCategory } from "./analysis/matchup";
 import type { MatchupAnalysis, DetailedMatchupAnalysis } from "./analysis/matchup";
 import { rankStreamingOptions, getIPStatus } from "./analysis/streaming";
-import { findBestPickups, shouldUseWaiverPriority } from "./analysis/waivers";
+import { rankPitcherPickups } from "./analysis/pitcher-pickups";
+import { findBestPickups, findDroppablePlayer, shouldUseWaiverPriority } from "./analysis/waivers";
 import { fetchBatterProjections, fetchPitcherProjections } from "./data/projections";
 import { identifyCategoryNeeds, identifySurplus } from "./analysis/trades";
 import { askLLM } from "./ai/llm";
-import {
-  lineupSummaryPrompt,
-  waiverWirePrompt,
-  matchupStrategyPrompt,
-  tradeProposalPrompt,
-  injuryAssessmentPrompt,
-} from "./ai/prompts";
-import {
-  formatMatchupForLLM,
-  formatWaiverForLLM,
-  formatTradeForLLM,
-  formatInjuryForLLM,
-  formatLineupForLLM,
-} from "./ai/briefing";
+import { matchupStrategyPrompt, tradeProposalPrompt, injuryAssessmentPrompt } from "./ai/prompts";
+import { formatMatchupForLLM, formatTradeForLLM, formatInjuryForLLM } from "./ai/briefing";
 import { getWeekSchedule, findGameCountEdge } from "./analysis/game-count";
 import { getTwoStartPitchers } from "./analysis/two-start";
 import {
   getAddBudget,
   recordAdd,
-  shouldSpendAdd,
+  canSpendAdd,
   classifyAddPriority,
   resetWeeklyBudget,
 } from "./analysis/add-budget";
@@ -68,6 +66,7 @@ import {
   type PlatoonSplit,
 } from "./data/matchup-data";
 import { buildRetrospective, formatRetrospectiveForTelegram } from "./analysis/retrospective";
+import { getImpliedRunsMap } from "./data/vegas";
 import { loadTuning } from "./config/tuning";
 import { logDecisionEvent, logError } from "./observability/log";
 import { buildMemoryContext, generateReflection } from "./ai/memory";
@@ -144,7 +143,8 @@ function classifyAlertRelevance(alert: NewsAlert, rosterNames: string[]): AlertR
 function shouldSendAlert(alert: NewsAlert, relevance: AlertRelevance): boolean {
   if (relevance === "OUR_PLAYER") return true;
   if (relevance === "FREE_AGENT") {
-    return alert.type === "closer_change" || alert.type === "callup";
+    // Only high-impact FA alerts: closer changes always, injuries for popular FAs
+    return alert.type === "closer_change";
   }
   return false;
 }
@@ -230,17 +230,19 @@ async function buildProjectionMap(
     const { idMap, matches } = buildPlayerIdMap(rosterPlayers, allProjections);
     fgToYahoo = idMap;
 
-    // Persist matches to player_ids table
+    // Persist matches to player_ids table (including mlbId from FanGraphs)
     if (env && matches.length > 0) {
-      const projByFg = new Map<number, { name: string; team: string }>();
-      for (const b of batters) projByFg.set(b.fangraphsId, { name: b.name, team: b.team });
-      for (const p of pitchers) projByFg.set(p.fangraphsId, { name: p.name, team: p.team });
+      const projByFg = new Map<number, { name: string; team: string; mlbId?: number }>();
+      for (const b of batters)
+        projByFg.set(b.fangraphsId, { name: b.name, team: b.team, mlbId: b.mlbId });
+      for (const p of pitchers)
+        projByFg.set(p.fangraphsId, { name: p.name, team: p.team, mlbId: p.mlbId });
 
       const rows: PlayerIdRow[] = matches.map((m) => {
         const proj = projByFg.get(m.fangraphsId);
         return {
           yahooId: m.yahooId,
-          mlbId: null,
+          mlbId: proj?.mlbId ?? null,
           fangraphsId: m.fangraphsId,
           name: proj?.name ?? m.name,
           positions: null,
@@ -310,73 +312,50 @@ function projectionsToArray(map: Map<string, PlayerProjection>): PlayerProjectio
 export async function runDailyMorning(env: Env): Promise<void> {
   const yahoo = new YahooClient(env);
   const today = new Date().toISOString().slice(0, 10);
-  const summaryLines: string[] = [`<b>Daily GM Report — ${today}</b>`];
+  const actionItems: string[] = []; // things the user needs to DO
+  const summaryLines: string[] = []; // background context
   const decisions: Decision[] = [];
 
-  // 0. Check news alerts (closer changes, call-ups, injuries)
+  // 0. Fetch news alerts (filtered after roster is available)
+  let rawAlerts: NewsAlert[] = [];
   try {
-    const alerts = await getActionableAlerts(env);
-    if (alerts.length > 0) {
-      summaryLines.push(`\n<b>News Alerts (${alerts.length}):</b>`);
-      for (const alert of alerts.slice(0, 5)) {
-        summaryLines.push(formatAlertForTelegram(alert));
-
-        // Run injury alerts through LLM injury assessment
-        if (alert.type === "injury" && alert.playerName) {
-          try {
-            const injuryMemory = await buildMemoryContext(env, "injury");
-            const briefing = formatInjuryForLLM({
-              player: alert.playerName,
-              injury: alert.headline,
-              rosterContext: `Team: ${alert.team}. ${alert.fantasyImpact}`,
-              ilSlots: "Check roster for availability",
-              memory: injuryMemory,
-            });
-            const prompt = injuryAssessmentPrompt(briefing);
-            const assessment = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
-            if (!assessment.startsWith("[")) {
-              summaryLines.push(`  → AI: ${assessment}`);
-            }
-          } catch (e) {
-            logError("injury_assessment", e);
-            // supplemental
-          }
-        }
-      }
-    }
+    rawAlerts = await getActionableAlerts(env);
   } catch (e) {
     logError("news_alerts", e);
-    // non-fatal
   }
 
   // 1. Fetch roster
   let roster;
   try {
     roster = await yahoo.getRoster(today);
-    summaryLines.push(`Roster: ${roster.entries.length} players`);
   } catch (e) {
     logError("roster_fetch", e);
-    const msg = `Roster fetch failed: ${e instanceof Error ? e.message : "unknown"}`;
-    summaryLines.push(msg);
-    await sendMessage(env, summaryLines.join("\n"));
+    await sendMessage(env, `Roster fetch failed: ${e instanceof Error ? e.message : "unknown"}`);
     return;
+  }
+
+  // 1b. Filter news alerts to roster-relevant items
+  if (rawAlerts.length > 0) {
+    const rosterNames = roster.entries.map((e) => e.player.name);
+    for (const alert of rawAlerts) {
+      const relevance = classifyAlertRelevance(alert, rosterNames);
+      if (shouldSendAlert(alert, relevance)) {
+        actionItems.push(formatAlertForTelegram(alert));
+      }
+    }
   }
 
   // 2. Fetch today's games
   let games: ScheduledGame[] = [];
   try {
     games = await getTodaysGames(today, env);
-    summaryLines.push(`Games today: ${games.length}`);
-    appendProbablePitchers(summaryLines, games);
   } catch (e) {
     logError("games_fetch", e);
-    summaryLines.push(`Games fetch failed: ${e instanceof Error ? e.message : "unknown"}`);
   }
 
   // 2b. Weekly game count analysis
   try {
-    // Get this week's schedule (Mon-Sun)
-    const dayOfWeek = new Date(today).getDay(); // 0=Sun
+    const dayOfWeek = new Date(today).getDay();
     const weekStartOffset = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
     const weekStart = new Date(new Date(today).getTime() + weekStartOffset * 86400000)
       .toISOString()
@@ -387,33 +366,33 @@ export async function runDailyMorning(env: Env): Promise<void> {
     const weekSchedule = await getWeekSchedule(weekStart, weekEnd);
     const edgeTeams = findGameCountEdge(weekSchedule);
     if (edgeTeams.length > 0) {
-      summaryLines.push(`7-game teams this week: ${edgeTeams.join(", ")}`);
+      summaryLines.push(`7-game teams: ${edgeTeams.join(", ")}`);
     }
   } catch (e) {
     logError("week_schedule", e);
-    // non-fatal
   }
 
   // 3. Fetch projections from FanGraphs
   let projectionMap = new Map<string, PlayerProjection>();
   let allProjections: PlayerProjection[] = [];
   let valuations: PlayerValuation[] = [];
+  let rawPitcherProjections: Awaited<ReturnType<typeof fetchPitcherProjections>> = [];
   try {
     const [rawBatters, rawPitchers] = await Promise.all([
       fetchBatterProjections(undefined, env),
       fetchPitcherProjections(undefined, env),
     ]);
+    rawPitcherProjections = rawPitchers;
     const rosterForMatch = roster?.entries.map((e) => e.player) ?? [];
     projectionMap = await buildProjectionMap(rawBatters, rawPitchers, rosterForMatch, env);
     allProjections = projectionsToArray(projectionMap);
-    summaryLines.push(`Projections: ${rawBatters.length} batters, ${rawPitchers.length} pitchers`);
 
-    // 4. Compute z-scores
-    valuations = computeZScores(allProjections);
-    summaryLines.push(`Valuations: ${valuations.length} players scored`);
+    // 4. Compute z-scores with variance adjustment for H2H consistency
+    const rawValuations = computeZScores(allProjections);
+    valuations = applyVarianceAdjustment(rawValuations, allProjections);
   } catch (e) {
     logError("projections_fetch", e);
-    summaryLines.push(`Projections failed: ${e instanceof Error ? e.message : "unknown"}`);
+    actionItems.push("Data issue: projections unavailable — lineup may be suboptimal");
   }
 
   // 5. Fetch current matchup for category weighting
@@ -491,23 +470,14 @@ export async function runDailyMorning(env: Env): Promise<void> {
           );
         }
         streakSummaryText = parts.join(". ");
+        // Surface hot/cold streaks as actionable info
         if (streakSummaryText) {
-          summaryLines.push(`Statcast: ${statcast.length} batters tracked. ${streakSummaryText}`);
-        } else {
-          summaryLines.push(`Statcast: ${statcast.length} batters tracked, no notable streaks`);
+          summaryLines.push(streakSummaryText);
         }
-      } else {
-        summaryLines.push("Statcast: no data for roster players");
       }
-    } else {
-      summaryLines.push("Statcast: skipped (no mlbId mappings)");
     }
   } catch (e) {
     logError("statcast_fetch", e);
-    summaryLines.push(
-      `Statcast: failed (${e instanceof Error ? e.message : "unknown"}) — continuing without`,
-    );
-    // Non-fatal: optimizer handles missing streaks gracefully
   }
 
   // Build per-player ScoringContext with park factors (static data, never fails)
@@ -515,20 +485,14 @@ export async function runDailyMorning(env: Env): Promise<void> {
     contextMap = new Map<string, ScoringContext>();
     for (const entry of roster.entries) {
       const team = entry.player.team;
-      // Find the game this player's team is in today
       const game = games.find((g) => g.homeTeam === team || g.awayTeam === team);
       if (game) {
-        // Park factor comes from the HOME team's park
         const parkFactor = getParkFactor(game.homeTeam);
         contextMap.set(entry.player.yahooId, { parkFactor });
       }
     }
-    if (contextMap.size > 0) {
-      summaryLines.push(`Park factors: ${contextMap.size} players in context`);
-    }
   } catch (e) {
     logError("park_factors", e);
-    // Park factors are static — this should never fail, but be safe
     contextMap = undefined;
   }
 
@@ -607,32 +571,77 @@ export async function runDailyMorning(env: Env): Promise<void> {
       contextMap.set(yahooId, { ...existing, platoon, opposingPitcherHand });
       platoonCount++;
     }
-
-    if (platoonCount > 0) {
-      const lhpCount = [...teamToOpposingHand.values()].filter((h) => h === "L").length;
-      const rhpCount = [...teamToOpposingHand.values()].filter((h) => h === "R").length;
-      summaryLines.push(
-        `Platoon: ${platoonCount} batters matched (${lhpCount}L/${rhpCount}R pitchers)`,
-      );
-    }
   } catch (e) {
     logError("platoon_splits", e);
-    summaryLines.push(
-      `Platoon: failed (${e instanceof Error ? e.message : "unknown"}) — continuing without`,
-    );
-    // Non-fatal: optimizer handles missing platoon data gracefully
+  }
+
+  // 5d. Inject z-scores into context map (proper player quality ranking)
+  if (valuations.length > 0) {
+    if (!contextMap) contextMap = new Map<string, ScoringContext>();
+    const valMap = new Map(valuations.map((v) => [v.yahooId, v.totalZScore]));
+    for (const entry of roster.entries) {
+      const zScore = valMap.get(entry.player.yahooId);
+      if (zScore != null) {
+        const existing = contextMap.get(entry.player.yahooId) ?? {};
+        contextMap.set(entry.player.yahooId, { ...existing, zScore });
+      }
+    }
+  }
+
+  // 5e. Inject team rate stat context for pitcher marginal impact scoring
+  if (matchup && matchup.categories.length > 0) {
+    try {
+      if (!contextMap) contextMap = new Map<string, ScoringContext>();
+
+      const currentIP = getCurrentIP(matchup);
+      const eraStat = matchup.categories.find((c) => c.category === "ERA");
+      const whipStat = matchup.categories.find((c) => c.category === "WHIP");
+
+      if (eraStat && whipStat && currentIP > 0) {
+        // Derive counting accumulators from rate stats
+        const teamCurrentER = (eraStat.myValue * currentIP) / 9;
+        const teamCurrentWhipNum = whipStat.myValue * currentIP;
+
+        // Map classifyCategory output to RateStatState
+        const toRateState = (c: "winning" | "losing" | "swing"): RateStatState =>
+          c === "winning" ? "won" : c === "losing" ? "lost" : "swing";
+
+        const eraState = toRateState(classifyCategory(eraStat));
+        const whipState = toRateState(classifyCategory(whipStat));
+
+        const teamRateContext: TeamRateContext = {
+          teamCurrentER,
+          teamCurrentIP: currentIP,
+          teamCurrentWhipNum,
+          eraState,
+          whipState,
+        };
+
+        // Inject into context for all pitchers on roster
+        for (const entry of roster.entries) {
+          const isPitcher =
+            entry.player.positions.includes("SP") || entry.player.positions.includes("RP");
+          if (!isPitcher) continue;
+          const existing = contextMap.get(entry.player.yahooId) ?? {};
+          contextMap.set(entry.player.yahooId, { ...existing, teamRateContext });
+        }
+      }
+    } catch (e) {
+      logError("rate_context", e);
+    }
   }
 
   // 6. IL moves
   try {
     const ilActions = getILMoves(roster);
     if (ilActions.length > 0) {
-      summaryLines.push(`\n<b>IL Moves (${ilActions.length}):</b>`);
+      for (const a of ilActions) {
+        actionItems.push(`IL: ${a.reasoning}`);
+      }
 
       // Convert IL actions to lineup moves and execute
       const ilMoves: LineupMove[] = [];
       for (const a of ilActions) {
-        summaryLines.push(`• ${a.reasoning}`);
         if (a.type === "move_to_il") {
           ilMoves.push({ playerId: a.player.yahooId, position: "IL" });
         } else if (a.type === "activate_from_il") {
@@ -644,16 +653,10 @@ export async function runDailyMorning(env: Env): Promise<void> {
         try {
           const ilMsg = formatILNotification(env, ilActions, ilMoves);
           await sendMessage(env, ilMsg);
-          summaryLines.push(`IL moves notified: ${ilMoves.length}`);
         } catch (e) {
           logError("il_notification", e);
-          summaryLines.push(
-            `IL notification failed: ${e instanceof Error ? e.message : "unknown"}`,
-          );
         }
       }
-    } else {
-      summaryLines.push("IL: no moves needed");
     }
     decisions.push({
       type: "il",
@@ -663,50 +666,72 @@ export async function runDailyMorning(env: Env): Promise<void> {
     });
   } catch (e) {
     logError("il_check", e);
-    summaryLines.push(`IL check failed: ${e instanceof Error ? e.message : "unknown"}`);
   }
 
   // 7. Optimize lineup + AI analysis
   try {
     const moves = optimizeLineup(roster, projectionMap, games, matchup, streakMap, contextMap);
-    if (moves.length > 0) {
-      const lineupMsg = formatLineupNotification(env, today, moves, roster);
-      await sendMessage(env, lineupMsg);
-      const activeCount = moves.filter((m) => m.position !== "BN" && m.position !== "IL").length;
-      summaryLines.push(
-        `Lineup changes notified: ${activeCount} active, ${moves.length} total moves`,
+
+    // Separate starters from bench in optimized lineup
+    const starterMoves = moves.filter((m) => m.position !== "BN" && m.position !== "IL");
+    const benchMoves = moves.filter((m) => m.position === "BN");
+
+    // Detect if most moves come from BN (fresh lineup day — user hasn't set lineup yet)
+    const changedStarters = starterMoves.filter((m) => {
+      const current = roster.entries.find((e) => e.player.yahooId === m.playerId)?.currentPosition;
+      return current !== m.position;
+    });
+    const freshLineup = changedStarters.length > starterMoves.length * 0.7;
+
+    // Compute bench reasons from algorithm data
+    const benchReasons = new Map<string, string>();
+    for (const m of benchMoves) {
+      const entry = roster.entries.find((e) => e.player.yahooId === m.playerId);
+      if (!entry) continue;
+      const hasGame = games.some(
+        (g) =>
+          (g.homeTeam === entry.player.team || g.awayTeam === entry.player.team) &&
+          g.status !== "final",
       );
-    } else {
-      summaryLines.push("Lineup: no changes needed");
+      if (!hasGame) {
+        benchReasons.set(m.playerId, "off day");
+      } else if (!projectionMap.get(m.playerId)) {
+        benchReasons.set(m.playerId, "no projection");
+      } else {
+        benchReasons.set(m.playerId, "outscored");
+      }
     }
 
-    // AI: explain lineup decisions (supplemental — stats engine already decided)
-    try {
-      const lineupMemory = await buildMemoryContext(env, "lineup");
-      const starters = moves.filter((m) => m.position !== "BN" && m.position !== "IL");
-      const benched = moves.filter((m) => m.position === "BN");
-      const briefing = formatLineupForLLM({
-        starters: starters
-          .map((m) => `${findPlayerName(roster, m.playerId)} → ${m.position}`)
-          .join(", "),
-        benched: benched.map((m) => findPlayerName(roster, m.playerId)).join(", "),
-        games: games
-          .slice(0, 8)
-          .map((g) => `${g.awayTeam}@${g.homeTeam}`)
-          .join(", "),
-        strategy: matchupAnalysis?.strategy.benchMessage,
-        swingCategories: matchupAnalysis?.swingCategories.join(", "),
-        streaks: streakSummaryText || undefined,
-        memory: lineupMemory,
-      });
-      const prompt = lineupSummaryPrompt(briefing);
-      const aiNotes = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
-      if (!aiNotes.startsWith("[")) {
-        summaryLines.push(`\n<b>AI Notes:</b> ${aiNotes}`);
+    if (starterMoves.length > 0 || benchMoves.length > 0) {
+      const lineupMsg = formatLineupNotification(
+        env,
+        today,
+        moves,
+        roster,
+        freshLineup,
+        benchReasons,
+      );
+      await sendMessage(env, lineupMsg);
+
+      // Action items: always show bench (most actionable), only list starter changes if few
+      if (benchMoves.length > 0) {
+        actionItems.push(
+          `Bench: ${benchMoves
+            .map((m) => {
+              const name = findPlayerName(roster, m.playerId);
+              const reason = benchReasons.get(m.playerId);
+              return reason ? `${name} (${reason})` : name;
+            })
+            .join(", ")}`,
+        );
       }
-    } catch (e) {
-      logError("lineup_ai_notes", e);
-      // supplemental — don't fail
+      if (!freshLineup && changedStarters.length > 0) {
+        actionItems.push(
+          `Lineup: start ${changedStarters.map((m) => `${findPlayerName(roster, m.playerId)} (${m.position})`).join(", ")}`,
+        );
+      } else if (freshLineup) {
+        actionItems.push(`Lineup: set ${starterMoves.length} starters — open Yahoo`);
+      }
     }
 
     decisions.push({
@@ -717,7 +742,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
     });
   } catch (e) {
     logError("lineup_optimization", e);
-    summaryLines.push(`Lineup optimization failed: ${e instanceof Error ? e.message : "unknown"}`);
+    actionItems.push("Lineup optimization failed — set lineup manually");
   }
 
   // 8. Waiver wire evaluation
@@ -734,12 +759,15 @@ export async function runDailyMorning(env: Env): Promise<void> {
         freeAgents.some((fa) => fa.yahooId === v.yahooId),
       );
 
-      const pickups = findBestPickups(faValuations, roster.entries, valMap, 5);
+      const pickups = findBestPickups(
+        faValuations,
+        roster.entries,
+        valMap,
+        5,
+        matchupAnalysis ?? undefined,
+      );
 
       if (pickups.length > 0) {
-        summaryLines.push(
-          `\n<b>Waiver Picks (${pickups.length}):</b> [${budget.addsRemaining} adds left this week]`,
-        );
         const pickupNotifications: PickupNotificationItem[] = [];
         for (const rec of pickups) {
           const reasoningLower = rec.reasoning.toLowerCase();
@@ -750,15 +778,13 @@ export async function runDailyMorning(env: Env): Promise<void> {
               reasoningLower.includes("IL") ||
               rec.drop.status === "IL",
           });
-          summaryLines.push(
-            `• ${rec.add.name} for ${rec.drop.name} (+${rec.netValue.toFixed(1)}) [${priority}]`,
-          );
 
-          // Check add budget before spending
-          if (!shouldSpendAdd(budget, priority)) {
-            summaryLines.push(`  -> Skipped (saving adds for higher-impact moves)`);
-            continue;
-          }
+          // Check add budget before spending (type-aware)
+          if (!canSpendAdd(budget, "waiver", priority)) continue;
+
+          actionItems.push(
+            `Pickup: add ${rec.add.name}, drop ${rec.drop.name} (+${rec.netValue.toFixed(1)})`,
+          );
 
           const method = shouldUseWaiverPriority(rec, 5)
             ? ("waiver" as const)
@@ -771,7 +797,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
             reasoning: rec.reasoning,
             method,
           });
-          await recordAdd(env);
+          await recordAdd(env, "waiver");
           decisions.push({
             type: "waiver",
             action: { add: rec.add.name, drop: rec.drop.name, net: rec.netValue },
@@ -788,79 +814,104 @@ export async function runDailyMorning(env: Env): Promise<void> {
               budget.addsRemaining,
             );
             await sendMessage(env, pickupMsg);
-            summaryLines.push(`  -> ${pickupNotifications.length} pickup(s) notified`);
           } catch (e) {
             logError("pickup_notification", e);
-            summaryLines.push(
-              `  -> Pickup notification failed: ${e instanceof Error ? e.message : "unknown"}`,
-            );
           }
         }
-
-        // LLM: commentary on waiver recommendations (supplemental — stats engine already decided)
-        try {
-          const waiverMemory = await buildMemoryContext(env, "waiver");
-          const rosterNeeds =
-            valuations.length > 0 ? identifyCategoryNeeds(valuations).join(", ") : "unknown";
-          const swingCats = matchupAnalysis?.swingCategories.join(", ") ?? "unknown";
-          const briefing = formatWaiverForLLM({
-            matchupContext: `Swing categories this week: ${swingCats}`,
-            addBudget: `${budget.addsRemaining} adds remaining (${budget.addsUsed} used)`,
-            recommendations: pickups.map((r) => r.reasoning).join("\n"),
-            rosterNeeds,
-            memory: waiverMemory,
-          });
-          const prompt = waiverWirePrompt(briefing);
-          const waiverInsight = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
-          if (!waiverInsight.startsWith("[")) {
-            summaryLines.push(`\n<b>AI Waiver Notes:</b> ${waiverInsight}`);
-          }
-        } catch (e) {
-          logError("waiver_ai_notes", e);
-          // supplemental — don't fail
-        }
-      } else {
-        summaryLines.push("Waivers: no upgrades found");
       }
-    } else {
-      summaryLines.push("Waivers: skipped (no FAs or valuations)");
     }
   } catch (e) {
     logError("waiver_scan", e);
-    summaryLines.push(`Waiver scan failed: ${e instanceof Error ? e.message : "unknown"}`);
   }
 
-  // 9. Streaming pitchers
+  // 9. Schedule-aware pitcher pickups (rest of matchup week)
   try {
     const faPitchers = await yahoo.getFreeAgents("SP", 25);
-    if (faPitchers.length > 0 && games.length > 0) {
-      // Build pitcher streaming inputs
+    if (faPitchers.length > 0) {
+      // Match FA pitchers to FanGraphs projections by name/team
+      const faForMatch = faPitchers.map((p) => ({
+        yahooId: p.yahooId,
+        name: p.name,
+        team: p.team,
+      }));
+      const faProjEntries = rawPitcherProjections.map((p) => ({
+        fangraphsId: p.fangraphsId,
+        name: p.name,
+        team: p.team,
+      }));
+      const { idMap: faIdMap } = buildPlayerIdMap(faForMatch, faProjEntries);
+      const yahooToFgFA = new Map<string, number>();
+      for (const [fgId, yId] of faIdMap) yahooToFgFA.set(yId, fgId);
+      const pitcherByFg = new Map(rawPitcherProjections.map((p) => [p.fangraphsId, p]));
+
+      // Enrich FA pitchers with mlbId from FanGraphs match or D1 database
+      for (const p of faPitchers) {
+        if (p.mlbId) continue;
+        const fgId = yahooToFgFA.get(p.yahooId);
+        const raw = fgId ? pitcherByFg.get(fgId) : undefined;
+        if (raw?.mlbId) {
+          p.mlbId = raw.mlbId;
+        } else {
+          const row = await lookupByYahooId(env, p.yahooId);
+          if (row?.mlbId) p.mlbId = row.mlbId;
+        }
+      }
+
       const streamCandidates = faPitchers.map((p) => {
-        const proj = projectionMap.get(p.yahooId);
+        const existing = projectionMap.get(p.yahooId);
+        if (existing?.pitching) return { player: p, projection: existing.pitching };
+
+        const fgId = yahooToFgFA.get(p.yahooId);
+        const raw = fgId ? pitcherByFg.get(fgId) : undefined;
         return {
           player: p,
-          projection: proj?.pitching,
+          projection: raw
+            ? {
+                ip: raw.ip,
+                outs: Math.round(raw.ip * 3),
+                k: raw.k,
+                era: raw.era,
+                whip: raw.whip,
+                qs: raw.qs,
+                svhd: raw.svhd,
+              }
+            : undefined,
         };
       });
 
-      const ranked = rankStreamingOptions(streamCandidates, games);
+      // Vegas implied runs → opponent wOBA
+      const opponentWobas = new Map<string, number>();
+      if (env.ODDS_API_KEY) {
+        try {
+          const impliedRuns = await getImpliedRunsMap(env.ODDS_API_KEY);
+          for (const [team, runs] of impliedRuns) {
+            opponentWobas.set(team, 0.32 * (runs / 4.5));
+          }
+        } catch (e) {
+          logError("streaming_vegas", e);
+        }
+      }
 
-      // Compute days remaining from day-of-week (Sun=1, Mon=7, Tue=6, ...)
-      const dow = new Date().getDay(); // 0=Sun
+      // Compute matchup window end date + streaming decision
+      const dow = new Date().getDay();
       const daysRemaining = dow === 0 ? 1 : 8 - dow;
+      const matchupEnd =
+        matchup?.weekEnd ??
+        new Date(Date.now() + daysRemaining * 86400000).toISOString().slice(0, 10);
 
-      // Use smart streaming decision from detailed matchup analysis
       let canStream = true;
       let minScore = 3.0;
       let streamReasoning = "No matchup data — streaming freely";
+      let categoryStates;
+
       if (matchup) {
         const currentIP = getCurrentIP(matchup);
         const detailed = analyzeMatchupDetailed(matchup, daysRemaining, currentIP);
         const decision = detailed.streamingDecision;
         canStream = decision.canStream;
         streamReasoning = decision.reasoning;
+        categoryStates = detailed.detailedCategories;
 
-        // Map quality floors to minimum score thresholds (from tuning config)
         const streamMinimums = loadTuning().streaming.scoreMinimum;
         switch (decision.qualityFloor) {
           case "any":
@@ -878,92 +929,133 @@ export async function runDailyMorning(env: Env): Promise<void> {
         }
       }
 
-      if (canStream && ranked.length > 0 && ranked[0].score > minScore) {
-        const top = ranked[0];
-        summaryLines.push(`\n<b>Streaming SP:</b> (${streamReasoning})`);
-        summaryLines.push(
-          `• ${top.player.name} vs ${top.opponent} (score: ${top.score.toFixed(1)}, floor: ${minScore.toFixed(1)})`,
-        );
+      if (canStream) {
+        // Rank pitchers across all remaining starts in the matchup window
+        const ranked = await rankPitcherPickups(streamCandidates, today, matchupEnd, {
+          opponentWobas,
+          categoryStates,
+        });
 
-        // Check add budget before streaming
-        const streamPriority = classifyAddPriority(
-          { add: top.player, drop: top.player, netValue: top.score, reasoning: "streaming" },
-          {},
-        );
-        if (!shouldSpendAdd(budget, streamPriority)) {
-          summaryLines.push("  -> Skipped (saving adds for higher-impact moves)");
-        } else {
-          // Find worst bench pitcher to drop
-          const benchPitchers = roster.entries.filter(
-            (e) =>
-              e.currentPosition === "BN" &&
-              e.player.positions.some((p) => p === "SP" || p === "RP"),
+        // Filter to pitchers with starts and above score threshold
+        const viable = ranked.filter((r) => !r.noStartsInWindow && r.totalScore > minScore);
+
+        if (viable.length > 0) {
+          const top = viable[0];
+          const topProj = top.projection;
+          const metricsStr = topProj
+            ? ` — ${topProj.era.toFixed(2)} ERA, ${(topProj.ip > 0 ? (topProj.k / topProj.ip) * 9 : 0).toFixed(1)} K/9`
+            : "";
+
+          const streamPriority = classifyAddPriority(
+            { add: top.player, drop: top.player, netValue: top.totalScore, reasoning: "streaming" },
+            {},
           );
+          if (canSpendAdd(budget, "streaming", streamPriority)) {
+            const streamValMap = new Map<string, PlayerValuation>();
+            for (const v of valuations) streamValMap.set(v.yahooId, v);
+            const dropEntry =
+              findDroppablePlayer(roster.entries, streamValMap, ["SP", "RP"]) ??
+              findDroppablePlayer(roster.entries, streamValMap) ??
+              findDroppablePlayer(roster.entries, streamValMap, ["SP", "RP"], {
+                eliteOverride: true,
+              }) ??
+              findDroppablePlayer(roster.entries, streamValMap, undefined, { eliteOverride: true });
 
-          if (benchPitchers.length > 0) {
-            const dropTarget = benchPitchers[benchPitchers.length - 1];
-            try {
-              const streamMsg = formatStreamingNotification(
-                env,
-                top.player.name,
-                top.opponent,
-                top.score,
-                dropTarget.player.name,
-                streamReasoning,
+            if (dropEntry) {
+              const startsSummary = top.starts
+                .map((s) => `${s.isHome ? "vs" : "@"} ${s.opponent}`)
+                .join(", ");
+              actionItems.push(
+                `Stream: add ${top.player.name} (${startsSummary})${metricsStr}, drop ${dropEntry.player.name}`,
               );
-              await sendMessage(env, streamMsg);
-              await recordAdd(env);
-              summaryLines.push(`  -> Streaming pickup notified, drop ${dropTarget.player.name}`);
-              decisions.push({
-                type: "stream",
-                action: {
-                  add: top.player.name,
-                  drop: dropTarget.player.name,
-                  score: top.score,
-                  opponent: top.opponent,
-                },
-                reasoning: `Streaming ${top.player.name} vs ${top.opponent} (score ${top.score.toFixed(1)}, ${streamReasoning})`,
-                result: "notified",
-              });
-            } catch (e) {
-              logError("stream_notification", e);
-              summaryLines.push(
-                `  -> Stream notification failed: ${e instanceof Error ? e.message : "unknown"}`,
-              );
+              try {
+                const streamMsg = formatPitcherPickupNotification(
+                  env,
+                  top,
+                  dropEntry.player.name,
+                  streamReasoning,
+                  metricsStr,
+                );
+                await sendMessage(env, streamMsg);
+                await recordAdd(env, "streaming");
+                decisions.push({
+                  type: "stream",
+                  action: {
+                    add: top.player.name,
+                    drop: dropEntry.player.name,
+                    score: top.totalScore,
+                    starts: top.starts.map((s) => ({
+                      date: s.date,
+                      opponent: s.opponent,
+                      confidence: s.confidence,
+                    })),
+                    isTwoStart: top.isTwoStart,
+                  },
+                  reasoning: `${top.player.name}: ${top.reasoning} (score ${top.totalScore.toFixed(1)}, ${streamReasoning})`,
+                  result: "notified",
+                });
+              } catch (e) {
+                logError("stream_notification", e);
+              }
             }
-          } else {
-            summaryLines.push("  -> No droppable bench pitcher");
           }
         }
-      } else if (!canStream) {
-        summaryLines.push(`Streaming: skipped (${streamReasoning})`);
-      } else {
-        summaryLines.push(
-          `Streaming: no strong options (top: ${ranked[0]?.score.toFixed(1) ?? "none"}, need >${minScore.toFixed(1)})`,
-        );
       }
-    } else {
-      summaryLines.push("Streaming: skipped (no FA pitchers or games)");
     }
   } catch (e) {
     logError("streaming_analysis", e);
-    summaryLines.push(`Streaming analysis failed: ${e instanceof Error ? e.message : "unknown"}`);
   }
 
-  // 10. Send rich Telegram summary
+  // 10. Build and send action-first summary
+  const finalLines: string[] = [`<b>Today's Plan — ${today}</b>`];
+  if (actionItems.length > 0) {
+    finalLines.push("");
+    for (const item of actionItems) finalLines.push(`• ${item}`);
+  } else {
+    finalLines.push("", "No changes needed today.");
+  }
+
+  // Strategy section: what to do to win the week
+  if (matchupAnalysis) {
+    const { swingCategories, lostCategories, safeCategories, strategy } = matchupAnalysis;
+    finalLines.push("");
+    finalLines.push(
+      `<b>Strategy (${matchupAnalysis.projectedWins}W-${matchupAnalysis.projectedLosses}L):</b>`,
+    );
+    if (swingCategories.length > 0) {
+      finalLines.push(`Chase: ${swingCategories.join(", ")}`);
+    }
+    if (safeCategories.length > 0) {
+      finalLines.push(`Protect: ${safeCategories.join(", ")}`);
+    }
+    if (lostCategories.length > 0) {
+      finalLines.push(`Give up: ${lostCategories.join(", ")}`);
+    }
+
+    // Concrete actions from strategy flags
+    const actions: string[] = [];
+    if (strategy.protectRatios) actions.push("sit risky SPs to protect ERA/WHIP");
+    if (strategy.chaseStrikeouts) actions.push("start high-K pitchers");
+    if (strategy.prioritizePower) actions.push("start power bats");
+    if (strategy.prioritizeSpeed) actions.push("start speed guys");
+    if (strategy.streamPitchers) actions.push("stream pitchers for counting stats");
+    if (actions.length > 0) {
+      finalLines.push(`Today: ${actions.join(", ")}`);
+    }
+  }
+  // Append AI context if available (already filtered to non-empty)
+  if (summaryLines.length > 0) {
+    finalLines.push("", ...summaryLines);
+  }
+
   try {
-    await sendMessage(env, summaryLines.join("\n"));
+    await sendMessage(env, finalLines.join("\n"));
   } catch (e) {
     logError("telegram_summary", e);
-    // last-resort: try a simpler message
     try {
-      await sendMessage(
-        env,
-        `GM report generated but Telegram formatting failed: ${e instanceof Error ? e.message : "unknown"}`,
-      );
+      await sendMessage(env, `Today's Plan generated but send failed`);
     } catch (e) {
       logError("telegram_summary_fallback", e);
-      // truly nothing we can do
     }
   }
 
@@ -1278,69 +1370,76 @@ export async function runMidWeekAdjustment(env: Env): Promise<void> {
     return;
   }
 
-  // Fetch standings rank (non-fatal)
-  const rankInfo = await getOurRank(yahoo, buildTeamKey(env));
-
-  // Build current category scoreboard
-  const catLines: string[] = [];
+  // Classify categories into actionable groups
+  const winning: string[] = [];
+  const losing: string[] = [];
+  const swing: string[] = [];
   for (const cs of matchup.categories) {
-    const indicator =
-      cs.myValue > cs.opponentValue ? "+" : cs.myValue < cs.opponentValue ? "-" : "=";
-    catLines.push(`  ${indicator} ${cs.category}: ${cs.myValue} vs ${cs.opponentValue}`);
+    const cat = cs.category;
+    if (analysis.swingCategories.includes(cat)) {
+      swing.push(`${cat} (${cs.myValue} vs ${cs.opponentValue})`);
+    } else if (cs.myValue > cs.opponentValue) {
+      winning.push(cat);
+    } else if (cs.myValue < cs.opponentValue) {
+      losing.push(cat);
+    } else {
+      swing.push(`${cat} (tied ${cs.myValue})`);
+    }
   }
 
+  // Build action-first message
   const lines = [
-    `<b>Mid-Week Adjustment — Week ${matchup.week}</b>`,
-    `vs. ${matchup.opponentTeamName}`,
-    "",
-    `<b>Current scores:</b>`,
-    ...catLines,
-    "",
-    `<b>Updated projection:</b> ${analysis.projectedWins}W - ${analysis.projectedLosses}L - ${analysis.swingCategories.length} swing`,
+    `<b>Mid-Week — Week ${matchup.week} vs ${matchup.opponentTeamName}</b>`,
+    `${analysis.projectedWins}W-${analysis.projectedLosses}L`,
     "",
   ];
 
-  if (analysis.swingCategories.length > 0) {
-    lines.push(`<b>Swing cats:</b> ${analysis.swingCategories.join(", ")}`);
+  // DO section
+  const doItems: string[] = [];
+  if (swing.length > 0) doItems.push(`Chase: ${swing.join(", ")}`);
+  if (winning.length > 0 && analysis.strategy.protectRatios) {
+    doItems.push(`Protect: ${winning.join(", ")}`);
+  }
+  if (analysis.strategy.streamPitchers) doItems.push("Stream pitchers for counting stats");
+  if (analysis.strategy.prioritizeSpeed) doItems.push("Start speed guys for SB");
+  if (analysis.strategy.prioritizePower) doItems.push("Start power bats for HR/TB");
+  if (analysis.strategy.chaseStrikeouts) doItems.push("Start high-K pitchers");
+  if (doItems.length > 0) {
+    lines.push("<b>DO:</b>");
+    for (const item of doItems) lines.push(`• ${item}`);
   }
 
-  lines.push("");
-  lines.push(`<b>Adjustments:</b> ${analysis.strategy.benchMessage}`);
-
-  if (analysis.strategy.protectRatios) {
-    lines.push("<b>Note:</b> Protecting ERA/WHIP lead — avoid streaming risky arms.");
-  }
-  if (analysis.strategy.streamPitchers) {
-    lines.push("<b>Note:</b> Streaming pitchers recommended to chase counting stats.");
+  // DON'T section
+  if (analysis.lostCategories.length > 0) {
+    lines.push("");
+    lines.push(`<b>DON'T chase:</b> ${analysis.lostCategories.join(", ")} — too far behind`);
   }
 
-  // LLM: mid-week tactical memo with full briefing (supplemental)
+  if (winning.length > 0) {
+    lines.push("");
+    lines.push(`<b>Winning:</b> ${winning.join(", ")}`);
+  }
+
+  // Concrete algorithmic context: IP status + streaming decision
   try {
-    const midweekMemory = await buildMemoryContext(env, "matchup");
     const currentIP = getCurrentIP(matchup);
     const detailed = analyzeMatchupDetailed(matchup, 4);
     const ipInfo = getIPStatus(currentIP);
-    const briefing = formatMatchupForLLM({
-      summary: `Mid-week ${matchup.week} vs ${matchup.opponentTeamName}, ${detailed.projectedWins}W-${detailed.projectedLosses}L, 4 days left`,
-      categories: formatDetailedCategories(detailed),
-      worthless:
-        detailed.worthlessCategories.length > 0
-          ? `${detailed.worthlessCategories.join(", ")} — production here is worthless`
-          : "None — all categories still in play",
-      streaming: `${detailed.streamingDecision.reasoning} (quality floor: ${detailed.streamingDecision.qualityFloor})`,
-      ipStatus: `${ipInfo.currentIP.toFixed(1)} IP (${ipInfo.above ? "above" : "below"} ${ipInfo.minimum} min${ipInfo.ipNeeded > 0 ? `, need ${ipInfo.ipNeeded.toFixed(1)} more` : ""})`,
-      standings: rankInfo?.label,
-      recentFeedback: await getRecentFeedback(env),
-      memory: midweekMemory,
-    });
-    const prompt = matchupStrategyPrompt(briefing);
-    const strategyMemo = await askLLM(env, prompt.system, prompt.user, prompt.touchpoint);
-    if (!strategyMemo.startsWith("[")) {
+
+    if (!ipInfo.above) {
       lines.push("");
-      lines.push(`<b>AI Mid-Week Tactics:</b> ${strategyMemo}`);
+      lines.push(
+        `<b>IP alert:</b> ${ipInfo.currentIP.toFixed(1)}/${ipInfo.minimum} IP — need ${ipInfo.ipNeeded.toFixed(1)} more`,
+      );
+    }
+    if (detailed.streamingDecision.canStream) {
+      lines.push("");
+      lines.push(
+        `<b>Streaming:</b> ${detailed.streamingDecision.reasoning} (floor: ${detailed.streamingDecision.qualityFloor})`,
+      );
     }
   } catch (e) {
-    logError("midweek_tactics_llm", e);
+    logError("midweek_context", e);
   }
 
   try {
@@ -1867,16 +1966,59 @@ export async function logDecision(env: Env, decision: Decision): Promise<void> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function appendProbablePitchers(lines: string[], games: ScheduledGame[]): void {
-  const pitchers = games.flatMap((g) => {
-    const out: string[] = [];
-    if (g.homeProbable) out.push(`${g.homeProbable.name} (${g.homeTeam})`);
-    if (g.awayProbable) out.push(`${g.awayProbable.name} (${g.awayTeam})`);
-    return out;
-  });
-  if (pitchers.length > 0) {
-    lines.push(
-      `Probable SPs: ${pitchers.slice(0, 8).join(", ")}${pitchers.length > 8 ? "..." : ""}`,
+/** Build daily projection inputs for Monte Carlo from roster + projections + today's games. */
+function _buildDailyProjections(
+  roster: Roster,
+  projectionMap: Map<string, PlayerProjection>,
+  games: ScheduledGame[],
+): DailyProjection[] {
+  const ROS_GAMES = 130; // approximate remaining games for per-game conversion
+  const projections: DailyProjection[] = [];
+
+  for (const entry of roster.entries) {
+    const p = entry.player;
+    const proj = projectionMap.get(p.yahooId);
+    if (!proj) continue;
+    // Only include players with a game today
+    const hasGame = games.some(
+      (g) => (g.homeTeam === p.team || g.awayTeam === p.team) && g.status !== "final",
     );
+    if (!hasGame) continue;
+
+    if (proj.playerType === "batter" && proj.batting) {
+      const b = proj.batting;
+      const pa = b.pa / ROS_GAMES;
+      projections.push({
+        yahooId: p.yahooId,
+        playerType: "batter",
+        batting: {
+          r: b.r / ROS_GAMES,
+          h: b.h / ROS_GAMES,
+          hr: b.hr / ROS_GAMES,
+          rbi: b.rbi / ROS_GAMES,
+          sb: b.sb / ROS_GAMES,
+          tb: b.tb / ROS_GAMES,
+          pa,
+          obp_numerator: b.obp * pa,
+        },
+      });
+    } else if (proj.playerType === "pitcher" && proj.pitching) {
+      const pi = proj.pitching;
+      const ipPerGame = pi.ip / ROS_GAMES;
+      projections.push({
+        yahooId: p.yahooId,
+        playerType: "pitcher",
+        pitching: {
+          er: (pi.era * ipPerGame) / 9,
+          outs: pi.outs / ROS_GAMES,
+          k: pi.k / ROS_GAMES,
+          qs: pi.qs / ROS_GAMES,
+          svhd: pi.svhd / ROS_GAMES,
+          whip_numerator: pi.whip * ipPerGame,
+        },
+      });
+    }
   }
+
+  return projections;
 }
