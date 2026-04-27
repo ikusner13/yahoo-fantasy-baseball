@@ -98,9 +98,8 @@ app.post("/telegram", async (c) => {
 // GET /test — run read-only test suite
 app.get("/test", async (c) => {
   const env = buildAppEnv(c.env);
-  const dryRun = c.req.query("apply") !== "1";
   const date = c.req.query("date") ?? undefined;
-  return runTestSuite(env, dryRun, date);
+  return runTestSuite(env, true, date);
 });
 
 // --- Manual routine triggers ---
@@ -116,7 +115,7 @@ const ROUTINES: Record<string, (env: Env) => Promise<void>> = {
   "two-start": runTwoStartPreview,
 };
 
-// GET /run/:routine — run a routine for real (sends to Telegram)
+// GET /run/:routine — run a routine for real (sends advisory messages to Telegram)
 app.get("/run/:routine", async (c) => {
   const name = c.req.param("routine");
   const fn = ROUTINES[name];
@@ -129,7 +128,7 @@ app.get("/run/:routine", async (c) => {
   const start = Date.now();
   try {
     await fn(env);
-    return c.text(`${name}: completed in ${Date.now() - start}ms (messages sent to Telegram)`);
+    return c.text(`${name}: completed in ${Date.now() - start}ms (advisory messages sent to Telegram)`);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return c.text(`${name}: FAILED in ${Date.now() - start}ms\n${msg}`, 500);
@@ -146,6 +145,7 @@ app.get("/preview/:routine", async (c) => {
   }
   const env = buildAppEnv(c.env);
   env._messageBuffer = [];
+  env._dryRun = true;
   setEnvNowOverride(env, c.req.query("date") ?? c.req.query("now") ?? undefined);
   const start = Date.now();
   try {

@@ -24,6 +24,8 @@ export interface MatchupPickupOptions {
   seed?: number;
   limit?: number;
   dropCandidatesPerPlayer?: number;
+  opponentRoster?: Roster;
+  opponentProjectionMap?: Map<string, PlayerProjection>;
 }
 
 function replaceRosterEntry(roster: Roster, drop: RosterEntry, add: Player): Roster {
@@ -93,6 +95,8 @@ export function evaluateMatchupPickups(options: MatchupPickupOptions): PickupRec
     seed = 42,
     limit = 3,
     dropCandidatesPerPlayer = 3,
+    opponentRoster,
+    opponentProjectionMap,
   } = options;
 
   if (freeAgents.length === 0 || rosterProjectionMap.size === 0 || freeAgentProjectionMap.size === 0) {
@@ -103,6 +107,8 @@ export function evaluateMatchupPickups(options: MatchupPickupOptions): PickupRec
     asOf,
     simulations,
     seed,
+    opponentRoster,
+    opponentProjectionMap,
   });
 
   const preferredDrops = rankDroppablePlayers(roster.entries, rosterValuations);
@@ -137,6 +143,8 @@ export function evaluateMatchupPickups(options: MatchupPickupOptions): PickupRec
           asOf,
           simulations,
           seed,
+          opponentRoster,
+          opponentProjectionMap,
         },
       );
 

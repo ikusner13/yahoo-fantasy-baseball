@@ -279,7 +279,9 @@ export function classifyCategoryDetailed(
   } else if (rawDiff < 0) {
     // How much daily production needed to close the gap?
     dailyFlipRate = daysRemaining > 0 ? Math.abs(rawDiff) / daysRemaining : Infinity;
-    state = dailyFlipRate > dailyProd * 2 ? "losing" : "swing";
+    // Tighter threshold on final day - 1.25x is "losing", otherwise 2x
+    const losingMultiplier = daysRemaining <= 1 ? 1.25 : 2;
+    state = dailyFlipRate > dailyProd * losingMultiplier ? "losing" : "swing";
   } else {
     state = "swing";
   }
@@ -393,7 +395,7 @@ export function analyzeMatchupDetailed(
   currentIP: number = 0,
   minimumIP: number = loadLeagueSettings().pitching.minimumInningsPerWeek,
 ): DetailedMatchupAnalysis {
-  // Compute base analysis (preserves existing behavior)
+  // Compute base analysis for strategy recommendations
   const base = analyzeMatchup(matchup);
 
   // Compute detailed time-aware states
@@ -401,11 +403,39 @@ export function analyzeMatchupDetailed(
     classifyCategoryDetailed(score, daysRemaining),
   );
 
+  // Recalculate projected wins/losses from time-aware states
+  // "clinched" and "safe" count as wins; "lost" and "losing" count as losses
+  const safeCategories: Category[] = [];
+  const swingCategories: Category[] = [];
+  const lostCategories: Category[] = [];
+
+  for (const dc of detailedCategories) {
+    switch (dc.state) {
+      case "clinched":
+      case "safe":
+        safeCategories.push(dc.category);
+        break;
+      case "swing":
+        swingCategories.push(dc.category);
+        break;
+      case "losing":
+      case "lost":
+        lostCategories.push(dc.category);
+        break;
+    }
+  }
+
   const worthlessCategories = getWorthlessCategories(detailedCategories);
   const streamingDecision = computeStreamingDecision(detailedCategories, currentIP, minimumIP);
 
   return {
     ...base,
+    // Override with time-aware classifications
+    projectedWins: safeCategories.length,
+    projectedLosses: lostCategories.length,
+    safeCategories,
+    swingCategories,
+    lostCategories,
     detailedCategories,
     worthlessCategories,
     streamingDecision,

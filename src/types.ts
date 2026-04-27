@@ -18,6 +18,8 @@ export interface Env {
   ODDS_API_KEY?: string;
   /** When set, sendMessage captures here instead of sending to Telegram */
   _messageBuffer?: string[];
+  /** When true, routines should avoid persistent side effects (DB/KV writes). */
+  _dryRun?: boolean;
   /** Optional ISO date or datetime override for deterministic previews/tests */
   _nowIso?: string;
 }

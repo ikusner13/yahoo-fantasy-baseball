@@ -53,6 +53,14 @@ export function logApiCall(
   logger.info({ event: "api_call", label, durationMs, statusCode, cacheHit });
 }
 
+export function logRoutineStep(
+  step: string,
+  durationMs: number,
+  metadata?: Record<string, unknown>,
+): void {
+  logger.info({ event: "routine_step", step, durationMs, ...metadata });
+}
+
 export function logCacheResult(cacheKey: string, hit: boolean): void {
   logger.info({ event: hit ? "cache_hit" : "cache_miss", cacheKey });
 }

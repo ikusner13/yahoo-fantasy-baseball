@@ -6,8 +6,6 @@ import type {
   Player,
   Matchup,
   CategoryScore,
-  LineupMove,
-  TradeProposal,
 } from "../types";
 import { getValidToken } from "./auth";
 import { logApiCall } from "../observability/log";
@@ -87,33 +85,26 @@ export class YahooClient {
     return `${GAME_KEY}.l.${this.env.YAHOO_LEAGUE_ID}.t.${this.env.YAHOO_TEAM_ID}`;
   }
 
-  private async request(path: string, method: string = "GET", body?: string): Promise<any> {
+  private async request(path: string): Promise<any> {
     const token = await getValidToken(this.env);
-    const isGet = method === "GET";
-    const url = `${BASE_URL}${path}${isGet ? "?format=json" : ""}`;
+    const url = `${BASE_URL}${path}?format=json`;
 
     const headers: Record<string, string> = {
       Authorization: `Bearer ${token}`,
     };
-    if (!isGet && body) {
-      headers["Content-Type"] = "application/xml";
-    }
 
     const start = Date.now();
-    const res = await fetch(url, { method, headers, body });
+    const res = await fetch(url, { method: "GET", headers });
     const durationMs = Date.now() - start;
 
     if (!res.ok) {
       const text = await res.text();
-      logApiCall(`yahoo:${method}:${path}`, durationMs, res.status);
-      throw new Error(`Yahoo API ${method} ${path} failed (${res.status}): ${text}`);
+      logApiCall(`yahoo:GET:${path}`, durationMs, res.status);
+      throw new Error(`Yahoo API GET ${path} failed (${res.status}): ${text}`);
     }
 
-    logApiCall(`yahoo:${method}:${path}`, durationMs, res.status);
-
-    if (isGet) {
-      return res.json();
-    }
+    logApiCall(`yahoo:GET:${path}`, durationMs, res.status);
+    return res.json();
   }
 
   // ---------------------------------------------------------------------------
@@ -371,133 +362,6 @@ export class YahooClient {
     return transactions;
   }
 
-  // ---------------------------------------------------------------------------
-  // Writes (XML payloads)
-  // ---------------------------------------------------------------------------
-
-  async setLineup(date: string, moves: LineupMove[]): Promise<void> {
-    const playerEntries = moves
-      .map(
-        (m) => `
-      <player>
-        <player_key>${m.playerId}</player_key>
-        <position>${m.position}</position>
-      </player>`,
-      )
-      .join("");
-
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<fantasy_content>
-  <roster>
-    <coverage_type>date</coverage_type>
-    <date>${date}</date>
-    <players>${playerEntries}
-    </players>
-  </roster>
-</fantasy_content>`;
-
-    await this.request(`/team/${this.getTeamKey()}/roster`, "PUT", xml);
-  }
-
-  async addDrop(addPlayerId: string, dropPlayerId: string): Promise<void> {
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<fantasy_content>
-  <transaction>
-    <type>add/drop</type>
-    <players>
-      <player>
-        <player_key>${addPlayerId}</player_key>
-        <transaction_data>
-          <type>add</type>
-          <destination_team_key>${this.getTeamKey()}</destination_team_key>
-        </transaction_data>
-      </player>
-      <player>
-        <player_key>${dropPlayerId}</player_key>
-        <transaction_data>
-          <type>drop</type>
-          <source_team_key>${this.getTeamKey()}</source_team_key>
-        </transaction_data>
-      </player>
-    </players>
-  </transaction>
-</fantasy_content>`;
-
-    await this.request(`/league/${this.getLeagueKey()}/transactions`, "POST", xml);
-  }
-
-  async claimWaiver(addPlayerId: string, dropPlayerId: string): Promise<void> {
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<fantasy_content>
-  <transaction>
-    <type>add/drop</type>
-    <players>
-      <player>
-        <player_key>${addPlayerId}</player_key>
-        <transaction_data>
-          <type>add</type>
-          <destination_team_key>${this.getTeamKey()}</destination_team_key>
-        </transaction_data>
-      </player>
-      <player>
-        <player_key>${dropPlayerId}</player_key>
-        <transaction_data>
-          <type>drop</type>
-          <source_team_key>${this.getTeamKey()}</source_team_key>
-        </transaction_data>
-      </player>
-    </players>
-  </transaction>
-</fantasy_content>`;
-
-    await this.request(`/league/${this.getLeagueKey()}/transactions`, "POST", xml);
-  }
-
-  async proposeTrade(proposal: TradeProposal): Promise<void> {
-    const sendPlayers = proposal.playersToSend
-      .map(
-        (id) => `
-      <player>
-        <player_key>${id}</player_key>
-        <transaction_data>
-          <type>pending_trade</type>
-          <source_team_key>${this.getTeamKey()}</source_team_key>
-          <destination_team_key>${proposal.targetTeamKey}</destination_team_key>
-        </transaction_data>
-      </player>`,
-      )
-      .join("");
-
-    const receivePlayers = proposal.playersToReceive
-      .map(
-        (id) => `
-      <player>
-        <player_key>${id}</player_key>
-        <transaction_data>
-          <type>pending_trade</type>
-          <source_team_key>${proposal.targetTeamKey}</source_team_key>
-          <destination_team_key>${this.getTeamKey()}</destination_team_key>
-        </transaction_data>
-      </player>`,
-      )
-      .join("");
-
-    const notePart = proposal.message ? `<trade_note>${proposal.message}</trade_note>` : "";
-
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<fantasy_content>
-  <transaction>
-    <type>trade</type>
-    <trader_team_key>${this.getTeamKey()}</trader_team_key>
-    <tradee_team_key>${proposal.targetTeamKey}</tradee_team_key>
-    ${notePart}
-    <players>${sendPlayers}${receivePlayers}
-    </players>
-  </transaction>
-</fantasy_content>`;
-
-    await this.request(`/league/${this.getLeagueKey()}/transactions`, "POST", xml);
-  }
 }
 
 // ---------------------------------------------------------------------------

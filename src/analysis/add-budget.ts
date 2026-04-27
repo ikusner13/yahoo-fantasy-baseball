@@ -161,6 +161,7 @@ async function readState(env: Env): Promise<AddBudgetState> {
 }
 
 async function writeState(env: Env, state: AddBudgetState): Promise<void> {
+  if (env._dryRun) return;
   await env.KV.put(KV_KEY, JSON.stringify(state));
 }
 

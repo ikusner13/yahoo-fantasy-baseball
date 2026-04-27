@@ -106,7 +106,7 @@ export function formatLineupNotification(
   }
 
   lines.push("");
-  lines.push(`<a href="${urls.roster(date)}">Set lineup on Yahoo</a>`);
+  lines.push(`Apply manually in Yahoo: <a href="${urls.roster(date)}">Open lineup</a>`);
   return lines.join("\n");
 }
 
@@ -127,7 +127,7 @@ export function formatILNotification(
   }
 
   lines.push("");
-  lines.push(`<a href="${urls.roster()}">Open roster on Yahoo</a>`);
+  lines.push(`Apply manually in Yahoo: <a href="${urls.roster()}">Open roster</a>`);
   return lines.join("\n");
 }
 
@@ -153,8 +153,9 @@ export function formatPickupNotification(
 ): string {
   const urls = yahooUrls(env);
   const lines: string[] = [
-    `<b>Recommended Pickups (${pickups.length})</b>`,
+    `<b>Pickup Recommendations (${pickups.length})</b>`,
     `${addsRemaining} adds remaining this week`,
+    `Manual execution required in Yahoo`,
     "",
   ];
 
@@ -176,8 +177,8 @@ export function formatPickupNotification(
     lines.push("");
   }
 
-  lines.push(`<a href="${urls.transactions()}">Open transactions on Yahoo</a>`);
-  lines.push(`<a href="${urls.players()}">Browse free agents</a>`);
+  lines.push(`<a href="${urls.transactions()}">Review transactions in Yahoo</a>`);
+  lines.push(`<a href="${urls.players()}">Browse free agents in Yahoo</a>`);
   return lines.join("\n");
 }
 
@@ -201,7 +202,7 @@ export function formatStreamingNotification(
     `Drop <b>${esc(dropName)}</b>`,
     `${esc(reasoning)}`,
     "",
-    `<a href="${urls.transactions()}">Open transactions on Yahoo</a>`,
+    `Apply manually in Yahoo: <a href="${urls.transactions()}">Review transactions</a>`,
   ].join("\n");
 }
 
@@ -253,7 +254,7 @@ export function formatPitcherPickupNotification(
   lines.push("");
   lines.push(esc(streamReasoning));
   lines.push("");
-  lines.push(`<a href="${urls.transactions()}">Open transactions on Yahoo</a>`);
+  lines.push(`Apply manually in Yahoo: <a href="${urls.transactions()}">Review transactions</a>`);
 
   return lines.join("\n");
 }

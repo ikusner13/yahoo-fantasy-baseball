@@ -92,6 +92,54 @@ describe("scorePlayerForToday", () => {
   it("returns 0.1 for player with game but no projection", () => {
     expect(scorePlayerForToday(makePlayer("b1", ["OF"], "NYY"), undefined, true)).toBe(0.1);
   });
+
+  it("shrinks tiny BvP samples toward neutral", () => {
+    const proj = makeBatterProj("b1");
+    const neutral = scorePlayerForToday(makePlayer("b1", ["OF"], "NYY"), proj, true, {});
+    const tinyBvp = scorePlayerForToday(makePlayer("b1", ["OF"], "NYY"), proj, true, {
+      bvp: {
+        batterId: 1,
+        pitcherId: 2,
+        pa: 12,
+        ab: 10,
+        h: 6,
+        hr: 2,
+        bb: 2,
+        k: 1,
+        obp: 0.600,
+        slg: 1.100,
+        tb: 11,
+      },
+    });
+
+    expect(tinyBvp).toBe(neutral);
+  });
+
+  it("trusts larger platoon samples more than small ones", () => {
+    const proj = makeBatterProj("b1");
+    const smallSample = scorePlayerForToday(makePlayer("b1", ["OF"], "NYY"), proj, true, {
+      platoon: {
+        mlbId: 1,
+        vsLeft: { pa: 40, obp: 0.380, slg: 0.520, kPct: 0.18 },
+        vsRight: { pa: 200, obp: 0.300, slg: 0.360, kPct: 0.26 },
+        advantage: "L",
+        advantageSize: 0.24,
+      },
+      opposingPitcherHand: "L",
+    });
+    const largeSample = scorePlayerForToday(makePlayer("b1", ["OF"], "NYY"), proj, true, {
+      platoon: {
+        mlbId: 1,
+        vsLeft: { pa: 260, obp: 0.380, slg: 0.520, kPct: 0.18 },
+        vsRight: { pa: 320, obp: 0.300, slg: 0.360, kPct: 0.26 },
+        advantage: "L",
+        advantageSize: 0.24,
+      },
+      opposingPitcherHand: "L",
+    });
+
+    expect(largeSample).toBeGreaterThan(smallSample);
+  });
 });
 
 describe("optimizeLineup", () => {

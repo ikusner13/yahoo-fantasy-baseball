@@ -1,9 +1,10 @@
 import { desc } from "drizzle-orm";
 import type { Env } from "../types";
 import type { Touchpoint } from "./llm";
-import { askLLM } from "./llm";
+import { askLLM, askLLMJson } from "./llm";
 import { decisions, retrospectives, gmReflections } from "../db/schema";
 import type { WeeklyRetrospective } from "../analysis/retrospective";
+import { z } from "zod";
 
 // Which decision types are relevant to each touchpoint
 const TOUCHPOINT_DECISION_TYPES: Record<Touchpoint, string[]> = {
@@ -12,8 +13,103 @@ const TOUCHPOINT_DECISION_TYPES: Record<Touchpoint, string[]> = {
   trade: ["trade"],
   lineup: ["lineup"],
   injury: ["il"],
+  news: ["waiver", "il"],
+  review: ["waiver", "stream", "il"],
   summary: ["lineup", "waiver", "stream"],
 };
+
+const REFLECTION_TAGS = [
+  "missed_role_change",
+  "missed_injury_context",
+  "too_aggressive_ratios",
+  "too_passive_on_saves",
+  "small_sample_bias",
+  "underweighted_schedule",
+  "budget_mismanagement",
+  "correct_process",
+] as const;
+
+export type ReflectionTag = (typeof REFLECTION_TAGS)[number];
+
+export interface GMReflectionRecord {
+  summary: string;
+  strengths: string[];
+  misses: string[];
+  tags: ReflectionTag[];
+  tuningIdeas: string[];
+  confidence: number;
+}
+
+const REFLECTION_TAG_SET = new Set<string>(REFLECTION_TAGS);
+const reflectionRecordSchema = z.object({
+  summary: z.string().min(4).max(400),
+  strengths: z.array(z.string()).max(5),
+  misses: z.array(z.string()).max(5),
+  tags: z.array(z.enum(REFLECTION_TAGS)).max(6),
+  tuningIdeas: z.array(z.string()).max(5),
+  confidence: z.number().min(0).max(1),
+});
+
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+}
+
+function normalizeReflectionRecord(value: Partial<GMReflectionRecord>): GMReflectionRecord {
+  return {
+    summary: typeof value.summary === "string" && value.summary.trim().length > 0
+      ? value.summary.trim()
+      : "No clear pattern identified.",
+    strengths: Array.isArray(value.strengths)
+      ? value.strengths
+          .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+          .slice(0, 3)
+      : [],
+    misses: Array.isArray(value.misses)
+      ? value.misses
+          .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+          .slice(0, 3)
+      : [],
+    tags: Array.isArray(value.tags)
+      ? value.tags.filter((item): item is ReflectionTag => REFLECTION_TAG_SET.has(String(item))).slice(0, 5)
+      : [],
+    tuningIdeas: Array.isArray(value.tuningIdeas)
+      ? value.tuningIdeas
+          .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+          .slice(0, 3)
+      : [],
+    confidence: clamp01(value.confidence ?? 0.5),
+  };
+}
+
+export function parseReflectionRecord(reflection: string): GMReflectionRecord | null {
+  try {
+    return normalizeReflectionRecord(JSON.parse(reflection) as Partial<GMReflectionRecord>);
+  } catch {
+    return null;
+  }
+}
+
+function formatReflectionSummary(reflection: string): string {
+  const parsed = parseReflectionRecord(reflection);
+  return parsed ? parsed.summary : reflection;
+}
+
+function summarizeReflectionTags(reflections: string[]): string[] {
+  const counts = new Map<ReflectionTag, number>();
+  for (const reflection of reflections) {
+    const parsed = parseReflectionRecord(reflection);
+    if (!parsed) continue;
+    for (const tag of parsed.tags) {
+      counts.set(tag, (counts.get(tag) ?? 0) + 1);
+    }
+  }
+
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4)
+    .map(([tag, count]) => `${tag}${count > 1 ? ` x${count}` : ""}`);
+}
 
 /**
  * Build memory context for a given touchpoint by querying recent decisions,
@@ -81,13 +177,31 @@ export async function buildMemoryContext(
       .select({ reflection: gmReflections.reflection })
       .from(gmReflections)
       .orderBy(desc(gmReflections.createdAt))
-      .limit(2)
+      .limit(4)
       .all();
 
     if (reflections.length > 0) {
       sections.push("\nPATTERNS:");
       for (const r of reflections) {
-        sections.push(`• ${r.reflection}`);
+        sections.push(`• ${formatReflectionSummary(r.reflection)}`);
+      }
+
+      const repeatedTags = summarizeReflectionTags(reflections.map((reflection) => reflection.reflection));
+      if (repeatedTags.length > 0) {
+        sections.push("\nREPEATED TAGS:");
+        for (const tag of repeatedTags) {
+          sections.push(`• ${tag}`);
+        }
+      }
+
+      const tuningIdeas = reflections
+        .flatMap((reflection) => parseReflectionRecord(reflection.reflection)?.tuningIdeas ?? [])
+        .slice(0, 3);
+      if (tuningIdeas.length > 0) {
+        sections.push("\nTUNING:");
+        for (const idea of tuningIdeas) {
+          sections.push(`• ${idea}`);
+        }
       }
     }
 
@@ -103,7 +217,7 @@ export async function buildMemoryContext(
  */
 export async function generateReflection(env: Env, _recentDecisionIds: number[]): Promise<void> {
   // Fetch recent decisions for summarization
-  const recentDecisions = await env.db
+  const recentDecisionRows = await env.db
     .select({
       id: decisions.id,
       type: decisions.type,
@@ -113,8 +227,13 @@ export async function generateReflection(env: Env, _recentDecisionIds: number[])
     })
     .from(decisions)
     .orderBy(desc(decisions.timestamp))
-    .limit(20)
+    .limit(40)
     .all();
+
+  const recentDecisions =
+    _recentDecisionIds.length > 0
+      ? recentDecisionRows.filter((decision) => _recentDecisionIds.includes(decision.id)).slice(0, 20)
+      : recentDecisionRows.slice(0, 20);
 
   if (recentDecisions.length === 0) return;
 
@@ -140,17 +259,42 @@ export async function generateReflection(env: Env, _recentDecisionIds: number[])
     .map((d) => `[${d.type}] ${formatDecisionSummary(d.type, d.action, d.reasoning)} — ${d.result}`)
     .join("\n");
 
-  const reflection = await askLLM(
+  const structuredReflection = await askLLMJson<GMReflectionRecord>(
     env,
-    "Summarize key patterns from these GM decisions in 2-3 sentences. What worked, what didn't, any consistent errors. Be concrete — name categories and players. No preamble.",
+    `You are reviewing recent fantasy baseball GM decisions. Identify what worked, what failed, and the repeatable tuning lessons. Return JSON with exactly these keys:
+{
+  "summary": string,
+  "strengths": string[],
+  "misses": string[],
+  "tags": string[],
+  "tuningIdeas": string[],
+  "confidence": number
+}
+    Allowed tags: ${REFLECTION_TAGS.join(", ")}.
+    Use "correct_process" only when a decision process was sound even if the outcome was noisy. Keep each list short and concrete.`,
     `Decisions:\n${decisionSummaries}${retroContext}`,
+    reflectionRecordSchema,
     "summary",
   );
 
-  if (reflection.startsWith("[LLM")) return;
+  let reflectionRecord: GMReflectionRecord | null =
+    structuredReflection ? normalizeReflectionRecord(structuredReflection) : null;
+  if (!reflectionRecord) {
+    const reflection = await askLLM(
+      env,
+      "Summarize key patterns from these GM decisions in 2-3 sentences. What worked, what didn't, any consistent errors. Be concrete — name categories and players. No preamble.",
+      `Decisions:\n${decisionSummaries}${retroContext}`,
+      "summary",
+    );
+    if (reflection.startsWith("[LLM")) return;
+    reflectionRecord = normalizeReflectionRecord({
+      summary: reflection,
+      confidence: 0.4,
+    });
+  }
 
   await env.db.insert(gmReflections).values({
-    reflection,
+    reflection: JSON.stringify(reflectionRecord),
     runsCovered: JSON.stringify(recentDecisions.map((d) => d.id)),
   });
 }

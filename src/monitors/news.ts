@@ -1,4 +1,7 @@
-import type { Env } from "../types";
+import type { Category, Env } from "../types";
+import { askLLMJson } from "../ai/llm";
+import { newsSignalPrompt } from "../ai/prompts";
+import { z } from "zod";
 
 // --- Interfaces ---
 
@@ -10,6 +13,33 @@ export interface NewsAlert {
   fantasyImpact: string; // brief description of impact
   actionable: boolean; // true = should consider adding/dropping
   timestamp: string;
+  structured?: NewsStructuredSignal;
+}
+
+export type NewsImpactLevel = "low" | "medium" | "high";
+export type NewsRoleChange =
+  | "closer_up"
+  | "closer_down"
+  | "rotation_up"
+  | "rotation_down"
+  | "lineup_up"
+  | "lineup_down"
+  | "playing_time_up"
+  | "playing_time_down"
+  | "none";
+export type NewsAbsence = "none" | "day_to_day" | "short_il" | "long_il" | "season_risk" | "unknown";
+export type NewsActionBias = "add" | "hold" | "drop" | "watch" | "ignore";
+export type NewsPlayingTimeDelta = "up" | "down" | "stable" | "unclear";
+
+export interface NewsStructuredSignal {
+  impactLevel: NewsImpactLevel;
+  roleChange: NewsRoleChange;
+  expectedAbsence: NewsAbsence;
+  actionBias: NewsActionBias;
+  playingTimeDelta: NewsPlayingTimeDelta;
+  targetCategories: Category[];
+  confidence: number;
+  summary: string;
 }
 
 // --- Constants ---
@@ -23,6 +53,56 @@ const ACTIONABLE_KEYWORDS = [
   ...CALLUP_KEYWORDS,
   "designated",
 ];
+
+const newsSignalSchema = z.object({
+  impactLevel: z.enum(["low", "medium", "high"]),
+  roleChange: z.enum([
+    "closer_up",
+    "closer_down",
+    "rotation_up",
+    "rotation_down",
+    "lineup_up",
+    "lineup_down",
+    "playing_time_up",
+    "playing_time_down",
+    "none",
+  ]),
+  expectedAbsence: z.enum(["none", "day_to_day", "short_il", "long_il", "season_risk", "unknown"]),
+  actionBias: z.enum(["add", "hold", "drop", "watch", "ignore"]),
+  playingTimeDelta: z.enum(["up", "down", "stable", "unclear"]),
+  targetCategories: z.array(z.string()).max(6),
+  confidence: z.number().min(0).max(1),
+  summary: z.string().min(4).max(80),
+});
+
+const CATEGORY_ALIASES: Record<string, Category> = {
+  r: "R",
+  runs: "R",
+  h: "H",
+  hits: "H",
+  hr: "HR",
+  home_runs: "HR",
+  home_runss: "HR",
+  rbi: "RBI",
+  sb: "SB",
+  steals: "SB",
+  tb: "TB",
+  total_bases: "TB",
+  obp: "OBP",
+  out: "OUT",
+  outs: "OUT",
+  k: "K",
+  ks: "K",
+  strikeouts: "K",
+  era: "ERA",
+  whip: "WHIP",
+  qs: "QS",
+  svhd: "SVHD",
+  "sv+h": "SVHD",
+  sv_h: "SVHD",
+  saves: "SVHD",
+  holds: "SVHD",
+};
 
 // --- Helpers ---
 
@@ -86,6 +166,181 @@ export function assessImpact(type: NewsAlert["type"], _description: string): str
     case "lineup_change":
       return "Lineup position change — may affect counting stats";
   }
+}
+
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+}
+
+function normalizeCategory(value: string): Category | null {
+  const key = value.toLowerCase().replace(/[^a-z+]/g, "_").replace(/_+/g, "_").replace(/^_|_$/g, "");
+  return CATEGORY_ALIASES[key] ?? null;
+}
+
+function uniqueCategories(values: Iterable<Category>): Category[] {
+  return [...new Set(values)];
+}
+
+function shouldUseLLM(alert: NewsAlert): boolean {
+  return alert.type === "closer_change" || alert.type === "callup" || alert.type === "injury" || alert.type === "trade";
+}
+
+export function inferFallbackNewsSignal(alert: NewsAlert): NewsStructuredSignal {
+  const lower = `${alert.headline} ${alert.fantasyImpact}`.toLowerCase();
+  const isCloser = alert.type === "closer_change" || lower.includes("closer") || lower.includes("save");
+  const categories = new Set<Category>();
+
+  let roleChange: NewsRoleChange = "none";
+  let expectedAbsence: NewsAbsence = "none";
+  let impactLevel: NewsImpactLevel = "medium";
+  let actionBias: NewsActionBias = "watch";
+  let playingTimeDelta: NewsPlayingTimeDelta = "stable";
+  let summary = alert.fantasyImpact;
+
+  if (isCloser) {
+    roleChange = "closer_up";
+    actionBias = "add";
+    impactLevel = "high";
+    playingTimeDelta = "up";
+    categories.add("SVHD");
+    summary = "Closer role likely gained";
+  } else if (alert.type === "callup") {
+    roleChange = lower.includes("rotation") || lower.includes("starter") ? "rotation_up" : "playing_time_up";
+    actionBias = "watch";
+    impactLevel = "medium";
+    playingTimeDelta = "up";
+    summary = "Promotion may create playing time";
+  } else if (alert.type === "injury") {
+    actionBias = "hold";
+    playingTimeDelta = "down";
+    roleChange = "playing_time_down";
+    if (
+      lower.includes("out for season") ||
+      lower.includes("tommy john") ||
+      lower.includes("surgery") ||
+      lower.includes("60-day")
+    ) {
+      expectedAbsence = "season_risk";
+      impactLevel = "high";
+      actionBias = "drop";
+      summary = "Long absence risk";
+    } else if (lower.includes("10-day") || lower.includes("15-day") || lower.includes("il")) {
+      expectedAbsence = "short_il";
+      impactLevel = "medium";
+      summary = "Likely short IL absence";
+    } else if (lower.includes("day to day") || lower.includes("dtd")) {
+      expectedAbsence = "day_to_day";
+      impactLevel = "low";
+      summary = "Short-term injury concern";
+    } else {
+      expectedAbsence = "unknown";
+      impactLevel = "medium";
+      summary = "Injury impact unclear";
+    }
+  } else if (alert.type === "trade") {
+    impactLevel = "medium";
+    actionBias = "watch";
+    summary = "Role may change on new team";
+  } else if (alert.type === "lineup_change") {
+    impactLevel = "low";
+    actionBias = "watch";
+    summary = "Lineup role may be changing";
+  }
+
+  if (lower.includes("bat leadoff") || lower.includes("leading off") || lower.includes("move up") || lower.includes("batting second")) {
+    roleChange = "lineup_up";
+    playingTimeDelta = "up";
+    impactLevel = impactLevel === "low" ? "medium" : impactLevel;
+  } else if (lower.includes("bat ninth") || lower.includes("batting ninth") || lower.includes("platoon") || lower.includes("resting")) {
+    roleChange = "lineup_down";
+    playingTimeDelta = "down";
+  }
+
+  if (lower.includes("speed") || lower.includes("steal")) categories.add("SB");
+  if (lower.includes("power") || lower.includes("home run")) categories.add("HR");
+  if (lower.includes("run production") || lower.includes("middle of the order")) categories.add("RBI");
+
+  return {
+    impactLevel,
+    roleChange,
+    expectedAbsence,
+    actionBias,
+    playingTimeDelta,
+    targetCategories: uniqueCategories(categories),
+    confidence: isCloser ? 0.82 : alert.type === "injury" ? 0.72 : 0.64,
+    summary,
+  };
+}
+
+function reconcileTargetCategories(
+  alert: NewsAlert,
+  fallback: NewsStructuredSignal,
+  parsedCategories: Category[],
+): Category[] {
+  const merged = uniqueCategories([...fallback.targetCategories, ...parsedCategories]);
+
+  if (alert.type === "closer_change") {
+    return uniqueCategories(["SVHD", ...merged.filter((category) => category !== "H")]);
+  }
+
+  return merged;
+}
+
+function mergeNewsSignals(
+  alert: NewsAlert,
+  fallback: NewsStructuredSignal,
+  llmSignal: Partial<Omit<NewsStructuredSignal, "targetCategories">> & { targetCategories?: string[] },
+): NewsStructuredSignal {
+  const parsedCategories = uniqueCategories(
+    (llmSignal.targetCategories ?? [])
+      .map((value) => normalizeCategory(value))
+      .filter((value): value is Category => value != null),
+  );
+
+  return {
+    impactLevel: llmSignal.impactLevel ?? fallback.impactLevel,
+    roleChange: llmSignal.roleChange ?? fallback.roleChange,
+    expectedAbsence: llmSignal.expectedAbsence ?? fallback.expectedAbsence,
+    actionBias: llmSignal.actionBias ?? fallback.actionBias,
+    playingTimeDelta: llmSignal.playingTimeDelta ?? fallback.playingTimeDelta,
+    targetCategories: reconcileTargetCategories(alert, fallback, parsedCategories),
+    confidence:
+      llmSignal.confidence == null ? fallback.confidence : Math.max(fallback.confidence * 0.6, clamp01(llmSignal.confidence)),
+    summary:
+      typeof llmSignal.summary === "string" && llmSignal.summary.trim().length > 0
+        ? llmSignal.summary.trim()
+        : fallback.summary,
+  };
+}
+
+export async function enrichNewsAlert(env: Env, alert: NewsAlert): Promise<NewsAlert> {
+  const fallback = inferFallbackNewsSignal(alert);
+  if (!shouldUseLLM(alert) || (!env.OPENROUTER_API_KEY && !env.ANTHROPIC_API_KEY)) {
+    return { ...alert, structured: fallback };
+  }
+
+  const briefing = [
+    `TYPE: ${alert.type}`,
+    `PLAYER: ${alert.playerName}`,
+    `TEAM: ${alert.team || "unknown"}`,
+    `HEADLINE: ${alert.headline}`,
+    `BASE IMPACT: ${alert.fantasyImpact}`,
+  ].join("\n");
+  const prompt = newsSignalPrompt(briefing);
+  const llmSignal = await askLLMJson<
+    Partial<Omit<NewsStructuredSignal, "targetCategories">> & { targetCategories?: string[] }
+  >(env, prompt.system, prompt.user, newsSignalSchema, prompt.touchpoint);
+
+  return {
+    ...alert,
+    structured: llmSignal ? mergeNewsSignals(alert, fallback, llmSignal) : fallback,
+  };
+}
+
+export async function enrichNewsAlerts(env: Env, alerts: NewsAlert[]): Promise<NewsAlert[]> {
+  if (alerts.length === 0) return alerts;
+  return Promise.all(alerts.map((alert) => enrichNewsAlert(env, alert)));
 }
 
 /** Simple XML tag content extractor (avoids heavy XML parser dep). */
@@ -288,6 +543,7 @@ export function formatAlertForTelegram(alert: NewsAlert): string {
   const icon = emoji[alert.type];
   const tag = label[alert.type];
   const teamStr = alert.team ? ` (${alert.team})` : "";
+  const structured = alert.structured?.summary ? ` ${alert.structured.summary}.` : "";
 
-  return `<b>${icon} ${tag}:</b> ${alert.playerName}${teamStr} — ${alert.headline}. <i>${alert.fantasyImpact}</i>`;
+  return `<b>${icon} ${tag}:</b> ${alert.playerName}${teamStr} — ${alert.headline}.${structured} <i>${alert.fantasyImpact}</i>`;
 }

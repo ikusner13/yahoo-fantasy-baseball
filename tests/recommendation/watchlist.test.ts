@@ -74,4 +74,42 @@ describe("watchlist helpers", () => {
     expect(recommendations[0]?.tier).toBe("must_add_now");
     expect(recommendations[0]?.summary).toContain("Must add Robert Suarez now");
   });
+
+  it("uses structured high-impact add signals to promote a watch alert", () => {
+    const alert: NewsAlert = {
+      type: "callup",
+      playerName: "Jordan Beck",
+      team: "COL",
+      headline: "Jordan Beck recalled and expected to play regularly",
+      fantasyImpact: "New MLB player — evaluate for roster add",
+      actionable: true,
+      timestamp: "2026-04-11T12:00:00Z",
+      structured: {
+        impactLevel: "high",
+        roleChange: "playing_time_up",
+        expectedAbsence: "none",
+        actionBias: "add",
+        playingTimeDelta: "up",
+        targetCategories: ["R", "HR"],
+        confidence: 0.86,
+        summary: "Playing time spike expected",
+      },
+    };
+
+    const recommendations = buildWatchlistRecommendations(
+      [alert],
+      [
+        {
+          yahooId: "beck",
+          name: "Jordan Beck",
+          team: "COL",
+          positions: ["OF"],
+        },
+      ],
+      [],
+    );
+
+    expect(recommendations[0]?.tier).toBe("strong_watch");
+    expect(recommendations[0]?.summary).toContain("Playing time spike expected");
+  });
 });

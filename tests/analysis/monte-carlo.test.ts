@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vite-plus/test";
 import {
   simulateMatchup,
+  compareLineupOptions,
   type DailyProjection,
   type RateStatAccumulators,
 } from "../../src/analysis/monte-carlo";
@@ -213,6 +214,40 @@ describe("simulateMatchup", () => {
 
     expect(r1.winProbability).toBe(r2.winProbability);
     expect(r1.expectedCategoryWins).toBe(r2.expectedCategoryWins);
+  });
+
+  it("uses explicit opponent projections instead of static opponent pace", () => {
+    const stats = fullMatchup({
+      R: [20, 20],
+      H: [35, 35],
+      HR: [6, 6],
+      RBI: [18, 18],
+      SB: [4, 4],
+      TB: [55, 55],
+      OBP: [0.27, 0.27],
+      OUT: [80, 80],
+      K: [40, 40],
+      ERA: [3.5, 3.5],
+      WHIP: [1.15, 1.15],
+      QS: [2, 2],
+      SVHD: [2, 2],
+    });
+    const myProj = [batter({ r: 1.2, h: 1.8, hr: 0.25, rbi: 1.0, sb: 0.2, tb: 2.8 })];
+    const weakOpponent = [batter({ r: 0.2, h: 0.5, hr: 0.03, rbi: 0.2, sb: 0.02, tb: 0.7 })];
+    const strongOpponent = [batter({ r: 1.4, h: 2.0, hr: 0.3, rbi: 1.1, sb: 0.15, tb: 3.0 })];
+
+    const weakResult = simulateMatchup(stats, 3, myProj, weakOpponent, 500, {
+      myAccumulators: makeAccumulators(30, 3.5, 1.15, 140, 0.28),
+      oppAccumulators: makeAccumulators(30, 3.5, 1.15, 140, 0.28),
+      seed: 77,
+    });
+    const strongResult = simulateMatchup(stats, 3, myProj, strongOpponent, 500, {
+      myAccumulators: makeAccumulators(30, 3.5, 1.15, 140, 0.28),
+      oppAccumulators: makeAccumulators(30, 3.5, 1.15, 140, 0.28),
+      seed: 77,
+    });
+
+    expect(weakResult.winProbability).toBeGreaterThan(strongResult.winProbability);
   });
 
   it("runs 1000 simulations under 100ms", () => {

@@ -1,4 +1,9 @@
-import { simulateMatchup, type DailyProjection, type SimulationResult } from "../analysis/monte-carlo";
+import {
+  simulateMatchup,
+  type DailyProjection,
+  type RateStatAccumulators,
+  type SimulationResult,
+} from "../analysis/monte-carlo";
 import type { TeamWeekSchedule } from "../analysis/game-count";
 import type { Category, Matchup, PlayerProjection, Roster } from "../types";
 
@@ -17,6 +22,38 @@ export interface MatchupProbabilitySnapshot {
   expectedCategoryWins: number;
   categoryWinProbabilities: CategoryWinProbability[];
   simulations: number;
+}
+
+function buildRateStatAccumulators(
+  matchup: Matchup,
+  side: "me" | "opponent",
+  asOf: Date,
+): RateStatAccumulators {
+  const daysRemaining = getInclusiveDaysRemaining(matchup.weekEnd, asOf);
+  const totalDays = 7;
+  const daysElapsed = Math.max(0, totalDays - daysRemaining);
+
+  const getValue = (category: Category): number => {
+    const row = matchup.categories.find((entry) => entry.category === category);
+    if (!row) return 0;
+    return side === "me" ? row.myValue : row.opponentValue;
+  };
+
+  const outs = getValue("OUT");
+  const ip = outs / 3;
+  const era = getValue("ERA");
+  const whip = getValue("WHIP");
+  const obp = getValue("OBP");
+  const estimatedDailyPA = 35;
+  const pa = daysElapsed > 0 ? estimatedDailyPA * daysElapsed : estimatedDailyPA;
+
+  return {
+    ip,
+    er: ip > 0 ? (era * ip) / 9 : 0,
+    whip_numerator: ip > 0 ? whip * ip : 0,
+    pa,
+    obp_numerator: obp * pa,
+  };
 }
 
 function buildRemainingDailyProjections(
@@ -102,25 +139,39 @@ export function estimateMatchupWinProbability(
     asOf?: Date;
     simulations?: number;
     seed?: number;
+    opponentRoster?: Roster;
+    opponentProjectionMap?: Map<string, PlayerProjection>;
   },
 ): MatchupProbabilitySnapshot {
-  const daysRemaining = getInclusiveDaysRemaining(matchup.weekEnd, options?.asOf);
+  const asOf = options?.asOf ?? new Date();
+  const daysRemaining = getInclusiveDaysRemaining(matchup.weekEnd, asOf);
   const myDailyProjections = buildRemainingDailyProjections(
     roster,
     projectionMap,
     weekSchedule,
     daysRemaining,
   );
+  const opponentDailyProjections =
+    options?.opponentRoster && options.opponentProjectionMap
+      ? buildRemainingDailyProjections(
+          options.opponentRoster,
+          options.opponentProjectionMap,
+          weekSchedule,
+          daysRemaining,
+        )
+      : undefined;
 
   const result: SimulationResult = simulateMatchup(
     matchup.categories,
     daysRemaining,
     myDailyProjections,
-    undefined,
+    opponentDailyProjections,
     options?.simulations,
     {
       totalDays: 7,
       seed: options?.seed,
+      myAccumulators: buildRateStatAccumulators(matchup, "me", asOf),
+      oppAccumulators: buildRateStatAccumulators(matchup, "opponent", asOf),
     },
   );
 

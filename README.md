@@ -1,12 +1,12 @@
 # Fantasy Baseball GM
 
-An autonomous AI general manager for Yahoo Fantasy Baseball. It monitors your league 24/7, sets optimal lineups, scouts the waiver wire, evaluates trades, tracks injuries, and sends you actionable recommendations via Telegram — all running serverlessly on Cloudflare Workers.
+An AI fantasy baseball advisor for Yahoo Fantasy Baseball. It monitors your league 24/7, recommends optimal lineups, scouts the waiver wire, evaluates trades, tracks injuries, and sends execution-ready recommendations via Telegram — all running serverlessly on Cloudflare Workers.
 
 Built for **head-to-head categories** leagues. Every decision is driven by LLM analysis layered on top of real statistical data: rest-of-season projections from FanGraphs, Statcast metrics, pitcher/batter splits, park factors, Vegas run lines, and your current matchup context.
 
 ## How It Works
 
-The GM runs as a Cloudflare Worker with scheduled cron triggers. Each trigger fires a specific analysis task that reads your roster, evaluates the situation, consults an LLM, and sends you a Telegram message with what it found and what it recommends.
+The GM runs as a Cloudflare Worker with scheduled cron triggers. Each trigger fires a specific analysis task that reads your roster, evaluates the situation, consults an LLM, and sends you a Telegram message with what it found and what it recommends. Yahoo API access is currently read-only for this setup, so lineup and transaction changes are executed manually through Yahoo deep links.
 
 **Daily:**
 
@@ -29,7 +29,7 @@ All decisions are logged to a database with reasoning, and the GM runs weekly re
 
 ### Telegram Integration
 
-The GM sends all recommendations to Telegram. For trades, it sends messages with inline **Approve / Reject** buttons so you stay in control of roster-altering moves.
+The GM sends all recommendations to Telegram with direct Yahoo links so you can apply them quickly.
 
 Commands you can send to the bot:
 
@@ -45,7 +45,7 @@ Cloudflare Worker (Hono)
   |-- KV ------------- Yahoo OAuth tokens, weekly add budget, news alert dedup
   |-- Cron triggers -- daily analysis, news monitoring, weekly matchup/trade reviews
   |-- Telegram ------- webhook for commands + outbound notifications
-  |-- Yahoo API ------ roster, lineup, waiver, trade operations
+  |-- Yahoo API ------ read-only roster, matchup, league, and transaction data
   |-- OpenRouter ----- LLM analysis (Claude, GPT, etc.)
   |-- FanGraphs ------ ROS projections (Steamer + ZiPS blend)
   |-- MLB Stats API -- schedule, game data, Statcast

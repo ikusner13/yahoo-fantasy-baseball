@@ -10,6 +10,7 @@ import type {
 } from "../../src/types";
 import type { TeamWeekSchedule } from "../../src/analysis/game-count";
 import { evaluateMatchupPickups } from "../../src/recommendation/pickups";
+import { estimateMatchupWinProbability } from "../../src/recommendation/probability-engine";
 
 vi.mock("../../src/recommendation/probability-engine", () => ({
   estimateMatchupWinProbability: vi.fn((matchup: Matchup, roster: Roster) => {
@@ -254,5 +255,59 @@ describe("evaluateMatchupPickups", () => {
     expect((recommendations[0]?.winProbabilityDelta ?? 0)).toBeGreaterThan(
       powerBat?.winProbabilityDelta ?? 0,
     );
+  });
+
+  it("forwards opponent roster context into probability calls", () => {
+    vi.mocked(estimateMatchupWinProbability).mockClear();
+
+    const roster: Roster = {
+      date: "2026-04-10",
+      entries: [makeEntry(makePlayer("weak-rp", "Weak RP", "NYY", ["RP"]))],
+    };
+    const opponentRoster: Roster = {
+      date: "2026-04-10",
+      entries: [makeEntry(makePlayer("opp-1", "Opp Bat", "BOS", ["OF"]))],
+    };
+    const matchup: Matchup = {
+      week: 3,
+      weekStart: "2026-04-06",
+      weekEnd: "2026-04-12",
+      opponentTeamKey: "opp",
+      opponentTeamName: "Opponent",
+      categories: [
+        { category: "SVHD", myValue: 1, opponentValue: 2 },
+        { category: "K", myValue: 44, opponentValue: 43 },
+      ] as Matchup["categories"],
+    };
+
+    evaluateMatchupPickups({
+      roster,
+      freeAgents: [makePlayer("closer-x", "Closer X", "STL", ["RP"])],
+      rosterValuations: new Map([
+        ["weak-rp", { yahooId: "weak-rp", name: "Weak RP", totalZScore: -1.5, categoryZScores: {} }],
+      ]),
+      rosterProjectionMap: new Map([
+        ["weak-rp", makePitcherProjection("weak-rp", { svhd: 0.4 })],
+      ]),
+      freeAgentProjectionMap: new Map([
+        ["closer-x", makePitcherProjection("closer-x", { svhd: 3.8 })],
+      ]),
+      matchup,
+      weekSchedule: makeWeekSchedule(["NYY", "STL", "BOS"]),
+      asOf: new Date("2026-04-10T12:00:00Z"),
+      simulations: 350,
+      seed: 42,
+      limit: 1,
+      opponentRoster,
+      opponentProjectionMap: new Map([
+        ["opp-1", makeBatterProjection("opp-1", "BOS")],
+      ]),
+    });
+
+    const mocked = vi.mocked(estimateMatchupWinProbability);
+    expect(mocked).toHaveBeenCalled();
+    const options = mocked.mock.calls.at(-1)?.[4];
+    expect(options?.opponentRoster).toBe(opponentRoster);
+    expect(options?.opponentProjectionMap).toBeInstanceOf(Map);
   });
 });

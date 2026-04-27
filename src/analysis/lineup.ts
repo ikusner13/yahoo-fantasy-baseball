@@ -113,6 +113,11 @@ export interface ScoringContext {
 
 // League-average OBP used as baseline for BvP adjustment
 const LEAGUE_AVG_OBP = 0.31;
+const PLATOON_PRIOR_PA = 400;
+const BVP_PRIOR_PA = 200;
+const BVP_MIN_PA = 25;
+const MAX_BVP_ADJUSTMENT = 0.02;
+const MAX_PLATOON_ADJUSTMENT = 0.05;
 
 // --- Category weight computation ---
 
@@ -226,31 +231,42 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+function sampleReliability(sampleSize: number, priorSample: number): number {
+  if (sampleSize <= 0) return 0;
+  return sampleSize / (sampleSize + priorSample);
+}
+
 /**
  * BvP adjustment: career stats vs today's opposing pitcher.
- * Gated at 10 PA minimum — below that sample is too noisy.
- * Max 20% swing clamped to [0.80, 1.20].
+ * Strongly shrunk toward neutral because matchup histories are usually tiny.
+ * Keeps BvP as a tiebreaker, not a primary signal.
  */
 function computeBvpMultiplier(bvp: BvPStats | undefined): number {
-  if (!bvp || bvp.pa < 10) return 1.0;
-  const raw = 1.0 + ((bvp.obp - LEAGUE_AVG_OBP) / LEAGUE_AVG_OBP) * 0.2;
-  return clamp(raw, 0.8, 1.2);
+  if (!bvp || bvp.pa < BVP_MIN_PA) return 1.0;
+  const reliability = sampleReliability(bvp.pa, BVP_PRIOR_PA);
+  const relativeObpDelta = (bvp.obp - LEAGUE_AVG_OBP) / LEAGUE_AVG_OBP;
+  const adjustment = relativeObpDelta * 0.08 * reliability;
+  return clamp(1.0 + adjustment, 1 - MAX_BVP_ADJUSTMENT, 1 + MAX_BVP_ADJUSTMENT);
 }
 
 /**
  * Platoon adjustment based on batter's L/R split advantage vs opposing pitcher hand.
- * Clamped to [0.90, 1.10].
+ * Shrinks raw split deltas because side-specific samples are noisy.
  */
 function computePlatoonMultiplier(
   platoon: PlatoonSplit | undefined,
   opposingHand: "L" | "R" | undefined,
 ): number {
   if (!platoon || !opposingHand || platoon.advantage === "neutral") return 1.0;
+  const splitSample = Math.min(platoon.vsLeft.pa, platoon.vsRight.pa);
+  const reliability = sampleReliability(splitSample, PLATOON_PRIOR_PA);
+  if (reliability === 0) return 1.0;
   // Batter has advantage when their advantage hand matches the opposing pitcher's hand
   // e.g. advantage === "R" means batter hits better vs RHP; if pitcher is R, boost
   const hasAdvantage = platoon.advantage === opposingHand;
-  const raw = hasAdvantage ? 1.0 + platoon.advantageSize * 0.1 : 1.0 - platoon.advantageSize * 0.1;
-  return clamp(raw, 0.9, 1.1);
+  const adjustment = platoon.advantageSize * 0.25 * reliability;
+  const raw = hasAdvantage ? 1.0 + adjustment : 1.0 - adjustment;
+  return clamp(raw, 1 - MAX_PLATOON_ADJUSTMENT, 1 + MAX_PLATOON_ADJUSTMENT);
 }
 
 /**

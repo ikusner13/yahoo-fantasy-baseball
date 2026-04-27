@@ -2,6 +2,8 @@ import type {
   Env,
   Decision,
   Roster,
+  Matchup,
+  Player,
   ScheduledGame,
   PlayerProjection,
   PlayerValuation,
@@ -52,7 +54,7 @@ import {
   classifyAddPriority,
   resetWeeklyBudget,
 } from "./analysis/add-budget";
-import { getActionableAlerts, formatAlertForTelegram } from "./monitors/news";
+import { getActionableAlerts, formatAlertForTelegram, enrichNewsAlerts } from "./monitors/news";
 import type { NewsAlert } from "./monitors/news";
 import { buildPlayerIdMap } from "./data/player-match";
 import { upsertPlayerIds, lookupByYahooId } from "./data/player-ids";
@@ -75,7 +77,8 @@ import { scoreRecommendationConfidence, summarizeConfidence } from "./recommenda
 import { evaluateMatchupPickups } from "./recommendation/pickups";
 import { buildWatchlistRecommendations } from "./recommendation/watchlist";
 import { extractMentionedCategories } from "./recommendation/category-signals";
-import { logDecisionEvent, logError } from "./observability/log";
+import { reviewWaiverRecommendation, shouldReviewPickup } from "./recommendation/waiver-review";
+import { logDecisionEvent, logError, logRoutineStep } from "./observability/log";
 import { buildMemoryContext, generateReflection } from "./ai/memory";
 import { eq, desc, sql } from "drizzle-orm";
 import { getEnvNow, getTodayIso } from "./time";
@@ -104,6 +107,11 @@ async function getRecentFeedback(env: Env, limit: number = 5): Promise<string | 
 
 // KV-backed alert dedup for news monitor
 const ALERT_KV_KEY = "sent-alert-keys";
+const MAX_WAIVER_REVIEWS_PER_RUN = 2;
+
+function isDryRun(env: Env): boolean {
+  return env._dryRun === true;
+}
 
 function formatWinOdds(probability: number): string {
   if (probability >= 0.995) return ">99%";
@@ -120,13 +128,38 @@ function formatShortDate(date: string): string {
   });
 }
 
+async function timedRoutineStep<T>(
+  step: string,
+  fn: () => Promise<T>,
+  metadata?: Record<string, unknown> | ((result: T) => Record<string, unknown>),
+): Promise<T> {
+  const start = Date.now();
+  try {
+    const result = await fn();
+    logRoutineStep(
+      step,
+      Date.now() - start,
+      typeof metadata === "function" ? metadata(result) : metadata,
+    );
+    return result;
+  } catch (error) {
+    logRoutineStep(step, Date.now() - start, {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+}
+
 async function getDecisionsForDateRange(
   env: Env,
   startDate: string,
   endDate: string,
-): Promise<Array<{ timestamp?: string; type: string; action: string; reasoning?: string | null }>> {
+  week?: number,
+): Promise<Array<{ id?: number; timestamp?: string; type: string; action: string; reasoning?: string | null }>> {
   const rows = await env.db
     .select({
+      id: decisionsTable.id,
       timestamp: decisionsTable.timestamp,
       type: decisionsTable.type,
       action: decisionsTable.action,
@@ -139,10 +172,39 @@ async function getDecisionsForDateRange(
 
   return rows
     .filter((row) => {
-      const date = row.timestamp?.slice(0, 10);
-      return !!date && date >= startDate && date <= endDate;
+      const action = parseDecisionAction(row.action);
+      const actionDate =
+        readDecisionString(action.date) ??
+        readDecisionString(action.weekStart) ??
+        row.timestamp?.slice(0, 10);
+      const actionWeek = readDecisionNumber(action.week);
+      return (
+        (!!actionDate && actionDate >= startDate && actionDate <= endDate) ||
+        (week != null && actionWeek === week)
+      );
     })
-    .sort((a, b) => (a.timestamp ?? "").localeCompare(b.timestamp ?? ""));
+    .sort((a, b) => {
+      if ((a.timestamp ?? "") !== (b.timestamp ?? "")) {
+        return (a.timestamp ?? "").localeCompare(b.timestamp ?? "");
+      }
+      return (a.id ?? 0) - (b.id ?? 0);
+    });
+}
+
+function parseDecisionAction(action: string): Record<string, unknown> {
+  try {
+    return JSON.parse(action) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+function readDecisionString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function readDecisionNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 async function getSentAlertKeys(env: Env): Promise<Set<string>> {
@@ -156,6 +218,7 @@ async function getSentAlertKeys(env: Env): Promise<Set<string>> {
 }
 
 async function addSentAlertKeys(env: Env, keys: string[]): Promise<void> {
+  if (isDryRun(env)) return;
   const existing = await getSentAlertKeys(env);
   for (const k of keys) existing.add(k);
   // TTL 24h — auto-cleanup
@@ -353,6 +416,43 @@ function projectionsToArray(map: Map<string, PlayerProjection>): PlayerProjectio
   return [...map.values()];
 }
 
+function buildRosterFromTeamPlayers(
+  players: Player[],
+  date: string,
+): Roster {
+  return {
+    entries: players.map((player) => ({
+      player,
+      currentPosition: player.status === "IL" || player.status === "OUT" ? "IL" : "BN",
+    })),
+    date,
+  };
+}
+
+async function buildOpponentProjectionContext(
+  yahoo: YahooClient,
+  matchup: Matchup,
+  date: string,
+  rawBatters: Awaited<ReturnType<typeof fetchBatterProjections>>,
+  rawPitchers: Awaited<ReturnType<typeof fetchPitcherProjections>>,
+  env: Env,
+): Promise<{ opponentRoster: Roster; opponentProjectionMap: Map<string, PlayerProjection> } | undefined> {
+  const teamRosters = await yahoo.getTeamRosters();
+  const opponent = teamRosters.find((team) => team.teamKey === matchup.opponentTeamKey);
+  if (!opponent || opponent.players.length === 0) return undefined;
+
+  const opponentRoster = buildRosterFromTeamPlayers(opponent.players, date);
+  const opponentProjectionMap = await buildProjectionMap(
+    rawBatters,
+    rawPitchers,
+    opponent.players,
+    env,
+  );
+
+  if (opponentProjectionMap.size === 0) return undefined;
+  return { opponentRoster, opponentProjectionMap };
+}
+
 // ---------------------------------------------------------------------------
 // Daily morning routine (9am ET)
 // ---------------------------------------------------------------------------
@@ -369,7 +469,11 @@ export async function runDailyMorning(env: Env): Promise<void> {
   // 0. Fetch news alerts (filtered after roster is available)
   let rawAlerts: NewsAlert[] = [];
   try {
-    rawAlerts = await getActionableAlerts(env);
+    rawAlerts = await timedRoutineStep(
+      "daily_news_alerts",
+      () => getActionableAlerts(env),
+      (alerts) => ({ alerts: alerts.length }),
+    );
   } catch (e) {
     logError("news_alerts", e);
   }
@@ -377,7 +481,11 @@ export async function runDailyMorning(env: Env): Promise<void> {
   // 1. Fetch roster
   let roster;
   try {
-    roster = await yahoo.getRoster(today);
+    roster = await timedRoutineStep(
+      "daily_roster",
+      () => yahoo.getRoster(today),
+      (result) => ({ entries: result.entries.length }),
+    );
   } catch (e) {
     logError("roster_fetch", e);
     await sendMessage(env, `Roster fetch failed: ${e instanceof Error ? e.message : "unknown"}`);
@@ -398,23 +506,29 @@ export async function runDailyMorning(env: Env): Promise<void> {
   // 2. Fetch today's games
   let games: ScheduledGame[] = [];
   try {
-    games = await getTodaysGames(today, env);
+    games = await timedRoutineStep(
+      "daily_games",
+      () => getTodaysGames(today, env),
+      (result) => ({ games: result.length }),
+    );
   } catch (e) {
     logError("games_fetch", e);
   }
 
   // 2b. Weekly game count analysis
   try {
-    const dayOfWeek = new Date(today).getDay();
-    const weekStartOffset = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
-    const weekStart = new Date(new Date(today).getTime() + weekStartOffset * 86400000)
-      .toISOString()
-      .slice(0, 10);
-    const weekEnd = new Date(new Date(weekStart).getTime() + 6 * 86400000)
-      .toISOString()
-      .slice(0, 10);
-    const weekSchedule = await getWeekSchedule(weekStart, weekEnd);
-    const edgeTeams = findGameCountEdge(weekSchedule);
+    const edgeTeams = await timedRoutineStep("daily_week_schedule", async () => {
+      const dayOfWeek = new Date(today).getDay();
+      const weekStartOffset = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
+      const weekStart = new Date(new Date(today).getTime() + weekStartOffset * 86400000)
+        .toISOString()
+        .slice(0, 10);
+      const weekEnd = new Date(new Date(weekStart).getTime() + 6 * 86400000)
+        .toISOString()
+        .slice(0, 10);
+      const weekSchedule = await getWeekSchedule(weekStart, weekEnd);
+      return findGameCountEdge(weekSchedule);
+    }, (result) => ({ edgeTeams: result.length }));
     if (edgeTeams.length > 0) {
       summaryLines.push(`7-game teams: ${edgeTeams.join(", ")}`);
     }
@@ -428,58 +542,129 @@ export async function runDailyMorning(env: Env): Promise<void> {
   let valuations: PlayerValuation[] = [];
   let rawBatterProjections: Awaited<ReturnType<typeof fetchBatterProjections>> = [];
   let rawPitcherProjections: Awaited<ReturnType<typeof fetchPitcherProjections>> = [];
+  let opponentProbabilityContext:
+    | { opponentRoster: Roster; opponentProjectionMap: Map<string, PlayerProjection> }
+    | undefined;
   try {
-    const [rawBatters, rawPitchers] = await Promise.all([
-      fetchBatterProjections(undefined, env),
-      fetchPitcherProjections(undefined, env),
-    ]);
-    rawBatterProjections = rawBatters;
-    rawPitcherProjections = rawPitchers;
-    const rosterForMatch = roster?.entries.map((e) => e.player) ?? [];
-    projectionMap = await buildProjectionMap(rawBatters, rawPitchers, rosterForMatch, env);
-    allProjections = projectionsToArray(projectionMap);
-
-    // 4. Compute z-scores with variance adjustment for H2H consistency
-    const rawValuations = computeZScores(allProjections);
-    valuations = applyVarianceAdjustment(rawValuations, allProjections);
+    const projectionResult = await timedRoutineStep("daily_projections", async () => {
+      const [rawBatters, rawPitchers] = await Promise.all([
+        fetchBatterProjections(undefined, env),
+        fetchPitcherProjections(undefined, env),
+      ]);
+      const rosterForMatch = roster?.entries.map((e) => e.player) ?? [];
+      const builtProjectionMap = await buildProjectionMap(rawBatters, rawPitchers, rosterForMatch, env);
+      const builtProjections = projectionsToArray(builtProjectionMap);
+      const rawValuations = computeZScores(builtProjections);
+      const adjustedValuations = applyVarianceAdjustment(rawValuations, builtProjections);
+      return {
+        rawBatters,
+        rawPitchers,
+        builtProjectionMap,
+        builtProjections,
+        adjustedValuations,
+      };
+    }, (result) => ({
+      batterProjections: result.rawBatters.length,
+      pitcherProjections: result.rawPitchers.length,
+      matchedPlayers: result.builtProjectionMap.size,
+    }));
+    rawBatterProjections = projectionResult.rawBatters;
+    rawPitcherProjections = projectionResult.rawPitchers;
+    projectionMap = projectionResult.builtProjectionMap;
+    allProjections = projectionResult.builtProjections;
+    valuations = projectionResult.adjustedValuations;
   } catch (e) {
     logError("projections_fetch", e);
     actionItems.push("Data issue: projections unavailable — lineup may be suboptimal");
   }
 
   // 5. Fetch current matchup for category weighting
-  let matchup;
+  let matchup: Matchup | undefined;
   let matchupAnalysis: MatchupAnalysis | null = null;
   try {
-    matchup = await yahoo.getMatchup();
-    if (matchup.categories.length > 0) {
-      matchupAnalysis = analyzeMatchup(matchup);
-      if (projectionMap.size > 0) {
-        const weekSchedule = await getWeekSchedule(matchup.weekStart, matchup.weekEnd);
-        probabilitySnapshot = estimateMatchupWinProbability(matchup, roster, projectionMap, weekSchedule, {
-          asOf: getEnvNow(env),
-          simulations: 500,
-          seed: 42,
-        });
+    const matchupResult = await timedRoutineStep("daily_matchup", async () => {
+      const currentMatchup = await yahoo.getMatchup();
+      let currentMatchupAnalysis: MatchupAnalysis | null = null;
+      let currentProbabilitySnapshot: MatchupProbabilitySnapshot | null = null;
+      let currentConfidence: string | null = null;
+      let currentOpponentContext:
+        | { opponentRoster: Roster; opponentProjectionMap: Map<string, PlayerProjection> }
+        | undefined;
 
-        const swingCategoryRate =
-          probabilitySnapshot.categoryWinProbabilities.filter(
-            (category) => category.winProbability >= 0.4 && category.winProbability <= 0.6,
-          ).length / Math.max(probabilitySnapshot.categoryWinProbabilities.length, 1);
-        const dataQuality = Math.min(
-          1,
-          projectionMap.size / Math.max(roster.entries.length, 1),
-        );
-        const assessment = scoreRecommendationConfidence({
-          delta: Math.abs(probabilitySnapshot.winProbability - 0.5),
-          deltaScale: 0.25,
-          dataQuality,
-          uncertainty: Math.min(1, swingCategoryRate * 0.7),
-          signalAgreement: matchupAnalysis ? 0.75 : 0.6,
-        });
-        matchupConfidence = summarizeConfidence(assessment);
+      if (currentMatchup.categories.length > 0) {
+        currentMatchupAnalysis = analyzeMatchup(currentMatchup);
+        if (projectionMap.size > 0) {
+          const weekSchedule = await getWeekSchedule(currentMatchup.weekStart, currentMatchup.weekEnd);
+          try {
+            if (rawBatterProjections.length > 0 || rawPitcherProjections.length > 0) {
+              currentOpponentContext = await buildOpponentProjectionContext(
+                yahoo,
+                currentMatchup,
+                today,
+                rawBatterProjections,
+                rawPitcherProjections,
+                env,
+              );
+            }
+          } catch (e) {
+            logError("opponent_projection_context", e);
+          }
+          currentProbabilitySnapshot = estimateMatchupWinProbability(
+            currentMatchup,
+            roster,
+            projectionMap,
+            weekSchedule,
+            {
+              asOf: getEnvNow(env),
+              simulations: 500,
+              seed: 42,
+              opponentRoster: currentOpponentContext?.opponentRoster,
+              opponentProjectionMap: currentOpponentContext?.opponentProjectionMap,
+            },
+          );
+
+          const swingCategoryRate =
+            currentProbabilitySnapshot.categoryWinProbabilities.filter(
+              (category) => category.winProbability >= 0.4 && category.winProbability <= 0.6,
+            ).length / Math.max(currentProbabilitySnapshot.categoryWinProbabilities.length, 1);
+          const dataQuality = Math.min(
+            1,
+            Math.min(
+              projectionMap.size / Math.max(roster.entries.length, 1),
+              currentOpponentContext
+                ? currentOpponentContext.opponentProjectionMap.size /
+                    Math.max(currentOpponentContext.opponentRoster.entries.length, 1)
+                : 0.75,
+            ),
+          );
+          const assessment = scoreRecommendationConfidence({
+            delta: Math.abs(currentProbabilitySnapshot.winProbability - 0.5),
+            deltaScale: 0.25,
+            dataQuality,
+            uncertainty: Math.min(1, swingCategoryRate * 0.7),
+            signalAgreement: currentMatchupAnalysis ? 0.75 : 0.6,
+          });
+          currentConfidence = summarizeConfidence(assessment);
+        }
       }
-    }
+
+      return {
+        currentMatchup,
+        currentMatchupAnalysis,
+        currentProbabilitySnapshot,
+        currentConfidence,
+        currentOpponentContext,
+      };
+    }, (result) => ({
+      categories: result.currentMatchup.categories.length,
+      hasProbabilitySnapshot: result.currentProbabilitySnapshot != null,
+      opponentRosterSize: result.currentOpponentContext?.opponentRoster.entries.length ?? 0,
+    }));
+    matchup = matchupResult.currentMatchup;
+    matchupAnalysis = matchupResult.currentMatchupAnalysis;
+    probabilitySnapshot = matchupResult.currentProbabilitySnapshot;
+    matchupConfidence = matchupResult.currentConfidence;
+    opponentProbabilityContext = matchupResult.currentOpponentContext;
   } catch (e) {
     logError("matchup_fetch", e);
     // non-fatal, lineup optimization works without matchup context
@@ -520,7 +705,11 @@ export async function runDailyMorning(env: Env): Promise<void> {
   try {
     if (rosterMlbIds.length > 0) {
       // Fetch Statcast batter data (1 HTTP call, cached per day)
-      const statcast = await getBatterStatcast(rosterMlbIds, 2026, env);
+      const statcast = await timedRoutineStep(
+        "daily_statcast",
+        () => getBatterStatcast(rosterMlbIds, 2026, env),
+        (result) => ({ players: result.length }),
+      );
 
       if (statcast.length > 0) {
         // Compute streaks: compare recent xwOBA vs ROS projections
@@ -581,6 +770,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
 
   // 5c. Platoon splits — highest signal-to-noise daily factor for batter lineup decisions
   try {
+    const platoonStart = Date.now();
     if (!contextMap) contextMap = new Map<string, ScoringContext>();
 
     // Step 1: Resolve opposing pitcher hand for each game today
@@ -654,6 +844,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
       contextMap.set(yahooId, { ...existing, platoon, opposingPitcherHand });
       platoonCount++;
     }
+    logRoutineStep("daily_platoon_splits", Date.now() - platoonStart, { players: platoonCount });
   } catch (e) {
     logError("platoon_splits", e);
   }
@@ -716,6 +907,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
 
   // 6. IL moves
   try {
+    const ilStart = Date.now();
     const ilActions = getILMoves(roster);
       if (ilActions.length > 0) {
       for (const a of ilActions) {
@@ -747,12 +939,14 @@ export async function runDailyMorning(env: Env): Promise<void> {
       reasoning: ilActions.map((a) => a.reasoning).join("; ") || "no moves",
       result: ilActions.length > 0 ? "notified" : "success",
     });
+    logRoutineStep("daily_il", Date.now() - ilStart, { actions: ilActions.length });
   } catch (e) {
     logError("il_check", e);
   }
 
   // 7. Optimize lineup + AI analysis
   try {
+    const lineupStart = Date.now();
     const moves = optimizeLineup(roster, projectionMap, games, matchup, streakMap, contextMap);
 
     // Separate starters from bench in optimized lineup
@@ -808,6 +1002,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
       reasoning: `Set ${moves.length} lineup moves`,
       result: moves.length > 0 ? "notified" : "success",
     });
+    logRoutineStep("daily_lineup", Date.now() - lineupStart, { moves: moves.length });
   } catch (e) {
     logError("lineup_optimization", e);
     actionItems.push("Lineup optimization failed — set lineup manually");
@@ -816,6 +1011,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
   // 8. Waiver wire evaluation
   const budget = await getAddBudget(env);
   try {
+    const waiverStart = Date.now();
     const freeAgents = await yahoo.getFreeAgents(undefined, 50);
     if (freeAgents.length > 0 && valuations.length > 0) {
       // Build valuation map for roster players
@@ -843,6 +1039,8 @@ export async function runDailyMorning(env: Env): Promise<void> {
           simulations: 350,
           seed: 23,
           limit: 5,
+          opponentRoster: opponentProbabilityContext?.opponentRoster,
+          opponentProjectionMap: opponentProbabilityContext?.opponentProjectionMap,
         });
       } else {
         const freeAgentProjectionMap = await buildProjectionMap(
@@ -866,16 +1064,53 @@ export async function runDailyMorning(env: Env): Promise<void> {
       }
 
       if (pickups.length > 0) {
+        const waiverReviewMemory =
+          env.OPENROUTER_API_KEY || env.ANTHROPIC_API_KEY
+            ? await buildMemoryContext(env, "review")
+            : undefined;
+        const reviewTargets = pickups
+          .filter((rec) => shouldReviewPickup(rec))
+          .slice(0, MAX_WAIVER_REVIEWS_PER_RUN);
+        const reviewResults = await Promise.allSettled(
+          reviewTargets.map(async (rec) => {
+            const review = await reviewWaiverRecommendation(env, {
+              recommendation: rec,
+              matchup,
+              addsRemaining: budget.addsRemaining,
+              memory: waiverReviewMemory,
+            });
+            return [`${rec.add.yahooId}:${rec.drop.yahooId}`, review] as const;
+          }),
+        );
+        const reviewMap = new Map<string, Awaited<ReturnType<typeof reviewWaiverRecommendation>>>();
+        for (const result of reviewResults) {
+          if (result.status !== "fulfilled") continue;
+          const [key, review] = result.value;
+          reviewMap.set(key, review);
+        }
         const pickupNotifications: PickupNotificationItem[] = [];
         for (const rec of pickups) {
-          const reasoningLower = rec.reasoning.toLowerCase();
-          const priority = classifyAddPriority(rec, {
+          const review = reviewMap.get(`${rec.add.yahooId}:${rec.drop.yahooId}`) ?? null;
+          if (review?.verdict === "reject") continue;
+
+          const reviewedReasoning =
+            review == null
+              ? rec.reasoning
+              : `${rec.reasoning} Review: ${review.summary}${review.riskFlags.length > 0 ? ` Risks: ${review.riskFlags.join(", ")}.` : ""}`;
+          const reasoningLower = reviewedReasoning.toLowerCase();
+          const priority = classifyAddPriority(
+            {
+              ...rec,
+              reasoning: reviewedReasoning,
+            },
+            {
             isCloserChange: reasoningLower.includes("closer") || reasoningLower.includes("saves"),
             isInjuryReplacement:
               reasoningLower.includes("injur") ||
               reasoningLower.includes("IL") ||
               rec.drop.status === "IL",
-          });
+            },
+          );
 
           // Check add budget before spending (type-aware)
           if (!canSpendAdd(budget, "waiver", priority)) continue;
@@ -893,7 +1128,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
             winProbabilityDelta: rec.winProbabilityDelta,
             expectedCategoryWinsDelta: rec.expectedCategoryWinsDelta,
             priority,
-            reasoning: rec.reasoning,
+            reasoning: reviewedReasoning,
             method: "waiver",
           });
           decisions.push({
@@ -907,8 +1142,10 @@ export async function runDailyMorning(env: Env): Promise<void> {
               winProbabilityDelta: rec.winProbabilityDelta,
               expectedCategoryWinsDelta: rec.expectedCategoryWinsDelta,
               targetCategories: rec.targetCategories ?? extractMentionedCategories(rec.reasoning),
+              reviewVerdict: review?.verdict,
+              reviewRiskFlags: review?.riskFlags ?? [],
             },
-            reasoning: rec.reasoning,
+            reasoning: reviewedReasoning,
             result: "notified",
           });
         }
@@ -927,12 +1164,17 @@ export async function runDailyMorning(env: Env): Promise<void> {
         }
       }
     }
+    logRoutineStep("daily_waiver_scan", Date.now() - waiverStart, {
+      freeAgents: freeAgents.length,
+      valuations: valuations.length,
+    });
   } catch (e) {
     logError("waiver_scan", e);
   }
 
   // 9. Schedule-aware pitcher pickups (rest of matchup week)
   try {
+    const streamingStart = Date.now();
     const faPitchers = await yahoo.getFreeAgents("SP", 25);
     if (faPitchers.length > 0) {
       // Match FA pitchers to FanGraphs projections by name/team
@@ -1112,6 +1354,9 @@ export async function runDailyMorning(env: Env): Promise<void> {
         }
       }
     }
+    logRoutineStep("daily_streaming_scan", Date.now() - streamingStart, {
+      freeAgentPitchers: faPitchers.length,
+    });
   } catch (e) {
     logError("streaming_analysis", e);
   }
@@ -1173,7 +1418,12 @@ export async function runDailyMorning(env: Env): Promise<void> {
   }
 
   try {
+    const summaryStart = Date.now();
     await sendMessage(env, finalLines.join("\n"));
+    logRoutineStep("daily_summary_send", Date.now() - summaryStart, {
+      lines: finalLines.length,
+      actionItems: actionItems.length,
+    });
   } catch (e) {
     logError("telegram_summary", e);
     try {
@@ -1184,6 +1434,7 @@ export async function runDailyMorning(env: Env): Promise<void> {
   }
 
   // 11. Log all decisions to SQLite
+  const decisionLoggingStart = Date.now();
   for (const d of decisions) {
     try {
       await logDecision(env, d);
@@ -1213,6 +1464,9 @@ export async function runDailyMorning(env: Env): Promise<void> {
     logError("completion_logging", e);
     // best-effort
   }
+  logRoutineStep("daily_decision_logging", Date.now() - decisionLoggingStart, {
+    decisions: decisions.length + 1,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1308,17 +1562,20 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
           env,
           prevMatchup.weekStart,
           prevMatchup.weekEnd,
+          prevMatchup.week,
         );
         const retro = buildRetrospective(prevMatchup, undefined, prevWeekDecisions);
 
-        // Store retrospective
-        await env.db
-          .insert(retrospectives)
-          .values({ week: prevWeek, data: JSON.stringify(retro) })
-          .onConflictDoUpdate({
-            target: retrospectives.week,
-            set: { data: JSON.stringify(retro) },
-          });
+        if (!isDryRun(env)) {
+          // Store retrospective
+          await env.db
+            .insert(retrospectives)
+            .values({ week: prevWeek, data: JSON.stringify(retro) })
+            .onConflictDoUpdate({
+              target: retrospectives.week,
+              set: { data: JSON.stringify(retro) },
+            });
+        }
 
         // Send Telegram summary
         await sendMessage(env, formatRetrospectiveForTelegram(retro));
@@ -1332,10 +1589,17 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
         });
 
         // Generate compressed reflection from recent decisions + retrospective
-        try {
-          await generateReflection(env, []);
-        } catch (e) {
-          logError("reflection_generation", e);
+        if (!isDryRun(env)) {
+          try {
+            await generateReflection(
+              env,
+              prevWeekDecisions
+                .map((decision) => decision.id)
+                .filter((id): id is number => typeof id === "number"),
+            );
+          } catch (e) {
+            logError("reflection_generation", e);
+          }
         }
       }
     }
@@ -1387,21 +1651,40 @@ export async function runWeeklyMatchupAnalysis(env: Env): Promise<void> {
     const allVals = computeZScores(projectionsToArray(projMap));
     const valMap = new Map(allVals.map((v) => [v.yahooId, v]));
     const weekSchedule = await getWeekSchedule(matchup.weekStart, matchup.weekEnd);
+    const opponentProbabilityContext = await buildOpponentProjectionContext(
+      yahoo,
+      matchup,
+      matchup.weekStart,
+      rawBat,
+      rawPit,
+      env,
+    );
 
     probabilitySnapshot = estimateMatchupWinProbability(matchup, myRoster, projMap, weekSchedule, {
       simulations: 1000,
       seed: 42,
+      opponentRoster: opponentProbabilityContext?.opponentRoster,
+      opponentProjectionMap: opponentProbabilityContext?.opponentProjectionMap,
     });
 
     const myVals = myRoster.entries
       .map((e) => valMap.get(e.player.yahooId))
       .filter((v): v is PlayerValuation => !!v);
 
-    // TODO: fetch opponent roster once API parsing is improved
-    // For now, use category scores from matchup to infer opponent strength
     if (myVals.length > 0) {
       const needs = identifyCategoryNeeds(myVals);
       scoutReport = `\n<b>Our weakest cats:</b> ${needs.slice(0, 3).join(", ")}`;
+      if (opponentProbabilityContext) {
+        const oppVals = computeZScores(
+          projectionsToArray(opponentProbabilityContext.opponentProjectionMap),
+        );
+        const oppStrengths = identifySurplus(oppVals)
+          .slice(0, 3)
+          .map((entry) => entry.category);
+        if (oppStrengths.length > 0) {
+          scoutReport += `\n<b>Opponent likely strengths:</b> ${oppStrengths.join(", ")}`;
+        }
+      }
     }
   } catch (e) {
     logError("opponent_scouting", e);
@@ -1779,6 +2062,12 @@ export async function runNewsMonitor(env: Env): Promise<void> {
     if (alerts.length === 0) return;
   }
 
+  try {
+    alerts = await enrichNewsAlerts(env, alerts);
+  } catch (e) {
+    logError("news_alert_enrichment", e);
+  }
+
   // 2. Fetch roster for relevance filtering (light call, runs every 30min)
   let rosterNames: string[] = [];
   let liveRoster: Roster | undefined;
@@ -1893,7 +2182,16 @@ export async function runNewsMonitor(env: Env): Promise<void> {
     }
 
     // Flag closer changes for urgent waiver consideration
-    if (alert.type === "closer_change" && relevance === "FREE_AGENT") {
+    if (
+      relevance === "FREE_AGENT" &&
+      (
+        alert.type === "closer_change" ||
+        (
+          alert.structured?.impactLevel === "high" &&
+          alert.structured.actionBias === "add"
+        )
+      )
+    ) {
       urgentWaiverFlag = true;
     }
 
@@ -2177,6 +2475,7 @@ export async function runTwoStartPreview(env: Env): Promise<void> {
 
 export async function logDecision(env: Env, decision: Decision): Promise<void> {
   logDecisionEvent(decision.type, decision.action, decision.result);
+  if (isDryRun(env)) return;
   await env.db.insert(decisionsTable).values({
     type: decision.type,
     action: JSON.stringify(decision.action),

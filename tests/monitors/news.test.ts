@@ -4,6 +4,7 @@ import {
   isCloserRelated,
   assessImpact,
   formatAlertForTelegram,
+  inferFallbackNewsSignal,
   type NewsAlert,
 } from "../../src/monitors/news";
 
@@ -146,6 +147,47 @@ describe("assessImpact", () => {
   it("lineup_change -> lineup text", () => {
     const result = assessImpact("lineup_change", "");
     expect(result).toContain("Lineup");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// inferFallbackNewsSignal
+// ---------------------------------------------------------------------------
+
+describe("inferFallbackNewsSignal", () => {
+  it("marks closer changes as high-impact adds for SVHD", () => {
+    const alert: NewsAlert = {
+      type: "closer_change",
+      playerName: "Robert Suarez",
+      team: "SD",
+      headline: "Robert Suarez expected to handle save chances",
+      fantasyImpact: "Potential saves/holds impact",
+      actionable: true,
+      timestamp: "2026-04-11T10:00:00Z",
+    };
+
+    const signal = inferFallbackNewsSignal(alert);
+    expect(signal.impactLevel).toBe("high");
+    expect(signal.actionBias).toBe("add");
+    expect(signal.roleChange).toBe("closer_up");
+    expect(signal.targetCategories).toContain("SVHD");
+  });
+
+  it("treats major IL news as long-absence risk", () => {
+    const alert: NewsAlert = {
+      type: "injury",
+      playerName: "Shane Bieber",
+      team: "CLE",
+      headline: "Placed on 60-day IL following elbow surgery",
+      fantasyImpact: "Check IL eligibility and replacement options",
+      actionable: true,
+      timestamp: "2026-04-11T10:00:00Z",
+    };
+
+    const signal = inferFallbackNewsSignal(alert);
+    expect(signal.expectedAbsence).toBe("season_risk");
+    expect(signal.actionBias).toBe("drop");
+    expect(signal.playingTimeDelta).toBe("down");
   });
 });
 

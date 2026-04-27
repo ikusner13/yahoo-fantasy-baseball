@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS projections (
 -- Decision audit log
 CREATE TABLE IF NOT EXISTS decisions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+  timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   type TEXT NOT NULL,       -- 'lineup' | 'waiver' | 'stream' | 'trade' | 'il'
   action TEXT NOT NULL,     -- JSON: what was done
   reasoning TEXT,           -- LLM reasoning or stats summary
@@ -56,19 +56,26 @@ CREATE TABLE IF NOT EXISTS api_cache (
 CREATE TABLE IF NOT EXISTS retrospectives (
   week INTEGER PRIMARY KEY,
   data TEXT NOT NULL, -- JSON blob of WeeklyRetrospective
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- User feedback for learning loop
 CREATE TABLE IF NOT EXISTS feedback (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+  timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   type TEXT NOT NULL, -- 'good' | 'bad' | 'note'
   message TEXT NOT NULL,
   week INTEGER -- which matchup week this relates to
 );
 
 CREATE INDEX IF NOT EXISTS idx_feedback_week ON feedback(week);
+
+CREATE TABLE IF NOT EXISTS gm_reflections (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  reflection TEXT NOT NULL,
+  runs_covered TEXT NOT NULL
+);
 
 -- Park factors (static-ish, refresh yearly)
 CREATE TABLE IF NOT EXISTS park_factors (

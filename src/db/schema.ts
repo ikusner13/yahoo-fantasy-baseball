@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { sqliteTable, text, integer, real, index, primaryKey } from "drizzle-orm/sqlite-core";
 
 export const playerIds = sqliteTable(
@@ -44,7 +45,7 @@ export const decisions = sqliteTable(
   "decisions",
   {
     id: integer("id").primaryKey({ autoIncrement: true }),
-    timestamp: text("timestamp").notNull().default("(datetime('now'))"),
+    timestamp: text("timestamp").notNull().default(sql`CURRENT_TIMESTAMP`),
     type: text("type").notNull(),
     action: text("action").notNull(),
     reasoning: text("reasoning"),
@@ -72,14 +73,14 @@ export const apiCache = sqliteTable("api_cache", {
 export const retrospectives = sqliteTable("retrospectives", {
   week: integer("week").primaryKey(),
   data: text("data").notNull(),
-  createdAt: text("created_at").notNull().default("(datetime('now'))"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 });
 
 export const feedback = sqliteTable(
   "feedback",
   {
     id: integer("id").primaryKey({ autoIncrement: true }),
-    timestamp: text("timestamp").notNull().default("(datetime('now'))"),
+    timestamp: text("timestamp").notNull().default(sql`CURRENT_TIMESTAMP`),
     type: text("type").notNull(),
     message: text("message").notNull(),
     week: integer("week"),
@@ -89,7 +90,7 @@ export const feedback = sqliteTable(
 
 export const gmReflections = sqliteTable("gm_reflections", {
   id: integer("id").primaryKey({ autoIncrement: true }),
-  createdAt: text("created_at").notNull().default("(datetime('now'))"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   reflection: text("reflection").notNull(),
   runsCovered: text("runs_covered").notNull(),
 });

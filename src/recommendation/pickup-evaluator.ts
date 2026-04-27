@@ -39,6 +39,8 @@ export function rerankPickupRecommendationsByMatchupDelta(
     asOf?: Date;
     simulations?: number;
     seed?: number;
+    opponentRoster?: Roster;
+    opponentProjectionMap?: Map<string, PlayerProjection>;
   },
 ): PickupRecommendation[] {
   if (recommendations.length === 0) return recommendations;
@@ -47,6 +49,8 @@ export function rerankPickupRecommendationsByMatchupDelta(
     asOf: options?.asOf,
     simulations: options?.simulations ?? 400,
     seed: options?.seed,
+    opponentRoster: options?.opponentRoster,
+    opponentProjectionMap: options?.opponentProjectionMap,
   });
   const baselineCategoryMap = new Map(
     baseline.categoryWinProbabilities.map((entry) => [entry.category, entry.winProbability]),
@@ -72,6 +76,8 @@ export function rerankPickupRecommendationsByMatchupDelta(
       asOf: options?.asOf,
       simulations: options?.simulations ?? 400,
       seed: options?.seed ?? 17,
+      opponentRoster: options?.opponentRoster,
+      opponentProjectionMap: options?.opponentProjectionMap,
     });
 
     const winProbabilityDelta = next.winProbability - baseline.winProbability;

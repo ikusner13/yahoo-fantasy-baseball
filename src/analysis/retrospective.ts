@@ -115,8 +115,15 @@ const CATEGORY_ORDER = [
 export function buildRetrospective(
   finalMatchup: Matchup,
   weekStartPredictions?: DetailedCategoryState[],
-  weekDecisions?: Array<{ timestamp?: string; type: string; action: string; reasoning?: string | null }>,
+  weekDecisions?: Array<{
+    id?: number;
+    timestamp?: string;
+    type: string;
+    action: string;
+    reasoning?: string | null;
+  }>,
 ): WeeklyRetrospective {
+  const normalizedWeekDecisions = dedupeDecisions(weekDecisions ?? []);
   const predictions: CategoryPrediction[] = [];
   let wins = 0;
   let losses = 0;
@@ -127,7 +134,7 @@ export function buildRetrospective(
   if (weekStartPredictions) {
     for (const p of weekStartPredictions) predMap.set(p.category, p);
   } else {
-    for (const p of extractPredictionsFromDecisions(finalMatchup, weekDecisions ?? [])) {
+    for (const p of extractPredictionsFromDecisions(finalMatchup, normalizedWeekDecisions)) {
       predMap.set(p.category, p);
     }
   }
@@ -163,7 +170,7 @@ export function buildRetrospective(
   );
 
   // Build decisions from audit log
-  const decisions: DecisionOutcome[] = (weekDecisions ?? []).map((d) =>
+  const decisions: DecisionOutcome[] = normalizedWeekDecisions.map((d) =>
     evaluateDecision(finalMatchup, finalResults, d),
   );
 
@@ -198,8 +205,11 @@ export function buildRetrospective(
     );
   }
 
-  const scorecard = buildRecommendationScorecard(finalMatchup, decisions, weekDecisions ?? []);
-  const alignmentScorecard = buildRecommendationAlignmentScorecard(finalMatchup, weekDecisions ?? []);
+  const scorecard = buildRecommendationScorecard(finalMatchup, decisions, normalizedWeekDecisions);
+  const alignmentScorecard = buildRecommendationAlignmentScorecard(
+    finalMatchup,
+    normalizedWeekDecisions,
+  );
 
   if (scorecard.averageBrierScore != null && scorecard.averageBrierScore > 0.2) {
     lessons.push(
@@ -299,12 +309,22 @@ export function formatRetrospectiveForTelegram(retro: WeeklyRetrospective): stri
 
 function extractPredictionsFromDecisions(
   finalMatchup: Matchup,
-  weekDecisions: Array<{ type: string; action: string }>,
+  weekDecisions: Array<{ id?: number; timestamp?: string; type: string; action: string }>,
 ): DetailedCategoryState[] {
   const weeklyDecision = weekDecisions
-    .map((decision) => parseAction(decision.action))
-    .reverse()
-    .find((action) => action.routine === "weekly_matchup");
+    .map((decision, index) => ({
+      action: parseAction(decision.action),
+      index,
+      id: decision.id,
+      timestamp: decision.timestamp,
+    }))
+    .filter(({ action }) => hasForecastCategories(action))
+    .sort((a, b) => {
+      const routineOrder = forecastRoutineRank(readString(a.action.routine)) -
+        forecastRoutineRank(readString(b.action.routine));
+      if (routineOrder !== 0) return routineOrder;
+      return compareDecisionOrder(a, b);
+    })[0]?.action;
 
   if (!weeklyDecision) return [];
 
@@ -388,7 +408,13 @@ function evaluateDecision(
 function buildRecommendationScorecard(
   finalMatchup: Matchup,
   decisions: DecisionOutcome[],
-  weekDecisions: Array<{ timestamp?: string; type: string; action: string; reasoning?: string | null }>,
+  weekDecisions: Array<{
+    id?: number;
+    timestamp?: string;
+    type: string;
+    action: string;
+    reasoning?: string | null;
+  }>,
 ): RecommendationScorecard {
   const goodDecisions = decisions.filter((decision) => decision.outcome === "good").length;
   const badDecisions = decisions.filter((decision) => decision.outcome === "bad").length;
@@ -400,22 +426,29 @@ function buildRecommendationScorecard(
 
   const actualOutcome = summarizeMatchupOutcome(finalMatchup);
 
-  const probabilityCalls = weekDecisions.reduce<ProbabilityCall[]>((calls, decision) => {
+  const probabilityCallMap = new Map<string, ProbabilityCall>();
+  for (const decision of weekDecisions) {
       const action = parseAction(decision.action);
       const probability = readNumber(action.winProbability);
-      if (probability == null) return calls;
+      if (probability == null) continue;
+
+      const label = readString(action.routine) ?? decision.type;
+      const date = extractDecisionDate(action, decision.timestamp);
+      const dedupeKey = `${label}|${date ?? "unknown"}`;
+      if (probabilityCallMap.has(dedupeKey)) continue;
 
       const expected = actualOutcome === "win" ? 1 : actualOutcome === "loss" ? 0 : 0.5;
       const brierScore = (probability - expected) ** 2;
-      calls.push({
-        label: readString(action.routine) ?? decision.type,
-        date: readString(action.date) ?? extractDateFromTimestamp(decision.timestamp),
+      probabilityCallMap.set(dedupeKey, {
+        label,
+        date,
         probability,
         actual: actualOutcome,
         brierScore,
       });
-      return calls;
-    }, []);
+    }
+
+  const probabilityCalls = [...probabilityCallMap.values()];
 
   const averageBrierScore =
     probabilityCalls.length > 0
@@ -525,6 +558,82 @@ function sortCategories(categories: Category[]): Category[] {
 
 function extractDateFromTimestamp(timestamp?: string): string | undefined {
   return timestamp?.slice(0, 10);
+}
+
+function extractDecisionDate(
+  action: Record<string, unknown>,
+  timestamp?: string,
+): string | undefined {
+  return readString(action.date) ?? readString(action.weekStart) ?? extractDateFromTimestamp(timestamp);
+}
+
+function hasForecastCategories(action: Record<string, unknown>): boolean {
+  return (
+    readStringArray(action.safe).length > 0 ||
+    readStringArray(action.swing).length > 0 ||
+    readStringArray(action.lost).length > 0
+  );
+}
+
+function forecastRoutineRank(routine?: string): number {
+  switch (routine) {
+    case "weekly_matchup":
+      return 0;
+    case "daily_morning":
+      return 1;
+    case "midweek_adjustment":
+      return 2;
+    default:
+      return 3;
+  }
+}
+
+function compareDecisionOrder(
+  a: { id?: number; timestamp?: string; index: number },
+  b: { id?: number; timestamp?: string; index: number },
+): number {
+  if (a.id != null && b.id != null && a.id !== b.id) return a.id - b.id;
+  if (a.timestamp && b.timestamp && a.timestamp !== b.timestamp) {
+    return a.timestamp.localeCompare(b.timestamp);
+  }
+  return a.index - b.index;
+}
+
+function dedupeDecisions<
+  T extends { id?: number; timestamp?: string; type: string; action: string; reasoning?: string | null },
+>(weekDecisions: T[]): T[] {
+  const deduped = new Map<string, T>();
+
+  for (const decision of weekDecisions) {
+    const action = parseAction(decision.action);
+    const key = buildDecisionKey(decision, action);
+    if (!deduped.has(key)) deduped.set(key, decision);
+  }
+
+  return [...deduped.values()];
+}
+
+function buildDecisionKey(
+  decision: { timestamp?: string; type: string },
+  action: Record<string, unknown>,
+): string {
+  const targetCategories = sortCategories(
+    readStringArray(action.targetCategories).filter(isCategory),
+  ).join(",");
+
+  return [
+    decision.type,
+    readString(action.routine) ?? "",
+    extractDecisionDate(action, decision.timestamp) ?? "",
+    readString(action.weekStart) ?? "",
+    readString(action.add) ?? "",
+    readString(action.drop) ?? "",
+    readString(action.player) ?? "",
+    readString(action.opponent) ?? "",
+    readNumber(action.week) ?? "",
+    readNumber(action.moves) ?? "",
+    targetCategories,
+  ].join("|");
 }
 
 function summarizeMatchupOutcome(finalMatchup: Matchup): "win" | "loss" | "tie" {

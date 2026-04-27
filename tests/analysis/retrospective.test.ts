@@ -112,4 +112,46 @@ describe("retrospective scoring", () => {
     expect(message).toContain("Win-odds Brier:");
     expect(message).toContain("SVHD won");
   });
+
+  it("falls back to daily forecasts and dedupes repeated probability calls", () => {
+    const retro = buildRetrospective(finalMatchup, undefined, [
+      {
+        id: 10,
+        timestamp: "2026-04-07 09:00:00",
+        type: "lineup",
+        action: JSON.stringify({
+          routine: "daily_morning",
+          date: "2026-04-07",
+          safe: ["R", "H", "ERA"],
+          swing: ["SVHD"],
+          lost: ["SB"],
+          winProbability: 0.68,
+        }),
+        reasoning: "Morning routine completed for 2026-04-07",
+      },
+      {
+        id: 11,
+        timestamp: "2026-04-07 09:05:00",
+        type: "lineup",
+        action: JSON.stringify({
+          routine: "daily_morning",
+          date: "2026-04-07",
+          safe: ["R", "H", "ERA"],
+          swing: ["SVHD"],
+          lost: ["SB"],
+          winProbability: 0.68,
+        }),
+        reasoning: "Morning routine completed for 2026-04-07",
+      },
+    ]);
+
+    expect(
+      retro.predictions.find((prediction) => prediction.category === "R")?.predictedState,
+    ).toBe("safe");
+    expect(retro.predictions.find((prediction) => prediction.category === "SB")?.predictedState).toBe(
+      "losing",
+    );
+    expect(retro.scorecard.probabilityCalls).toHaveLength(1);
+    expect(retro.scorecard.averageBrierScore).toBeCloseTo((0.68 - 1) ** 2, 5);
+  });
 });

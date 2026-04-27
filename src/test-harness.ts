@@ -1,9 +1,9 @@
-import type { Env, PlayerProjection, Roster } from "./types";
+import type { Env, Roster } from "./types";
 import { YahooClient } from "./yahoo/client";
 import { getValidToken } from "./yahoo/auth";
 import { getTodaysGames, getInjuries } from "./data/mlb";
-import { optimizeLineup } from "./analysis/lineup";
 import { simulateDay, type SimulationResult } from "./simulation";
+import { askLLM } from "./ai/llm";
 
 interface TestResult {
   name: string;
@@ -25,7 +25,7 @@ async function runTest(name: string, fn: () => Promise<string>): Promise<TestRes
 
 export async function runTestSuite(
   env: Env,
-  dryRun: boolean,
+  _dryRun: boolean,
   targetDate?: string,
 ): Promise<Response> {
   const results: TestResult[] = [];
@@ -192,25 +192,26 @@ export async function runTestSuite(
     }),
   );
 
-  // --- 13. Set Lineup (only if ?apply=1) ---
-  if (!dryRun && roster) {
-    results.push(
-      await runTest("SET LINEUP — apply via API (LIVE)", async () => {
-        const games = await getTodaysGames(today);
-        const projMap = new Map<string, PlayerProjection>();
-        const moves = optimizeLineup(roster!, projMap, games);
-        await yahoo.setLineup(today, moves);
-        return `Applied ${moves.length} lineup moves via API for ${today}`;
-      }),
-    );
-  } else {
-    results.push({
-      name: "SET LINEUP — apply to Yahoo",
-      status: "skip",
-      detail: "Skipped (dry run). Use /test?apply=1 to actually set lineup.",
-      duration: 0,
-    });
-  }
+  // --- 13. LLM API Call ---
+  results.push(
+    await runTest("LLM API — OpenRouter connectivity", async () => {
+      if (!env.OPENROUTER_API_KEY && !env.ANTHROPIC_API_KEY) {
+        throw new Error("No LLM API key configured");
+      }
+      const response = await askLLM(env, "You are a test bot.", "Say 'OK' and nothing else.");
+      if (response.includes("LLM unavailable")) {
+        throw new Error(`LLM call failed: ${response}`);
+      }
+      return `LLM responded: "${response.slice(0, 50)}${response.length > 50 ? "..." : ""}"`;
+    }),
+  );
+
+  results.push({
+    name: "YAHOO WRITES — unsupported",
+    status: "skip",
+    detail: "Skipped. This deployment is read-only and lineup or transaction changes must be applied manually in Yahoo.",
+    duration: 0,
+  });
 
   // --- Format response ---
   const passed = results.filter((r) => r.status === "pass").length;
@@ -221,7 +222,7 @@ export async function runTestSuite(
     `FANTASY BASEBALL GM — TEST SUITE`,
     `================================`,
     `${passed} passed, ${failed} failed, ${skipped} skipped`,
-    `Mode: ${dryRun ? "DRY RUN (read-only)" : "LIVE (writes enabled)"}`,
+    `Mode: READ-ONLY ADVISOR`,
     ``,
     ...results.map((r) => {
       const icon = r.status === "pass" ? "PASS" : r.status === "fail" ? "FAIL" : "SKIP";

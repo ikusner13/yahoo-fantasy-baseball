@@ -49,12 +49,18 @@ function classifyTier(
   alert: NewsAlert,
   pickup: PickupRecommendation | undefined,
 ): WatchlistTier {
+  const structured = alert.structured;
+
   if (pickup) {
     const winDelta = pickup.winProbabilityDelta ?? 0;
     const catDelta = pickup.expectedCategoryWinsDelta ?? 0;
+    const structuredBoost =
+      structured?.impactLevel === "high" &&
+      (structured.actionBias === "add" || structured.roleChange === "closer_up");
     if (
       winDelta >= 0.01 ||
       catDelta >= 0.2 ||
+      structuredBoost ||
       (alert.type === "closer_change" && (winDelta >= 0.005 || catDelta >= 0.12))
     ) {
       return "must_add_now";
@@ -62,14 +68,27 @@ function classifyTier(
     return "strong_watch";
   }
 
+  if (
+    structured?.impactLevel === "high" &&
+    (structured.actionBias === "add" || structured.roleChange === "closer_up")
+  ) {
+    return "strong_watch";
+  }
+
   return alert.type === "closer_change" ? "strong_watch" : "monitor";
 }
 
 function buildSummary(
+  alert: NewsAlert,
   player: Player,
   tier: WatchlistTier,
   pickup: PickupRecommendation | undefined,
 ): string {
+  const structuredHint =
+    alert.structured?.summary && alert.structured.summary !== alert.fantasyImpact
+      ? ` ${alert.structured.summary}.`
+      : "";
+
   if (pickup) {
     const delta =
       pickup.winProbabilityDelta != null
@@ -79,12 +98,12 @@ function buildSummary(
       tier === "must_add_now"
         ? `Must add ${player.name} now`
         : `Watch ${player.name} closely`;
-    return `${prefix}: drop ${pickup.drop.name}. ${delta}.`;
+    return `${prefix}: drop ${pickup.drop.name}. ${delta}.${structuredHint}`;
   }
 
   return tier === "strong_watch"
-    ? `${player.name} is worth tracking closely if the role sticks.`
-    : `${player.name} is on the watchlist.`;
+    ? `${player.name} is worth tracking closely if the role sticks.${structuredHint}`
+    : `${player.name} is on the watchlist.${structuredHint}`;
 }
 
 export function buildWatchlistRecommendations(
@@ -106,7 +125,7 @@ export function buildWatchlistRecommendations(
       player,
       tier,
       pickup,
-      summary: buildSummary(player, tier, pickup),
+      summary: buildSummary(alert, player, tier, pickup),
     });
   }
 

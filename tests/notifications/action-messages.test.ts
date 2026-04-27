@@ -37,5 +37,7 @@ describe("formatPickupNotification", () => {
     expect(text).toContain("+4.1pp win odds");
     expect(text).toContain("+0.24 cats");
     expect(text).not.toContain("z |");
+    expect(text).toContain("Manual execution required in Yahoo");
+    expect(text).toContain("Review transactions in Yahoo");
   });
 });

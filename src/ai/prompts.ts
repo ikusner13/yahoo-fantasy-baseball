@@ -83,3 +83,41 @@ export function injuryAssessmentPrompt(briefing: string): LLMPrompt {
     touchpoint: "injury",
   };
 }
+
+// --- Structured News Signals (Qwen 3.5 Flash — typed extraction) ---
+
+export function newsSignalPrompt(briefing: string): LLMPrompt {
+  return {
+    system: `You are classifying fantasy baseball news into structured signals for a stats engine. Use only facts clearly supported by the provided headline/context. If information is unclear, choose the conservative/unknown option and lower confidence. Return JSON with exactly these keys:
+{
+  "impactLevel": "low|medium|high",
+  "roleChange": "closer_up|closer_down|rotation_up|rotation_down|lineup_up|lineup_down|playing_time_up|playing_time_down|none",
+  "expectedAbsence": "none|day_to_day|short_il|long_il|season_risk|unknown",
+  "actionBias": "add|hold|drop|watch|ignore",
+  "playingTimeDelta": "up|down|stable|unclear",
+  "targetCategories": string[],
+  "confidence": number,
+  "summary": string
+}
+Keep targetCategories limited to fantasy baseball categories such as R, H, HR, RBI, SB, TB, OBP, OUT, K, ERA, WHIP, QS, SVHD, SV+H. Summary must be 4-12 words.`,
+    user: briefing,
+    touchpoint: "news",
+  };
+}
+
+// --- Borderline Waiver Review (Qwen 3.5 Flash — approve/reject) ---
+
+export function waiverReviewPrompt(briefing: string): LLMPrompt {
+  return {
+    system: `You are reviewing a borderline fantasy baseball add/drop recommendation. The stats engine already did the math. Your job is not to recalculate projections, but to check whether the move still makes baseball sense given context, role stability, category leverage, and recent lessons. Return JSON with exactly these keys:
+{
+  "verdict": "approve|reject|needs_human",
+  "confidence": number,
+  "summary": string,
+  "riskFlags": string[]
+}
+Approve only when the move is directionally correct despite being marginal. Reject when role/context makes the edge too fragile. Use needs_human when the edge is real but the downside is material. Summary must be one sentence, under 20 words. Risk flags should be short tokens like role_uncertain, ratios_risk, schedule_risk, small_edge, injury_noise, budget_cost.`,
+    user: briefing,
+    touchpoint: "review",
+  };
+}
