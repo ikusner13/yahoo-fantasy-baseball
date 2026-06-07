@@ -1,0 +1,3 @@
+{
+  "ignorePatterns": ["repos/**", "legacy/**", "dist/**", ".alchemy/**"]
+}

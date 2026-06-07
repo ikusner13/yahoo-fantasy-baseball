@@ -12,9 +12,28 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
     "isolatedModules": true,
-    "esModuleInterop": true
+    "esModuleInterop": true,
+    "plugins": [
+      {
+        "name": "@effect/language-service",
+        "diagnostics": true,
+        "refactors": true,
+        "includeSuggestionsInTsc": true,
+        "ignoreEffectSuggestionsInTscExitCode": true,
+        "ignoreEffectWarningsInTscExitCode": false,
+        "diagnosticSeverity": {
+          "globalFetch": "warning",
+          "globalFetchInEffect": "warning",
+          "lazyPromiseInEffectSync": "warning",
+          "missingEffectContext": "error",
+          "missingEffectError": "error",
+          "missingLayerContext": "error"
+        }
+      }
+    ]
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx"],
-  "exclude": ["node_modules", "tests"]
+  "include": ["alchemy.run.ts", "src/**/*.ts", "src/**/*.tsx"],
+  "exclude": ["node_modules", "tests", "repos", "legacy", "dist"]
 }
