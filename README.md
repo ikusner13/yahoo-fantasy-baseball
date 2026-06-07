@@ -2,7 +2,7 @@
 
 An autonomous AI general manager for Yahoo Fantasy Baseball. It monitors your league 24/7, sets optimal lineups, scouts the waiver wire, evaluates trades, tracks injuries, and sends you actionable recommendations via Telegram — all running serverlessly on Cloudflare Workers.
 
-Built for **head-to-head categories** leagues. Every decision is driven by LLM analysis layered on top of real statistical data: rest-of-season projections from FanGraphs, Statcast metrics, pitcher/batter splits, park factors, Vegas run lines, and your current matchup context.
+Built for a **head-to-head categories** league where every category result counts in the season standings. The product goal is not just to win a week as a binary matchup; it is to maximize cumulative category wins and ties across the season. See [docs/league-model.md](docs/league-model.md) for the league rules and rewrite assumptions.
 
 ## How It Works
 
@@ -26,6 +26,27 @@ The GM runs as a Cloudflare Worker with scheduled cron triggers. Each trigger fi
 - **News monitoring** (every 30 min) — player news alerts with deduplication so you don't get spammed
 
 All decisions are logged to a database with reasoning, and the GM runs weekly retrospectives to learn from outcomes.
+
+## League Model
+
+This app is being rewritten around the observed Yahoo league model:
+
+- 12-team H2H categories.
+- Standings are cumulative category results, not weekly matchup wins.
+- Each weekly matchup contributes up to 13 category outcomes to the season record.
+- Scoring categories are `R`, `H`, `HR`, `RBI`, `SB`, `TB`, `OBP`, `OUT`, `K`, `ERA`, `WHIP`, `QS`, and `SV+H`.
+- `H/AB` and `IP` can appear in Yahoo tables but are not scoring categories; `IP` still matters for the 20 IP weekly minimum.
+- The league has a 6-add weekly limit, rolling waiver priority, and 4 IL slots.
+
+The app should optimize for marginal category points. Turning a `4-9` week into `5-8` matters because that extra category win directly improves the standings record.
+
+Current rewrite priorities:
+
+- Treat empty roster spots as urgent category-volume leaks.
+- Use real Yahoo state for weekly adds used and waiver priority.
+- Support add-only recommendations when roster space exists.
+- Separate free-agent adds, waiver claims, add/drops, lineup moves, IL moves, and trades.
+- Weight decisions by category state, games remaining, probable starts, and ratio risk.
 
 ### Telegram Integration
 
@@ -67,14 +88,14 @@ You'll need accounts/keys for the following services:
 | [Telegram Bot](https://core.telegram.org/bots#botfather) | Receiving recommendations                | Message [@BotFather](https://t.me/botfather) on Telegram, send `/newbot` |
 | [OpenRouter](https://openrouter.ai/)                     | LLM API access                           | Sign up, add credits, copy API key                                       |
 
-You'll also need [Node.js](https://nodejs.org/) v20+ and [pnpm](https://pnpm.io/).
+You'll also need [Node.js](https://nodejs.org/) v20+ and [Vite Plus](https://github.com/voidzero-dev/vite-plus).
 
 ### 1. Clone and install
 
 ```sh
 git clone https://github.com/ikusner13/yahoo-fantasy-baseball.git
 cd yahoo-fantasy-baseball
-pnpm install
+vp i
 ```
 
 ### 2. Configure your league
@@ -98,9 +119,9 @@ Edit the `vars` section in `wrangler.jsonc` with your league details:
 ### 3. Create Cloudflare resources
 
 ```sh
-npx wrangler login
-npx wrangler d1 create fantasy-baseball
-npx wrangler kv namespace create KV
+vpx wrangler login
+vpx wrangler d1 create fantasy-baseball
+vpx wrangler kv namespace create KV
 ```
 
 Each command outputs an ID. Update `wrangler.jsonc` with them:
@@ -113,9 +134,9 @@ If you have multiple Cloudflare accounts, set `CLOUDFLARE_ACCOUNT_ID` in a `.env
 ### 4. Set up the database
 
 ```sh
-pnpm db:generate          # generate migration SQL from Drizzle schema
-pnpm db:migrate:local     # test locally
-pnpm db:migrate:remote    # apply to production D1
+vpr db:generate          # generate migration SQL from Drizzle schema
+vpr db:migrate:local     # test locally
+vpr db:migrate:remote    # apply to production D1
 ```
 
 ### 5. Set secrets
@@ -123,24 +144,24 @@ pnpm db:migrate:remote    # apply to production D1
 These are sensitive values that get encrypted on Cloudflare's side. Pipe values with `echo -n` to avoid trailing newline issues:
 
 ```sh
-echo -n "your-yahoo-client-id"     | npx wrangler secret put YAHOO_CLIENT_ID
-echo -n "your-yahoo-client-secret" | npx wrangler secret put YAHOO_CLIENT_SECRET
-echo -n "your-telegram-bot-token"  | npx wrangler secret put TELEGRAM_BOT_TOKEN
-echo -n "your-openrouter-api-key"  | npx wrangler secret put OPENROUTER_API_KEY
+echo -n "your-yahoo-client-id"     | vpx wrangler secret put YAHOO_CLIENT_ID
+echo -n "your-yahoo-client-secret" | vpx wrangler secret put YAHOO_CLIENT_SECRET
+echo -n "your-telegram-bot-token"  | vpx wrangler secret put TELEGRAM_BOT_TOKEN
+echo -n "your-openrouter-api-key"  | vpx wrangler secret put OPENROUTER_API_KEY
 ```
 
 Optional (for direct API access instead of OpenRouter, or for Vegas odds):
 
 ```sh
-echo -n "your-value" | npx wrangler secret put ANTHROPIC_API_KEY
-echo -n "your-value" | npx wrangler secret put OPENAI_API_KEY
-echo -n "your-value" | npx wrangler secret put ODDS_API_KEY
+echo -n "your-value" | vpx wrangler secret put ANTHROPIC_API_KEY
+echo -n "your-value" | vpx wrangler secret put OPENAI_API_KEY
+echo -n "your-value" | vpx wrangler secret put ODDS_API_KEY
 ```
 
 ### 6. Deploy
 
 ```sh
-npx wrangler deploy
+vpx wrangler deploy
 ```
 
 ### 7. Post-deploy setup
@@ -170,7 +191,7 @@ Then send `/status` to your Telegram bot — it should reply **"GM is online"**.
 To watch live logs:
 
 ```sh
-npx wrangler tail
+vpx wrangler tail
 ```
 
 ## Local Development
@@ -185,7 +206,7 @@ OPENROUTER_API_KEY=...
 ```
 
 ```sh
-pnpm dev                  # starts wrangler dev server at localhost:8787
+vpr dev                  # starts wrangler dev server at localhost:8787
 ```
 
 - `http://localhost:8787/health` — health check
@@ -219,15 +240,15 @@ src/
 
 ## Scripts
 
-| Script                   | Description                     |
-| ------------------------ | ------------------------------- |
-| `pnpm dev`               | Local dev server (wrangler dev) |
-| `npx wrangler deploy`    | Deploy to Cloudflare            |
-| `pnpm typecheck`         | TypeScript type checking        |
-| `pnpm test`              | Run tests                       |
-| `pnpm db:generate`       | Generate Drizzle migrations     |
-| `pnpm db:migrate:local`  | Apply migrations locally        |
-| `pnpm db:migrate:remote` | Apply migrations to production  |
+| Script                  | Description                     |
+| ----------------------- | ------------------------------- |
+| `vpr dev`               | Local dev server (wrangler dev) |
+| `vpx wrangler deploy`   | Deploy to Cloudflare            |
+| `vpr typecheck`         | TypeScript type checking        |
+| `vpr test`              | Run tests                       |
+| `vpr db:generate`       | Generate Drizzle migrations     |
+| `vpr db:migrate:local`  | Apply migrations locally        |
+| `vpr db:migrate:remote` | Apply migrations to production  |
 
 ## Tech Stack
 

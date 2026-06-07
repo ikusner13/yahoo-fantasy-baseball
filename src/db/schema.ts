@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, real, index, primaryKey } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 export const playerIds = sqliteTable(
   "player_ids",
@@ -6,11 +6,16 @@ export const playerIds = sqliteTable(
     yahooId: text("yahoo_id").primaryKey(),
     mlbId: integer("mlb_id"),
     fangraphsId: integer("fangraphs_id"),
+    fangraphsKey: text("fangraphs_key"),
     name: text("name").notNull(),
     positions: text("positions"),
     team: text("team"),
   },
-  (t) => [index("idx_player_ids_mlb").on(t.mlbId), index("idx_player_ids_fg").on(t.fangraphsId)],
+  (table) => [
+    index("idx_player_ids_mlb").on(table.mlbId),
+    index("idx_player_ids_fg").on(table.fangraphsId),
+    index("idx_player_ids_fg_key").on(table.fangraphsKey),
+  ],
 );
 
 export const projections = sqliteTable(
@@ -19,7 +24,6 @@ export const projections = sqliteTable(
     yahooId: text("yahoo_id").notNull(),
     season: integer("season").notNull(),
     playerType: text("player_type").notNull(),
-    // batter stats
     pa: integer("pa"),
     r: real("r"),
     h: real("h"),
@@ -28,7 +32,6 @@ export const projections = sqliteTable(
     sb: real("sb"),
     tb: real("tb"),
     obp: real("obp"),
-    // pitcher stats
     ip: real("ip"),
     k: real("k"),
     era: real("era"),
@@ -37,7 +40,7 @@ export const projections = sqliteTable(
     svhd: real("svhd"),
     updatedAt: text("updated_at").notNull(),
   },
-  (t) => [primaryKey({ columns: [t.yahooId, t.season] })],
+  (table) => [primaryKey({ columns: [table.yahooId, table.season] })],
 );
 
 export const decisions = sqliteTable(
@@ -50,7 +53,10 @@ export const decisions = sqliteTable(
     reasoning: text("reasoning"),
     result: text("result").notNull(),
   },
-  (t) => [index("idx_decisions_type").on(t.type), index("idx_decisions_ts").on(t.timestamp)],
+  (table) => [
+    index("idx_decisions_type").on(table.type),
+    index("idx_decisions_ts").on(table.timestamp),
+  ],
 );
 
 export const dailyStats = sqliteTable(
@@ -60,7 +66,7 @@ export const dailyStats = sqliteTable(
     date: text("date").notNull(),
     data: text("data").notNull(),
   },
-  (t) => [primaryKey({ columns: [t.yahooId, t.date] })],
+  (table) => [primaryKey({ columns: [table.yahooId, table.date] })],
 );
 
 export const apiCache = sqliteTable("api_cache", {
@@ -84,7 +90,7 @@ export const feedback = sqliteTable(
     message: text("message").notNull(),
     week: integer("week"),
   },
-  (t) => [index("idx_feedback_week").on(t.week)],
+  (table) => [index("idx_feedback_week").on(table.week)],
 );
 
 export const gmReflections = sqliteTable("gm_reflections", {

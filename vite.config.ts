@@ -2,17 +2,26 @@ import { defineConfig } from "vite-plus";
 
 export default defineConfig({
   build: {
-    ssr: "src/worker.tsx",
+    ssr: "src/worker.ts",
     outDir: "dist",
   },
   ssr: {
     target: "webworker",
   },
   test: {
-    include: ["tests/**/*.test.ts"],
+    include: [
+      "tests/phase0/**/*.test.ts",
+      "tests/phase1/**/*.test.ts",
+      "tests/phase2/**/*.test.ts",
+      "tests/phase3/**/*.test.ts",
+      "tests/phase4/**/*.test.ts",
+    ],
   },
   staged: {
     "*": "vp check --fix",
   },
-  lint: { options: { typeAware: true, typeCheck: true } },
+  lint: {
+    ignorePatterns: ["repos/**", "legacy/**", "dist/**", ".alchemy/**"],
+    options: { typeAware: true, typeCheck: true },
+  },
 });
