@@ -959,6 +959,95 @@ const briefing = Command.make(
   }),
 ).pipe(Command.withDescription("Render the current manager briefing locally or from the Worker"));
 
+const nextDecision = Command.make(
+  "next",
+  {},
+  Effect.fn(function* () {
+    yield* runWithEnv(
+      Effect.gen(function* () {
+        const options = yield* root;
+        const managerBriefing = yield* ManagerBriefing;
+        const report = yield* managerBriefing.currentBriefing;
+        const applyPlan = buildYahooApplyPlan(report);
+        const lineupSteps = applyPlan.steps.filter((step) => step.kind === "lineup");
+        const transaction = applyPlan.transaction;
+        const action =
+          lineupSteps.length > 0
+            ? `Fix lineup only: ${lineupSteps.length} internal move(s), then regenerate.`
+            : transaction != null
+              ? `${transaction.confidence === "act" ? "Make" : "Hold"} ${transaction.type}: add ${transaction.addPlayerName}${transaction.dropPlayerName == null ? "" : `, drop ${transaction.dropPlayerName}`}.`
+              : report.addsRemaining <= 0
+                ? "No transaction: weekly add limit is exhausted."
+                : "No transaction clears the manager bar right now.";
+        const confidence =
+          lineupSteps.length > 0
+            ? "HIGH"
+            : transaction?.confidence === "act"
+              ? "MEDIUM"
+              : transaction != null
+                ? "LOW/HOLD"
+                : "HOLD";
+        const evidence = [
+          `summary: ${report.summary}`,
+          `adds: ${report.addsRemaining} left, ${report.reservedAdds} reserved`,
+          `projected IP: ${report.projectedWeeklyIp.toFixed(1)}`,
+          `closest categories: ${report.closestCategories.join(", ") || "none"}`,
+          ...report.managerTakeaways.slice(0, 4),
+        ];
+        const nextSteps =
+          lineupSteps.length > 0
+            ? [
+                ...lineupSteps.map((step) => step.text),
+                "Save roster changes.",
+                "Run `vpr gm:next` again before considering any transaction.",
+              ]
+            : applyPlan.steps.length > 0
+              ? applyPlan.steps.map((step) => step.text)
+              : ["Do nothing right now; re-check after lineup/status/category context changes."];
+        const blockers = [
+          ...report.addTriggers.filter((line) => line.includes("paused")),
+          ...(report.writeAlerts ?? []),
+          ...report.warnings.slice(0, 2),
+        ];
+        const payload = {
+          generatedAt: report.generatedAt,
+          action,
+          confidence,
+          nextSteps,
+          evidence,
+          blockers,
+        };
+
+        if (options.json) {
+          yield* printJson(payload);
+          return;
+        }
+
+        yield* Console.log("Best current change to improve winning odds");
+        yield* Console.log(`Confidence: ${confidence}`);
+        yield* Console.log(`Action: ${action}`);
+        yield* Console.log("");
+        yield* Console.log("Do this");
+        for (const [index, step] of nextSteps.entries()) {
+          yield* Console.log(`${index + 1}. ${step}`);
+        }
+        yield* Console.log("");
+        yield* Console.log("Evidence");
+        for (const line of evidence) {
+          yield* Console.log(`- ${line}`);
+        }
+        if (blockers.length > 0) {
+          yield* Console.log("");
+          yield* Console.log("Blocked / guardrails");
+          for (const line of blockers) {
+            yield* Console.log(`- ${line}`);
+          }
+        }
+      }),
+    );
+  }),
+).pipe(Command.withDescription("Show one read-only manager decision with confidence and evidence"));
+
 const applyGuardrailLabel = (guardrail: string) => {
   switch (guardrail) {
     case "empty-slot-urgency":
@@ -2030,6 +2119,7 @@ root.pipe(
     pitcherStarts,
     matchup,
     briefing,
+    nextDecision,
     applyPlan,
     applyLineup,
     yahooAuthUrl,
