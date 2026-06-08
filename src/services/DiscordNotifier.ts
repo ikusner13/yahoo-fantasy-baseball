@@ -92,6 +92,7 @@ const managerDecisionLine = (
   lineupMoves: ReadonlyArray<string>,
   actions: ReadonlyArray<ManualAction>,
 ) => {
+  if (briefing.bestAction != null) return briefing.bestAction;
   if (lineupMoves.length > 0) {
     return `Fix lineup only: ${lineupMoves.length} internal move(s), then regenerate before any add/drop.`;
   }
@@ -113,6 +114,11 @@ const managerDecisionLine = (
   return "No add/drop clears the manager bar right now.";
 };
 
+const confidenceLine = (briefing: ManagerBriefingReport) => {
+  if (briefing.decisionConfidence == null) return undefined;
+  return `Confidence: ${briefing.decisionConfidence.toUpperCase()}`;
+};
+
 const normalizeWarning = (warning: string) =>
   warning.includes("manual manager decision")
     ? "Manager decision generated from Yahoo roster, status, lock data, matchup context, and category guardrails."
@@ -131,9 +137,22 @@ export const renderManagerBriefingForDiscord = (briefing: ManagerBriefingReport)
     `Projected weekly IP: ${briefing.projectedWeeklyIp.toFixed(1)}`,
     `Closest categories: ${briefing.closestCategories.join(", ") || "none"}`,
     "",
-    "**Manager decision**",
+    "**Best current action**",
+    ...(confidenceLine(briefing) == null ? [] : [confidenceLine(briefing)!]),
     managerDecisionLine(briefing, lineupMoves, actions),
   ];
+
+  if ((briefing.bestActionSteps?.length ?? 0) > 0) {
+    lines.push(
+      "",
+      "**Do this**",
+      ...briefing.bestActionSteps!.slice(0, 5).map((line) => `- ${line}`),
+    );
+  }
+
+  if ((briefing.decisionEvidence?.length ?? 0) > 0) {
+    lines.push("", "**Why**", ...briefing.decisionEvidence!.slice(0, 5).map((line) => `- ${line}`));
+  }
 
   if (briefing.categorySituations.length > 0) {
     lines.push(
@@ -165,6 +184,14 @@ export const renderManagerBriefingForDiscord = (briefing: ManagerBriefingReport)
 
   if ((briefing.pitcherStarts?.length ?? 0) > 0) {
     lines.push("", "**Pitcher starts**", ...briefing.pitcherStarts!.map((line) => `- ${line}`));
+  }
+
+  if ((briefing.decisionBlockers?.length ?? 0) > 0) {
+    lines.push(
+      "",
+      "**Blockers**",
+      ...briefing.decisionBlockers!.slice(0, 4).map((line) => `- ${line}`),
+    );
   }
 
   if (briefing.doNow.length > 0) {

@@ -59,6 +59,18 @@ export class ManagerBriefingReport extends Schema.Class<ManagerBriefingReport>(
 )({
   summary: Schema.String,
   generatedAt: Schema.String,
+  bestAction: Schema.optional(Schema.String),
+  decisionConfidence: Schema.optional(
+    Schema.Union([
+      Schema.Literal("high"),
+      Schema.Literal("medium"),
+      Schema.Literal("low"),
+      Schema.Literal("hold"),
+    ]),
+  ),
+  bestActionSteps: Schema.optional(Schema.Array(Schema.String)),
+  decisionEvidence: Schema.optional(Schema.Array(Schema.String)),
+  decisionBlockers: Schema.optional(Schema.Array(Schema.String)),
   addsRemaining: Schema.Finite,
   reservedAdds: Schema.Finite,
   projectedWeeklyIp: Schema.Finite,
@@ -629,6 +641,70 @@ const buildSummary = (
   return `No act-now move clears the bar from the current Yahoo setup. ${categoryText}`;
 };
 
+const buildBestDecision = (
+  plan: TransactionPlan,
+  summary: string,
+  lineupAlerts: ReadonlyArray<string>,
+  managerTakeaways: ReadonlyArray<string>,
+  doNow: ReadonlyArray<ManualAction>,
+  holdForLater: ReadonlyArray<ManualAction>,
+  addTriggers: ReadonlyArray<string>,
+  writeAlerts: ReadonlyArray<string>,
+  warnings: ReadonlyArray<string>,
+) => {
+  const lineupMoves = lineupAlerts.filter(isLineupMove);
+  const transactionAction = doNow[0] ?? holdForLater[0];
+  const bestAction =
+    lineupMoves.length > 0
+      ? `Fix lineup only: ${lineupMoves.length} internal move(s), then regenerate.`
+      : transactionAction != null
+        ? transactionAction.confidence === "act"
+          ? transactionAction.action
+          : transactionAction.confidence === "hold"
+            ? `Hold: ${transactionAction.action}`
+            : `Blocked: ${transactionAction.action}`
+        : plan.addsRemaining <= 0
+          ? "No transaction: weekly add limit is exhausted."
+          : "No transaction clears the manager bar right now.";
+  const decisionConfidence =
+    lineupMoves.length > 0
+      ? "high"
+      : transactionAction?.confidence === "act"
+        ? "medium"
+        : transactionAction != null
+          ? "low"
+          : "hold";
+  const bestActionSteps =
+    lineupMoves.length > 0
+      ? [
+          ...lineupMoves,
+          "Save roster changes.",
+          "Regenerate the manager plan before applying any transaction.",
+        ]
+      : transactionAction != null
+        ? transactionAction.yahooSteps
+        : ["Do nothing right now; re-check after lineup/status/category context changes."];
+  const decisionEvidence = [
+    `summary: ${summary}`,
+    `adds: ${plan.addsRemaining} left, ${plan.reservedAdds} reserved`,
+    `projected IP: ${plan.projectedWeeklyIp.toFixed(1)}`,
+    `closest categories: ${plan.closestCategories.join(", ") || "none"}`,
+    ...managerTakeaways.slice(0, 4),
+  ];
+  const decisionBlockers = [
+    ...addTriggers.filter((line) => line.includes("paused")),
+    ...writeAlerts,
+    ...warnings.slice(0, 2),
+  ];
+  return {
+    bestAction,
+    decisionConfidence,
+    bestActionSteps,
+    decisionEvidence,
+    decisionBlockers,
+  } as const;
+};
+
 export const buildManagerBriefing = (
   plan: TransactionPlan,
   lineup?: DailyLineupReport,
@@ -709,10 +785,29 @@ export const buildManagerBriefing = (
   ];
   const lineupAlerts = buildLineupAlerts(plan, lineup);
   const managerTakeaways = buildManagerTakeaways(plan, lineup, writeStatus, doNow, holdForLater);
+  const addTriggers = buildAddTriggers(plan, hasUrgentLineupFix);
+  const writeAlerts = buildWriteAlerts(writeStatus);
+  const summary = buildSummary(plan, doNow, lineup, lineupAlerts);
+  const bestDecision = buildBestDecision(
+    plan,
+    summary,
+    lineupAlerts,
+    managerTakeaways,
+    doNow,
+    holdForLater,
+    addTriggers,
+    writeAlerts,
+    warnings,
+  );
 
   return new ManagerBriefingReport({
-    summary: buildSummary(plan, doNow, lineup, lineupAlerts),
+    summary,
     generatedAt: new Date().toISOString(),
+    bestAction: bestDecision.bestAction,
+    decisionConfidence: bestDecision.decisionConfidence,
+    bestActionSteps: bestDecision.bestActionSteps,
+    decisionEvidence: bestDecision.decisionEvidence,
+    decisionBlockers: bestDecision.decisionBlockers,
     addsRemaining: plan.addsRemaining,
     reservedAdds: plan.reservedAdds,
     projectedWeeklyIp: plan.projectedWeeklyIp,
@@ -721,10 +816,10 @@ export const buildManagerBriefing = (
     categorySituations: plan.categorySituations,
     managerTakeaways,
     categoryPlan: buildCategoryPlan(plan),
-    addTriggers: buildAddTriggers(plan, hasUrgentLineupFix),
+    addTriggers,
     lineupAlerts,
     pitcherStarts: buildPitcherStarts(plan),
-    writeAlerts: buildWriteAlerts(writeStatus),
+    writeAlerts,
     rejectedTransactions: hasUrgentLineupFix ? [] : plan.rejectedTransactions,
     doNow,
     holdForLater,

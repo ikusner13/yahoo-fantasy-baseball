@@ -44,6 +44,17 @@ describe("DiscordNotifier", () => {
       new ManagerBriefingReport({
         summary: "Make the power add; closest categories are HR, RBI.",
         generatedAt: "2026-06-06T18:00:00.000Z",
+        bestAction: "Add Power Bat into the open active slot",
+        decisionConfidence: "medium",
+        bestActionSteps: [
+          "Search for Power Bat.",
+          "Use Add for the free-agent move selected by the manager.",
+          "Save the selected move, then regenerate the manager plan.",
+        ],
+        decisionEvidence: [
+          "summary: Make the power add; closest categories are HR, RBI.",
+          "adds: 4 left, 2 reserved",
+        ],
         addsRemaining: 4,
         reservedAdds: 2,
         projectedWeeklyIp: 24.2,
@@ -93,8 +104,13 @@ describe("DiscordNotifier", () => {
     expect(message).toContain("Today MLB games: 4/15 not started");
     expect(message).toContain("last Sat, 10:10 PM EDT");
     expect(message).toContain("Adds remaining: 4");
-    expect(message).toContain("**Manager decision**");
+    expect(message).toContain("**Best current action**");
+    expect(message).toContain("Confidence: MEDIUM");
     expect(message).toContain("Add Power Bat into the open active slot");
+    expect(message).toContain("**Do this**");
+    expect(message).toContain("- Search for Power Bat.");
+    expect(message).toContain("**Why**");
+    expect(message).toContain("adds: 4 left, 2 reserved");
     expect(message).toContain("W HR: 7-6");
     expect(message).toContain("T RBI: 21-21");
     expect(message).toContain("**Manager read**");

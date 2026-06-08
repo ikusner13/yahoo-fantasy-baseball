@@ -95,6 +95,7 @@ const managerDecisionLine = (
   lineupMoves: ReadonlyArray<string>,
   actions: ReadonlyArray<ManagerBriefingReport["doNow"][number]>,
 ) => {
+  if (briefing.bestAction != null) return briefing.bestAction;
   if (lineupMoves.length > 0) {
     return `Fix lineup only: ${lineupMoves.length} internal move(s), then regenerate before any add/drop.`;
   }
@@ -114,6 +115,15 @@ const managerDecisionLine = (
     return `No add/drop clears the manager bar; protect ${briefing.closestCategories.slice(0, 3).join(", ")}.`;
   }
   return "No add/drop clears the manager bar right now.";
+};
+
+const confidenceLabel = (briefing: ManagerBriefingReport) => {
+  const confidence = briefing.decisionConfidence;
+  if (confidence == null) return undefined;
+  if (confidence === "high") return "HIGH";
+  if (confidence === "medium") return "MEDIUM";
+  if (confidence === "low") return "LOW";
+  return "HOLD";
 };
 
 const normalizeWarning = (warning: string) =>
@@ -148,9 +158,22 @@ export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport
     `⚾ IP: ${briefing.projectedWeeklyIp.toFixed(1)}`,
     `🎯 Closest: ${briefing.closestCategories.join(", ") || "none"}`,
     "",
-    "✅ Manager Decision",
+    "✅ Best Current Action",
+    ...(confidenceLabel(briefing) == null ? [] : [`Confidence: ${confidenceLabel(briefing)}`]),
     managerDecisionLine(briefing, lineupMoves, actions),
   ];
+
+  if ((briefing.bestActionSteps?.length ?? 0) > 0) {
+    lines.push(
+      "",
+      "🧾 Do This",
+      ...briefing.bestActionSteps!.slice(0, 5).map((line) => `• ${line}`),
+    );
+  }
+
+  if ((briefing.decisionEvidence?.length ?? 0) > 0) {
+    lines.push("", "🔎 Why", ...briefing.decisionEvidence!.slice(0, 5).map((line) => `• ${line}`));
+  }
 
   if (briefing.managerTakeaways.length > 0) {
     lines.push(
@@ -182,6 +205,14 @@ export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport
       "",
       "🔐 Yahoo Writes",
       ...briefing.writeAlerts!.slice(0, 2).map((line) => `• ${line}`),
+    );
+  }
+
+  if ((briefing.decisionBlockers?.length ?? 0) > 0) {
+    lines.push(
+      "",
+      "🧱 Blockers",
+      ...briefing.decisionBlockers!.slice(0, 4).map((line) => `• ${line}`),
     );
   }
 

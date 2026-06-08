@@ -574,6 +574,16 @@ describe("ManagerBriefing Phase 4", () => {
 
     const alerts = briefing.lineupAlerts.join(" ");
     expect(briefing.summary).toContain("1 internal lineup move");
+    expect(briefing.bestAction).toBe("Fix lineup only: 1 internal move(s), then regenerate.");
+    expect(briefing.decisionConfidence).toBe("high");
+    expect(briefing.bestActionSteps).toContain(
+      "Swap Bench Catcher into C and move Injured Catcher to IL (IL10).",
+    );
+    expect(briefing.bestActionSteps).toContain(
+      "Regenerate the manager plan before applying any transaction.",
+    );
+    expect(briefing.decisionEvidence?.join(" ")).toContain("adds: 6 left, 0 reserved");
+    expect(briefing.decisionBlockers?.join(" ")).toContain("Transactions are paused");
     expect(alerts).toContain("Swap Bench Catcher into C and move Injured Catcher to IL");
     expect(alerts).not.toContain("Move Injured Catcher from C to IL");
     expect(alerts).not.toContain("Replace Injured Catcher at C with Bench Catcher");

@@ -41,6 +41,20 @@ describe("TelegramNotifier", () => {
       new ManagerBriefingReport({
         summary: "Lineup fix first; next add targets SB and OBP.",
         generatedAt: "2026-06-06T18:00:00.000Z",
+        bestAction: "Fix lineup only: 1 internal move(s), then regenerate.",
+        decisionConfidence: "high",
+        bestActionSteps: [
+          "Move Injured Catcher from C to IL (IL10).",
+          "Save roster changes.",
+          "Regenerate the manager plan before applying any transaction.",
+        ],
+        decisionEvidence: [
+          "summary: Lineup fix first; next add targets SB and OBP.",
+          "adds: 2 left, 0 reserved",
+        ],
+        decisionBlockers: [
+          "Transactions are paused until the listed lineup/IL moves are saved and the manager plan is regenerated.",
+        ],
         addsRemaining: 2,
         reservedAdds: 0,
         projectedWeeklyIp: 21,
@@ -99,8 +113,13 @@ describe("TelegramNotifier", () => {
     expect(message).toContain("first Jun 6, 1:05 PM EDT");
     expect(message).toContain("➕ Adds: 2 left (0 reserved)");
     expect(message).toContain("🎯 Closest: SB, OBP");
-    expect(message).toContain("✅ Manager Decision");
+    expect(message).toContain("✅ Best Current Action");
+    expect(message).toContain("Confidence: HIGH");
     expect(message).toContain("Fix lineup only: 1 internal move(s), then regenerate");
+    expect(message).toContain("🧾 Do This");
+    expect(message).toContain("• Move Injured Catcher from C to IL");
+    expect(message).toContain("🔎 Why");
+    expect(message).toContain("adds: 2 left, 0 reserved");
     expect(message).toContain("🧠 Manager Read");
     expect(message).toContain("Lineup first");
     expect(message).toContain("🧭 Add Triggers");
