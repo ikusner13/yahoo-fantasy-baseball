@@ -115,6 +115,7 @@ const testLayer = WeeklyProjections.layerLive.pipe(
           getLeagueSettings: Effect.die("unused"),
           getTeamMetadata: Effect.die("unused"),
           getRoster: Effect.die("unused"),
+          getRosterForDate: () => Effect.die("unused"),
           getCurrentMatchup: Effect.die("unused"),
           getLeagueStandings: Effect.die("unused"),
           getRosterForTeam: () =>
@@ -122,6 +123,7 @@ const testLayer = WeeklyProjections.layerLive.pipe(
           getAvailablePlayers: () =>
             Effect.succeed(freeAgentPayload([yahooPlayer("mlb.p.3", freeAgentName, "LAD")])),
           getLeagueTransactions: () => Effect.die("unused"),
+          putRosterPositions: () => Effect.die("unused"),
         }),
       ),
       Layer.succeed(

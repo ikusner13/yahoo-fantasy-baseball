@@ -1,5 +1,5 @@
 import type { KVNamespaceClient } from "alchemy/Cloudflare";
-import { RuntimeContext, type BaseRuntimeContext } from "alchemy";
+import type { BaseRuntimeContext } from "alchemy";
 import * as Config from "effect/Config";
 import * as Context from "effect/Context";
 import * as Data from "effect/Data";
@@ -13,6 +13,7 @@ const AUTH_URL = "https://api.login.yahoo.com/oauth2/request_auth";
 const TOKEN_URL = "https://api.login.yahoo.com/oauth2/get_token";
 const TOKEN_STORE_KEY = "yahoo-oauth-tokens";
 const EXPIRY_BUFFER_MS = 60_000;
+const FANTASY_READ_WRITE_SCOPE = "fspt-w";
 
 export class YahooOAuthError extends Data.TaggedError("YahooOAuthError")<{
   readonly message: string;
@@ -115,30 +116,40 @@ const tokenRequest = (
 export const kvYahooTokenStore = (
   kv: KVNamespaceClient,
   runtimeContext: BaseRuntimeContext,
-): YahooTokenStore => ({
-  get: kv.get<unknown>(TOKEN_STORE_KEY, "json").pipe(
-    Effect.provideService(RuntimeContext, runtimeContext),
-    Effect.mapError(
-      (cause) =>
-        new YahooOAuthError({
-          message: `Failed to read Yahoo OAuth tokens: ${cause.message}`,
-        }),
-    ),
-    Effect.flatMap((tokens) =>
-      tokens == null ? Effect.succeed(null) : decodeStoredTokens(tokens),
-    ),
-  ),
-  put: (tokens) =>
-    kv.put(TOKEN_STORE_KEY, JSON.stringify(tokens)).pipe(
-      Effect.provideService(RuntimeContext, runtimeContext),
-      Effect.mapError(
-        (cause) =>
-          new YahooOAuthError({
-            message: `Failed to write Yahoo OAuth tokens: ${cause.message}`,
-          }),
-      ),
-    ),
-});
+): YahooTokenStore => {
+  const runtimeContextTag = Effect.promise(() =>
+    import("alchemy").then((alchemy) => alchemy.RuntimeContext),
+  );
+  return {
+    get: Effect.gen(function* () {
+      const tag = yield* runtimeContextTag;
+      const tokens = yield* kv.get<unknown>(TOKEN_STORE_KEY, "json").pipe(
+        Effect.provideService(tag, runtimeContext),
+        Effect.mapError(
+          (cause) =>
+            new YahooOAuthError({
+              message: `Failed to read Yahoo OAuth tokens: ${cause.message}`,
+            }),
+        ),
+      );
+      if (tokens == null) return null;
+      return yield* decodeStoredTokens(tokens);
+    }),
+    put: (tokens) =>
+      Effect.gen(function* () {
+        const tag = yield* runtimeContextTag;
+        yield* kv.put(TOKEN_STORE_KEY, JSON.stringify(tokens)).pipe(
+          Effect.provideService(tag, runtimeContext),
+          Effect.mapError(
+            (cause) =>
+              new YahooOAuthError({
+                message: `Failed to write Yahoo OAuth tokens: ${cause.message}`,
+              }),
+          ),
+        );
+      }),
+  };
+};
 
 export const memoryYahooTokenStore = (initial?: YahooStoredTokens): YahooTokenStore => {
   let current: YahooStoredTokens | null = initial ?? null;
@@ -155,6 +166,7 @@ export class YahooOAuth extends Context.Service<
   YahooOAuth,
   {
     readonly authorizationUrl: (redirectUri: string) => string;
+    readonly authorizationUrlWithState: (redirectUri: string, state: string) => string;
     readonly exchangeAuthorizationCode: (
       code: string,
       redirectUri: string,
@@ -190,14 +202,17 @@ export const makeYahooOAuth = (
 ): Context.Service.Shape<typeof YahooOAuth> => {
   const persist = (tokens: YahooStoredTokens) => tokenStore.put(tokens).pipe(Effect.as(tokens));
 
-  const authorizationUrl = (redirectUri: string) => {
+  const authorizationUrlWithState = (redirectUri: string, state?: string) => {
     const params = new URLSearchParams({
       client_id: config.clientId,
       redirect_uri: redirectUri,
       response_type: "code",
+      scope: FANTASY_READ_WRITE_SCOPE,
     });
+    if (state != null && state !== "") params.set("state", state);
     return `${AUTH_URL}?${params.toString()}`;
   };
+  const authorizationUrl = (redirectUri: string) => authorizationUrlWithState(redirectUri);
 
   const exchangeAuthorizationCode = (code: string, redirectUri: string) =>
     tokenRequest(httpClient, config, {
@@ -235,6 +250,7 @@ export const makeYahooOAuth = (
 
   return {
     authorizationUrl,
+    authorizationUrlWithState,
     exchangeAuthorizationCode,
     refresh,
     getAccessToken,

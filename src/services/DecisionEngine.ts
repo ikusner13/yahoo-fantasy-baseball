@@ -23,8 +23,8 @@ import {
 import { WeeklyProjections, WeeklyProjectionsError } from "./WeeklyProjections.ts";
 import { type YahooApiError } from "./YahooClient.ts";
 
-const SIMULATION_COUNT = 400;
-const MAX_SIMULATED_ADD_CANDIDATES = 24;
+export const PRODUCTION_SIMULATION_COUNT = 5_000;
+export const MAX_SIMULATED_ADD_CANDIDATES = 6;
 const WEEKLY_WEIGHT_ALPHA = 0.75;
 const TEAM_SEASON_OBP_DENOMINATOR = 6500;
 const TEAM_SEASON_IP = 1400;
@@ -51,7 +51,10 @@ const CATEGORIES = [
 type Category = (typeof CATEGORIES)[number];
 type WeeklyLine = WeeklyBatterLine | WeeklyPitcherLine;
 
+const SUPPORTED_CATEGORIES = new Set<string>(CATEGORIES);
 const LOWER_IS_BETTER = new Set<Category>(["ERA", "WHIP"]);
+const BATTER_CATEGORIES = new Set<Category>(["R", "H", "HR", "RBI", "SB", "TB", "OBP"]);
+const PITCHER_CATEGORIES = new Set<Category>(["OUT", "K", "ERA", "WHIP", "QS", "SV+H"]);
 
 const SGP_DENOMINATORS: Record<Category, number> = {
   R: 35,
@@ -129,6 +132,9 @@ export class MatchupSimulation extends Schema.Class<MatchupSimulation>("MatchupS
 export class DecisionReport extends Schema.Class<DecisionReport>("DecisionReport")({
   baseline: MatchupSimulation,
   scout: OpponentScout,
+  sgpDenominatorSource: Schema.optional(
+    Schema.Union([Schema.Literal("standings-history"), Schema.Literal("fallback")]),
+  ),
   recommendations: Schema.Array(AddRecommendation),
   lineupRecommendations: Schema.Array(LineupRecommendation),
 }) {}
@@ -152,6 +158,13 @@ type Totals = {
 };
 
 type MatchupSample = Record<Category, number>;
+
+const isCategory = (category: string): category is Category => SUPPORTED_CATEGORIES.has(category);
+
+const scoringCategoriesForSnapshot = (snapshot: LeagueStateSnapshot | undefined) => {
+  const scoringCategories = snapshot?.scoringCategories.filter(isCategory) ?? [];
+  return scoringCategories.length > 0 ? scoringCategories : [...CATEGORIES];
+};
 
 const emptyTotals = (): Totals => ({
   R: 0,
@@ -288,21 +301,31 @@ export const computeSgpDenominators = (standingsHistory: ReadonlyArray<StandingC
   return denominators;
 };
 
+const hasUsableSgpHistory = (standingsHistory: ReadonlyArray<StandingCategoryTotal>) =>
+  CATEGORIES.some((category) => {
+    const pointCount = standingsHistory.reduce(
+      (count, entry) => count + (entry.categories[category] == null ? 0 : 1),
+      0,
+    );
+    return pointCount >= 2;
+  });
+
 export const simulateMatchup = (
   myRoster: ReadonlyArray<WeeklyLine>,
   opponentRoster: ReadonlyArray<WeeklyLine>,
-  iterations = SIMULATION_COUNT,
+  iterations = PRODUCTION_SIMULATION_COUNT,
   seed = 62744,
+  scoringCategories: ReadonlyArray<Category> = CATEGORIES,
 ) => {
   const random = createRandom(seed);
   const results = new Map<Category, { wins: number; ties: number }>(
-    CATEGORIES.map((category) => [category, { wins: 0, ties: 0 }]),
+    scoringCategories.map((category) => [category, { wins: 0, ties: 0 }]),
   );
 
   for (let index = 0; index < iterations; index += 1) {
     const mine = sampleTeam(myRoster, random);
     const opponent = sampleTeam(opponentRoster, random);
-    for (const category of CATEGORIES) {
+    for (const category of scoringCategories) {
       const myValue = mine[category];
       const opponentValue = opponent[category];
       const result = results.get(category);
@@ -317,7 +340,7 @@ export const simulateMatchup = (
     }
   }
 
-  const categories = CATEGORIES.map((category) => {
+  const categories = scoringCategories.map((category) => {
     const result = results.get(category) ?? { wins: 0, ties: 0 };
     const winProbability = result.wins / iterations;
     const tieProbability = result.ties / iterations;
@@ -380,20 +403,21 @@ const categorySgpValue = (
 ) => {
   const values = toCategoryValues(totals);
   const denominator = denominators[category];
+  const weight = weights[category] ?? 0;
   if (category === "OBP") {
     const impact =
       ((values.OBP - LEAGUE_AVG_OBP) * totals.obpDenominator) / TEAM_SEASON_OBP_DENOMINATOR;
-    return (impact / denominator) * weights[category];
+    return (impact / denominator) * weight;
   }
   if (category === "ERA") {
     const impact = ((LEAGUE_AVG_ERA - values.ERA) * totals.ip) / TEAM_SEASON_IP;
-    return (impact / denominator) * weights[category];
+    return (impact / denominator) * weight;
   }
   if (category === "WHIP") {
     const impact = ((LEAGUE_AVG_WHIP - values.WHIP) * totals.ip) / TEAM_SEASON_IP;
-    return (impact / denominator) * weights[category];
+    return (impact / denominator) * weight;
   }
-  return (values[category] / denominator) * weights[category];
+  return (values[category] / denominator) * weight;
 };
 
 const categoryDelta = (
@@ -402,12 +426,19 @@ const categoryDelta = (
   candidate: WeeklyLine,
   denominators: Record<Category, number>,
   weights: Record<Category, number>,
+  scoringCategories: ReadonlySet<Category>,
 ) => {
   const beforeByCategory = new Map(
     before.categories.map((category) => [category.category, category]),
   );
   const candidateTotals = expectedTotals([candidate]);
+  const applicableCategories = candidate.kind === "batter" ? BATTER_CATEGORIES : PITCHER_CATEGORIES;
   return after.categories
+    .filter(
+      (category) =>
+        applicableCategories.has(category.category as Category) &&
+        scoringCategories.has(category.category as Category),
+    )
     .map((category) => {
       const name = category.category as Category;
       const weeklyDelta =
@@ -420,8 +451,11 @@ const categoryDelta = (
         seasonSgpDelta,
       });
     })
-    .filter((delta) => Math.abs(delta.weeklyDelta) > 0.01 || Math.abs(delta.seasonSgpDelta) > 0.01)
-    .sort((a, b) => Math.abs(b.weeklyDelta) - Math.abs(a.weeklyDelta))
+    .filter((delta) => delta.weeklyDelta > 0.01 || delta.seasonSgpDelta > 0.01)
+    .sort(
+      (a, b) =>
+        Math.max(b.weeklyDelta, b.seasonSgpDelta) - Math.max(a.weeklyDelta, a.seasonSgpDelta),
+    )
     .slice(0, 5);
 };
 
@@ -440,6 +474,26 @@ const isPitcherSlot = (slot: RosterSlotCount) => ["P", "SP", "RP"].includes(slot
 
 const isActive = (player: LeagueStatePlayer | undefined) =>
   player != null && !["BN", "IL", "IL+", "NA"].includes(player.selectedPosition);
+
+const isHardUnavailableStatus = (status: string | undefined) =>
+  status != null && (status.startsWith("IL") || status === "NA" || status === "O");
+
+const isStartableReserve = (player: LeagueStatePlayer | undefined) =>
+  player != null && player.selectedPosition === "BN" && !isHardUnavailableStatus(player.status);
+
+const canFillSelectedPosition = (
+  player: LeagueStatePlayer | undefined,
+  selectedPosition: string,
+  kind: WeeklyLine["kind"],
+) => {
+  if (player == null) return false;
+  if (kind === "batter") {
+    if (selectedPosition === "Util") return true;
+    return player.eligiblePositions.includes(selectedPosition);
+  }
+  if (selectedPosition === "P") return true;
+  return player.eligiblePositions.includes(selectedPosition);
+};
 
 export const activeWeeklyLines = (
   lines: ReadonlyArray<WeeklyLine>,
@@ -465,6 +519,8 @@ export const optimizeLineup = (
   denominators: Record<Category, number> = SGP_DENOMINATORS,
 ) => {
   const weights = categoryWeightsFromScout(baseline);
+  const scoringCategorySet = new Set(scoringCategoriesForSnapshot(snapshot));
+  const rosterByKey = new Map(snapshot?.roster.map((player) => [player.playerKey, player]) ?? []);
   const currentActive = new Set(
     snapshot?.roster.filter((player) => isActive(player)).map((player) => player.playerKey) ?? [],
   );
@@ -478,16 +534,31 @@ export const optimizeLineup = (
       .map((line) => ({ line, score: lineScore(line, denominators, weights) }))
       .sort((a, b) => b.score - a.score);
     const shouldStart = new Set(ranked.slice(0, activeCount).map((entry) => entry.line.playerKey));
-    const currentStarters = ranked.filter((entry) => currentActive.has(entry.line.playerKey));
-    const currentBench = ranked.filter((entry) => !currentActive.has(entry.line.playerKey));
-    return currentBench.flatMap((bench) => {
-      if (!shouldStart.has(bench.line.playerKey)) return [];
-      const sit = currentStarters
-        .filter((starter) => !shouldStart.has(starter.line.playerKey))
-        .sort((a, b) => a.score - b.score)[0];
+    const sitCandidates = ranked
+      .filter(
+        (entry) =>
+          currentActive.has(entry.line.playerKey) && !shouldStart.has(entry.line.playerKey),
+      )
+      .sort((a, b) => a.score - b.score);
+    const startCandidates = ranked.filter(
+      (entry) =>
+        !currentActive.has(entry.line.playerKey) &&
+        shouldStart.has(entry.line.playerKey) &&
+        (snapshot == null || isStartableReserve(rosterByKey.get(entry.line.playerKey))),
+    );
+    const usedSitKeys = new Set<string>();
+    return startCandidates.flatMap((bench) => {
+      const benchPlayer = rosterByKey.get(bench.line.playerKey);
+      const sit = sitCandidates.find((candidate) => {
+        if (usedSitKeys.has(candidate.line.playerKey)) return false;
+        const sitPlayer = rosterByKey.get(candidate.line.playerKey);
+        if (snapshot == null) return true;
+        return canFillSelectedPosition(benchPlayer, sitPlayer?.selectedPosition ?? "", kind);
+      });
       if (sit == null) return [];
       const scoreDelta = bench.score - sit.score;
       if (scoreDelta <= 0) return [];
+      usedSitKeys.add(sit.line.playerKey);
       return [
         new LineupRecommendation({
           type: "lineup",
@@ -496,7 +567,13 @@ export const optimizeLineup = (
           sitPlayerKey: sit.line.playerKey,
           sitPlayerName: sit.line.name,
           scoreDelta,
-          affectedCategories: categoryLineDeltas(bench.line, sit.line, denominators, weights),
+          affectedCategories: categoryLineDeltas(
+            bench.line,
+            sit.line,
+            denominators,
+            weights,
+            scoringCategorySet,
+          ),
         }),
       ];
     });
@@ -511,21 +588,26 @@ const categoryLineDeltas = (
   remove: WeeklyLine,
   denominators: Record<Category, number>,
   weights: Record<Category, number>,
+  scoringCategories: ReadonlySet<Category> = new Set(CATEGORIES),
 ) => {
   const addTotals = expectedTotals([add]);
   const removeTotals = expectedTotals([remove]);
-  return CATEGORIES.map((category) => {
-    const seasonSgpDelta =
-      categorySgpValue(category, addTotals, denominators, weights) -
-      categorySgpValue(category, removeTotals, denominators, weights);
-    return new CategoryDelta({
-      category,
-      weeklyDelta: seasonSgpDelta,
-      seasonSgpDelta,
-    });
-  })
-    .filter((delta) => Math.abs(delta.weeklyDelta) > 0.01 || Math.abs(delta.seasonSgpDelta) > 0.01)
-    .sort((a, b) => Math.abs(b.weeklyDelta) - Math.abs(a.weeklyDelta))
+  return [...scoringCategories]
+    .map((category) => {
+      const seasonSgpDelta =
+        categorySgpValue(category, addTotals, denominators, weights) -
+        categorySgpValue(category, removeTotals, denominators, weights);
+      return new CategoryDelta({
+        category,
+        weeklyDelta: seasonSgpDelta,
+        seasonSgpDelta,
+      });
+    })
+    .filter((delta) => delta.weeklyDelta > 0.01 || delta.seasonSgpDelta > 0.01)
+    .sort(
+      (a, b) =>
+        Math.max(b.weeklyDelta, b.seasonSgpDelta) - Math.max(a.weeklyDelta, a.seasonSgpDelta),
+    )
     .slice(0, 5);
 };
 
@@ -534,8 +616,16 @@ export const rankAddCandidates = (
   snapshot?: LeagueStateSnapshot,
   standingsHistory: ReadonlyArray<StandingCategoryTotal> = [],
 ) => {
+  const scoringCategories = scoringCategoriesForSnapshot(snapshot);
+  const scoringCategorySet = new Set(scoringCategories);
   const scoringRoster = activeWeeklyLines(set.myRoster, snapshot);
-  const baseline = simulateMatchup(scoringRoster, set.opponentRoster);
+  const baseline = simulateMatchup(
+    scoringRoster,
+    set.opponentRoster,
+    undefined,
+    62744,
+    scoringCategories,
+  );
   const scout = scoutOpponent(baseline);
   const weights = scout.categoryWeights as Record<Category, number>;
   const denominators = computeSgpDenominators(standingsHistory);
@@ -548,10 +638,19 @@ export const rankAddCandidates = (
     .slice(0, MAX_SIMULATED_ADD_CANDIDATES);
   const recommendations = candidates
     .map(({ candidate, seasonSgpDelta }) => {
-      const after = simulateMatchup([...scoringRoster, candidate], set.opponentRoster);
+      const after = simulateMatchup(
+        [...scoringRoster, candidate],
+        set.opponentRoster,
+        undefined,
+        62744,
+        scoringCategories,
+      );
       const weeklyDelta = after.categories.reduce((sum, category) => {
-        const before = baseline.categories.find((entry) => entry.category === category.category);
         const name = category.category as Category;
+        const applicableCategories =
+          candidate.kind === "batter" ? BATTER_CATEGORIES : PITCHER_CATEGORIES;
+        if (!applicableCategories.has(name) || !scoringCategorySet.has(name)) return sum;
+        const before = baseline.categories.find((entry) => entry.category === category.category);
         return sum + (category.expectedPoints - (before?.expectedPoints ?? 0)) * weights[name];
       }, 0);
       const score = WEEKLY_WEIGHT_ALPHA * weeklyDelta + (1 - WEEKLY_WEIGHT_ALPHA) * seasonSgpDelta;
@@ -562,7 +661,14 @@ export const rankAddCandidates = (
         score,
         weeklyDelta,
         seasonSgpDelta,
-        affectedCategories: categoryDelta(baseline, after, candidate, denominators, weights),
+        affectedCategories: categoryDelta(
+          baseline,
+          after,
+          candidate,
+          denominators,
+          weights,
+          scoringCategorySet,
+        ),
       });
     })
     .sort((a, b) => b.score - a.score);
@@ -570,6 +676,7 @@ export const rankAddCandidates = (
   return new DecisionReport({
     baseline,
     scout,
+    sgpDenominatorSource: hasUsableSgpHistory(standingsHistory) ? "standings-history" : "fallback",
     recommendations,
     lineupRecommendations: optimizeLineup(set, baseline, snapshot, denominators),
   });

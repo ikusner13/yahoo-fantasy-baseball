@@ -2,7 +2,9 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   computeSgpDenominators,
+  MAX_SIMULATED_ADD_CANDIDATES,
   optimizeLineup,
+  PRODUCTION_SIMULATION_COUNT,
   rankAddCandidates,
   simulateMatchup,
 } from "../../src/services/DecisionEngine";
@@ -55,6 +57,14 @@ const pitcher = (overrides: Partial<ConstructorParameters<typeof WeeklyPitcherLi
   });
 
 describe("DecisionEngine Phase 3", () => {
+  it("uses a research-backed production Monte Carlo floor", () => {
+    expect(PRODUCTION_SIMULATION_COUNT).toBeGreaterThanOrEqual(5000);
+  });
+
+  it("keeps add-candidate simulation breadth within Worker CPU limits", () => {
+    expect(MAX_SIMULATED_ADD_CANDIDATES).toBeLessThanOrEqual(8);
+  });
+
   it("computes SGP denominators as standings-history slopes", () => {
     const denominators = computeSgpDenominators([
       { teamKey: "1", rank: 1, categories: { HR: 240 } },
@@ -64,6 +74,35 @@ describe("DecisionEngine Phase 3", () => {
     ]);
 
     expect(denominators.HR).toBe(15);
+  });
+
+  it("marks season SGP as fallback when standings history cannot calibrate denominators", () => {
+    const report = rankAddCandidates(
+      new WeeklyProjectionSet({
+        myRoster: [batter({ playerKey: "my-batter", hr: 1 })],
+        opponentRoster: [batter({ playerKey: "opp-batter", hr: 2 })],
+        freeAgents: [batter({ playerKey: "power-bat", name: "Power Bat", hr: 4 })],
+      }),
+    );
+
+    expect(report.sgpDenominatorSource).toBe("fallback");
+  });
+
+  it("marks season SGP as standings-history calibrated when Yahoo history has usable slopes", () => {
+    const report = rankAddCandidates(
+      new WeeklyProjectionSet({
+        myRoster: [batter({ playerKey: "my-batter", hr: 1 })],
+        opponentRoster: [batter({ playerKey: "opp-batter", hr: 2 })],
+        freeAgents: [batter({ playerKey: "power-bat", name: "Power Bat", hr: 4 })],
+      }),
+      undefined,
+      [
+        { teamKey: "1", rank: 1, categories: { HR: 240 } },
+        { teamKey: "2", rank: 2, categories: { HR: 225 } },
+      ],
+    );
+
+    expect(report.sgpDenominatorSource).toBe("standings-history");
   });
 
   it("simulates category probabilities against the real opponent projection set", () => {
@@ -77,6 +116,14 @@ describe("DecisionEngine Phase 3", () => {
     const hr = result.categories.find((category) => category.category === "HR");
     expect(hr?.winProbability).toBeGreaterThan(0.95);
     expect(hr?.tag).toBe("lock");
+  });
+
+  it("scores this league as cumulative category points instead of a binary weekly result", () => {
+    const result = simulateMatchup([], [], 100, 1);
+
+    expect(result.categories).toHaveLength(13);
+    expect(result.categories.every((category) => category.tieProbability === 1)).toBe(true);
+    expect(result.expectedCategoryPoints).toBe(6.5);
   });
 
   it("uses OBP numerator and denominator instead of hits or plate appearances", () => {
@@ -150,6 +197,108 @@ describe("DecisionEngine Phase 3", () => {
     });
     expect(report.recommendations[0]?.weeklyDelta).toBeGreaterThan(0);
     expect(report.recommendations[0]?.affectedCategories.length).toBeGreaterThan(0);
+  });
+
+  it("does not attribute pitching category impact to hitter adds", () => {
+    const report = rankAddCandidates(
+      new WeeklyProjectionSet({
+        myRoster: [batter({ playerKey: "my-batter", hr: 1 })],
+        opponentRoster: [
+          batter({ playerKey: "opp-batter", hr: 3 }),
+          pitcher({ playerKey: "opp-pitcher" }),
+        ],
+        freeAgents: [batter({ playerKey: "hitter-add", name: "Hitter Add", hr: 4, rbi: 8 })],
+      }),
+    );
+
+    const affected = new Set(
+      report.recommendations[0]?.affectedCategories.map((delta) => delta.category) ?? [],
+    );
+
+    for (const category of ["OUT", "K", "ERA", "WHIP", "QS", "SV+H"]) {
+      expect(affected.has(category)).toBe(false);
+    }
+  });
+
+  it("does not attribute batting category impact to pitcher adds", () => {
+    const report = rankAddCandidates(
+      new WeeklyProjectionSet({
+        myRoster: [pitcher({ playerKey: "my-pitcher", k: 3, out: 12 })],
+        opponentRoster: [
+          batter({ playerKey: "opp-batter", hr: 3 }),
+          pitcher({ playerKey: "opp-pitcher" }),
+        ],
+        freeAgents: [pitcher({ playerKey: "pitcher-add", name: "Pitcher Add", k: 12, out: 30 })],
+      }),
+    );
+
+    const affected = new Set(
+      report.recommendations[0]?.affectedCategories.map((delta) => delta.category) ?? [],
+    );
+
+    for (const category of ["R", "H", "HR", "RBI", "SB", "TB", "OBP"]) {
+      expect(affected.has(category)).toBe(false);
+    }
+  });
+
+  it("uses Yahoo scoring categories instead of exposing unsupported category constants", () => {
+    const snapshot = new LeagueStateSnapshot({
+      leagueId: "62744",
+      teamId: "12",
+      scoringFormat: "cumulative-category-h2h",
+      scoringCategories: ["R", "RBI", "OBP"],
+      weeklyAddLimit: 6,
+      addsUsed: 0,
+      roster: [
+        new LeagueStatePlayer({
+          playerKey: "my-batter",
+          name: "My Batter",
+          team: "NYY",
+          eligiblePositions: ["Util"],
+          selectedPosition: "Util",
+        }),
+      ],
+      rosterSlots: [new RosterSlotCount({ position: "Util", count: 1 })],
+      emptySlots: [],
+      ilUsed: 0,
+      ilSlots: 0,
+      matchup: {
+        week: 11,
+        weekStart: "2026-06-01",
+        weekEnd: "2026-06-07",
+        opponentTeamKey: "mlb.l.62744.t.3",
+        opponentTeamName: "Opponent",
+        categories: [],
+      },
+    });
+    const report = rankAddCandidates(
+      new WeeklyProjectionSet({
+        myRoster: [batter({ playerKey: "my-batter", r: 1, rbi: 1, sb: 0 })],
+        opponentRoster: [batter({ playerKey: "opp-batter", r: 3, rbi: 3, sb: 0 })],
+        freeAgents: [
+          batter({
+            playerKey: "speed-only",
+            name: "Speed Only",
+            r: 1,
+            rbi: 1,
+            sb: 8,
+            obpNumerator: 6,
+            obpDenominator: 24,
+            obp: 6 / 24,
+          }),
+        ],
+      }),
+      snapshot,
+    );
+
+    expect(report.baseline.categories.map((category) => category.category)).toEqual([
+      "R",
+      "RBI",
+      "OBP",
+    ]);
+    expect(
+      report.recommendations[0]?.affectedCategories.map((category) => category.category) ?? [],
+    ).not.toContain("SB");
   });
 
   it("uses active roster slots, not bench pitchers, for matchup category EV", () => {
@@ -308,5 +457,243 @@ describe("DecisionEngine Phase 3", () => {
       sitPlayerKey: "low-power-active",
     });
     expect(move?.affectedCategories.map((delta) => delta.category)).toContain("HR");
+  });
+
+  it("does not recommend multiple bench players over the same active starter", () => {
+    const set = new WeeklyProjectionSet({
+      myRoster: [
+        batter({ playerKey: "active-one", name: "Active One", pa: 10, r: 1, hr: 0, rbi: 1 }),
+        batter({ playerKey: "active-two", name: "Active Two", pa: 9, r: 1, hr: 0, rbi: 1 }),
+        batter({ playerKey: "bench-one", name: "Bench One", pa: 28, r: 5, hr: 2, rbi: 6 }),
+        batter({ playerKey: "bench-two", name: "Bench Two", pa: 26, r: 4, hr: 2, rbi: 5 }),
+        batter({ playerKey: "bench-three", name: "Bench Three", pa: 24, r: 4, hr: 1, rbi: 4 }),
+      ],
+      opponentRoster: [batter({ playerKey: "opp", hr: 3 })],
+      freeAgents: [],
+    });
+    const baseline = simulateMatchup(set.myRoster, set.opponentRoster, 1000, 7);
+    const snapshot = new LeagueStateSnapshot({
+      leagueId: "62744",
+      teamId: "12",
+      scoringFormat: "cumulative-category-h2h",
+      scoringCategories: [
+        "R",
+        "H",
+        "HR",
+        "RBI",
+        "SB",
+        "TB",
+        "OBP",
+        "OUT",
+        "K",
+        "ERA",
+        "WHIP",
+        "QS",
+        "SV+H",
+      ],
+      weeklyAddLimit: 6,
+      addsUsed: 0,
+      roster: [
+        new LeagueStatePlayer({
+          playerKey: "active-one",
+          name: "Active One",
+          team: "NYY",
+          eligiblePositions: ["Util"],
+          selectedPosition: "Util",
+        }),
+        new LeagueStatePlayer({
+          playerKey: "active-two",
+          name: "Active Two",
+          team: "NYY",
+          eligiblePositions: ["Util"],
+          selectedPosition: "Util",
+        }),
+        new LeagueStatePlayer({
+          playerKey: "bench-one",
+          name: "Bench One",
+          team: "LAD",
+          eligiblePositions: ["Util"],
+          selectedPosition: "BN",
+        }),
+        new LeagueStatePlayer({
+          playerKey: "bench-two",
+          name: "Bench Two",
+          team: "LAD",
+          eligiblePositions: ["Util"],
+          selectedPosition: "BN",
+        }),
+        new LeagueStatePlayer({
+          playerKey: "bench-three",
+          name: "Bench Three",
+          team: "LAD",
+          eligiblePositions: ["Util"],
+          selectedPosition: "BN",
+        }),
+      ],
+      rosterSlots: [new RosterSlotCount({ position: "Util", count: 2 })],
+      emptySlots: [],
+      ilUsed: 0,
+      ilSlots: 0,
+      matchup: {
+        week: 11,
+        weekStart: "2026-06-01",
+        weekEnd: "2026-06-07",
+        opponentTeamKey: "mlb.l.62744.t.3",
+        opponentTeamName: "Opponent",
+        categories: [],
+      },
+    });
+
+    const moves = optimizeLineup(set, baseline, snapshot);
+
+    expect(moves).toHaveLength(2);
+    expect(new Set(moves.map((move) => move.sitPlayerKey)).size).toBe(moves.length);
+  });
+
+  it("only recommends start/sit swaps the bench player can legally fill", () => {
+    const set = new WeeklyProjectionSet({
+      myRoster: [
+        batter({ playerKey: "active-catcher", name: "Active Catcher", pa: 4, r: 0, hr: 0 }),
+        batter({ playerKey: "active-util", name: "Active Util", pa: 5, r: 0, hr: 0 }),
+        batter({ playerKey: "bench-outfield", name: "Bench Outfield", pa: 30, r: 6, hr: 3 }),
+      ],
+      opponentRoster: [batter({ playerKey: "opp", hr: 3 })],
+      freeAgents: [],
+    });
+    const baseline = simulateMatchup(set.myRoster, set.opponentRoster, 1000, 7);
+    const snapshot = new LeagueStateSnapshot({
+      leagueId: "62744",
+      teamId: "12",
+      scoringFormat: "cumulative-category-h2h",
+      scoringCategories: [
+        "R",
+        "H",
+        "HR",
+        "RBI",
+        "SB",
+        "TB",
+        "OBP",
+        "OUT",
+        "K",
+        "ERA",
+        "WHIP",
+        "QS",
+        "SV+H",
+      ],
+      weeklyAddLimit: 6,
+      addsUsed: 0,
+      roster: [
+        new LeagueStatePlayer({
+          playerKey: "active-catcher",
+          name: "Active Catcher",
+          team: "NYY",
+          eligiblePositions: ["C"],
+          selectedPosition: "C",
+        }),
+        new LeagueStatePlayer({
+          playerKey: "active-util",
+          name: "Active Util",
+          team: "NYY",
+          eligiblePositions: ["1B"],
+          selectedPosition: "Util",
+        }),
+        new LeagueStatePlayer({
+          playerKey: "bench-outfield",
+          name: "Bench Outfield",
+          team: "LAD",
+          eligiblePositions: ["OF"],
+          selectedPosition: "BN",
+        }),
+      ],
+      rosterSlots: [
+        new RosterSlotCount({ position: "C", count: 1 }),
+        new RosterSlotCount({ position: "Util", count: 1 }),
+      ],
+      emptySlots: [],
+      ilUsed: 0,
+      ilSlots: 0,
+      matchup: {
+        week: 11,
+        weekStart: "2026-06-01",
+        weekEnd: "2026-06-07",
+        opponentTeamKey: "mlb.l.62744.t.3",
+        opponentTeamName: "Opponent",
+        categories: [],
+      },
+    });
+
+    const moves = optimizeLineup(set, baseline, snapshot);
+
+    expect(moves).toHaveLength(1);
+    expect(moves[0]).toMatchObject({
+      startPlayerKey: "bench-outfield",
+      sitPlayerKey: "active-util",
+    });
+  });
+
+  it("does not recommend starting players parked in IL slots", () => {
+    const set = new WeeklyProjectionSet({
+      myRoster: [
+        batter({ playerKey: "active-util", name: "Active Util", pa: 5, r: 0, hr: 0 }),
+        batter({ playerKey: "il-bat", name: "IL Bat", pa: 30, r: 6, hr: 3 }),
+      ],
+      opponentRoster: [batter({ playerKey: "opp", hr: 3 })],
+      freeAgents: [],
+    });
+    const baseline = simulateMatchup(set.myRoster, set.opponentRoster, 1000, 7);
+    const snapshot = new LeagueStateSnapshot({
+      leagueId: "62744",
+      teamId: "12",
+      scoringFormat: "cumulative-category-h2h",
+      scoringCategories: [
+        "R",
+        "H",
+        "HR",
+        "RBI",
+        "SB",
+        "TB",
+        "OBP",
+        "OUT",
+        "K",
+        "ERA",
+        "WHIP",
+        "QS",
+        "SV+H",
+      ],
+      weeklyAddLimit: 6,
+      addsUsed: 0,
+      roster: [
+        new LeagueStatePlayer({
+          playerKey: "active-util",
+          name: "Active Util",
+          team: "NYY",
+          eligiblePositions: ["1B"],
+          selectedPosition: "Util",
+        }),
+        new LeagueStatePlayer({
+          playerKey: "il-bat",
+          name: "IL Bat",
+          team: "LAD",
+          eligiblePositions: ["OF", "Util"],
+          selectedPosition: "IL",
+        }),
+      ],
+      rosterSlots: [new RosterSlotCount({ position: "Util", count: 1 })],
+      emptySlots: [],
+      ilUsed: 1,
+      ilSlots: 1,
+      matchup: {
+        week: 11,
+        weekStart: "2026-06-01",
+        weekEnd: "2026-06-07",
+        opponentTeamKey: "mlb.l.62744.t.3",
+        opponentTeamName: "Opponent",
+        categories: [],
+      },
+    });
+
+    const moves = optimizeLineup(set, baseline, snapshot);
+
+    expect(moves).toHaveLength(0);
   });
 });

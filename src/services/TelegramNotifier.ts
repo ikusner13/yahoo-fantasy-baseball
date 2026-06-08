@@ -8,7 +8,7 @@ import * as Redacted from "effect/Redacted";
 import { HttpBody, HttpClient, HttpClientError, HttpClientRequest } from "effect/unstable/http";
 
 import type { ManagerBriefingReport } from "./ManagerBriefing.ts";
-import { renderManagerBriefingForDiscord, splitDiscordMessage } from "./DiscordNotifier.ts";
+import { splitDiscordMessage } from "./DiscordNotifier.ts";
 
 const TELEGRAM_API_URL = "https://api.telegram.org";
 const TELEGRAM_MESSAGE_LIMIT = 3900;
@@ -24,10 +24,228 @@ const mapHttpError = (cause: unknown) =>
     status: HttpClientError.isHttpClientError(cause) ? cause.response?.status : undefined,
   });
 
-export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport) =>
-  renderManagerBriefingForDiscord(briefing)
-    .replace(/\*\*/g, "")
-    .replace(/\[(ACT|REVIEW|HOLD)\]/g, "[$1]");
+const compactDateTime = (isoTime: string) => {
+  const date = new Date(isoTime);
+  if (!Number.isFinite(date.getTime())) return isoTime;
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(date);
+};
+
+const compactGameWindow = (briefing: ManagerBriefingReport) => {
+  const window = briefing.todayGameWindow;
+  if (window == null) return "Games: schedule unavailable";
+  const first = window.firstGameTime == null ? "unknown" : compactDateTime(window.firstGameTime);
+  return `Games: ${window.remainingGames}/${window.games} unlocked, first ${first}`;
+};
+
+const actionLabel = (confidence: ManagerBriefingReport["doNow"][number]["confidence"]) => {
+  if (confidence === "act") return "DO NOW";
+  if (confidence === "hold") return "WAIT";
+  return "BLOCKED";
+};
+
+const compactAction = (action: ManagerBriefingReport["doNow"][number], index: number) => {
+  const focus =
+    action.categories.length > 0
+      ? action.categories.join(", ")
+      : action.action.includes("open active slot")
+        ? "open active slot, no drop"
+        : action.action.includes("open roster spot")
+          ? "open roster spot, no drop"
+          : "roster flexibility";
+  const lines = [
+    `${index}. [${actionLabel(action.confidence)}] ${action.action}`,
+    `   Focus: ${focus}`,
+    `   Why: ${action.rationale}`,
+  ];
+  const yahooSteps = action.yahooSteps.slice(1, 4);
+  if (yahooSteps.length > 0) {
+    lines.push("   Yahoo:");
+    for (const step of yahooSteps) lines.push(`   - ${step}`);
+  }
+  return lines;
+};
+
+const isLineupProblem = (line: string) => line.includes(" is active at ");
+
+const isLineupMove = (line: string) =>
+  line.startsWith("Swap ") || line.startsWith("Move ") || line.startsWith("Replace ");
+
+const compactCategoryLine = (situation: ManagerBriefingReport["categorySituations"][number]) => {
+  const label =
+    situation.status === "winning" ? "Lead" : situation.status === "losing" ? "Trail" : "Tie";
+  return `${label} ${situation.category}: ${situation.myValue}-${situation.opponentValue}`;
+};
+
+const yahooLineupSteps = (lineupMoves: ReadonlyArray<string>) => [
+  "1. Open Yahoo My Team for the briefing date.",
+  "2. Apply the moves listed from the current Yahoo roster state.",
+  ...lineupMoves.slice(0, 5).map((move, index) => `${index + 3}. ${move}`),
+  `${Math.min(lineupMoves.length, 5) + 3}. Save roster changes, then re-run the lineup check.`,
+];
+
+const managerDecisionLine = (
+  briefing: ManagerBriefingReport,
+  lineupMoves: ReadonlyArray<string>,
+  actions: ReadonlyArray<ManagerBriefingReport["doNow"][number]>,
+) => {
+  if (lineupMoves.length > 0) {
+    return `Fix lineup only: ${lineupMoves.length} internal move(s), then regenerate before any add/drop.`;
+  }
+  const actNow = actions.find((action) => action.confidence === "act");
+  if (actNow != null) return actNow.action;
+  const nextAction = actions[0];
+  if (nextAction?.confidence === "hold") {
+    return `Wait on ${nextAction.action}; timing guardrail is not clear yet.`;
+  }
+  if (nextAction != null) {
+    return `Decision blocked: ${nextAction.action}; execute only after the listed gate clears.`;
+  }
+  if (briefing.addsRemaining <= 0) {
+    return "No transaction available: weekly Yahoo add limit is exhausted.";
+  }
+  if (briefing.closestCategories.length > 0) {
+    return `No add/drop clears the manager bar; protect ${briefing.closestCategories.slice(0, 3).join(", ")}.`;
+  }
+  return "No add/drop clears the manager bar right now.";
+};
+
+const normalizeWarning = (warning: string) =>
+  warning.includes("manual manager decision")
+    ? "Manager decision generated from Yahoo roster, status, lock data, matchup context, and category guardrails."
+    : warning;
+
+export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport) => {
+  const actions = briefing.doNow.length > 0 ? briefing.doNow : briefing.holdForLater.slice(0, 1);
+  const lineupProblems = briefing.lineupAlerts.filter(isLineupProblem);
+  const lineupMoves = briefing.lineupAlerts.filter(isLineupMove);
+  const otherLineupAlerts = briefing.lineupAlerts.filter(
+    (line) => !isLineupProblem(line) && !isLineupMove(line),
+  );
+  const hasUrgentLineup = lineupProblems.length > 0 || lineupMoves.length > 0;
+  const hasActNow = actions.some((action) => action.confidence === "act");
+  const hasBlockedDecision = actions.some((action) => action.confidence === "review");
+  const actionHeader = hasActNow
+    ? "✅ Do Now"
+    : hasUrgentLineup
+      ? "🎯 Next Add After Lineup Fix"
+      : hasBlockedDecision
+        ? "🧱 Blocked Decision"
+        : "⏸️ Not Doing Now";
+  const lines = [
+    "⚾ Fantasy GM",
+    briefing.summary,
+    "",
+    `🕒 Generated: ${compactDateTime(briefing.generatedAt)}`,
+    `🗓️ ${compactGameWindow(briefing)}`,
+    `➕ Adds: ${briefing.addsRemaining} left (${briefing.reservedAdds} reserved)`,
+    `⚾ IP: ${briefing.projectedWeeklyIp.toFixed(1)}`,
+    `🎯 Closest: ${briefing.closestCategories.join(", ") || "none"}`,
+    "",
+    "✅ Manager Decision",
+    managerDecisionLine(briefing, lineupMoves, actions),
+  ];
+
+  if (briefing.managerTakeaways.length > 0) {
+    lines.push(
+      "",
+      "🧠 Manager Read",
+      ...briefing.managerTakeaways.slice(0, 5).map((line) => `• ${line}`),
+    );
+  }
+
+  if (briefing.lineupAlerts.length > 0) {
+    lines.push("", "🚨 Lineup");
+    if (lineupProblems.length > 0) {
+      lines.push("Problems", ...lineupProblems.slice(0, 5).map((line) => `• ${line}`));
+    }
+    if (lineupMoves.length > 0) {
+      lines.push("Moves", ...lineupMoves.slice(0, 6).map((line) => `• ${line}`));
+    }
+    if (otherLineupAlerts.length > 0) {
+      lines.push("Notes", ...otherLineupAlerts.slice(0, 3).map((line) => `• ${line}`));
+    }
+  }
+
+  if (lineupMoves.length > 0) {
+    lines.push("", "📲 Yahoo Steps", ...yahooLineupSteps(lineupMoves));
+  }
+
+  if ((briefing.writeAlerts?.length ?? 0) > 0) {
+    lines.push(
+      "",
+      "🔐 Yahoo Writes",
+      ...briefing.writeAlerts!.slice(0, 2).map((line) => `• ${line}`),
+    );
+  }
+
+  if ((briefing.pitcherStarts?.length ?? 0) > 0) {
+    lines.push(
+      "",
+      "🗓️ Pitcher Starts",
+      ...briefing.pitcherStarts!.slice(0, 5).map((line) => `• ${line}`),
+    );
+  }
+
+  if (actions.length > 0 && (hasActNow || hasUrgentLineup)) {
+    lines.push(
+      "",
+      actionHeader,
+      ...actions.flatMap((action, index) => compactAction(action, index + 1)),
+    );
+  } else if (actions.length > 0) {
+    lines.push(
+      "",
+      actionHeader,
+      ...actions.flatMap((action, index) => compactAction(action, index + 1)),
+    );
+  }
+
+  if (briefing.categorySituations.length > 0 && !hasUrgentLineup) {
+    lines.push(
+      "",
+      "📊 Scoreboard",
+      ...briefing.categorySituations.slice(0, 8).map(compactCategoryLine),
+    );
+  }
+
+  if (briefing.addTriggers.length > 0) {
+    lines.push(
+      "",
+      "🧭 Add Triggers",
+      ...briefing.addTriggers.slice(0, 3).map((line) => `• ${line}`),
+    );
+  }
+
+  if (briefing.rejectedTransactions.length > 0) {
+    lines.push(
+      "",
+      "⛔ Skipped",
+      ...briefing.rejectedTransactions
+        .slice(0, 3)
+        .map((move) => `• ${move.addPlayerName}: ${move.reason}`),
+    );
+  }
+
+  if (briefing.warnings.length > 0) {
+    lines.push(
+      "",
+      "🛑 Guardrails",
+      ...briefing.warnings
+        .slice(0, 2)
+        .map(normalizeWarning)
+        .map((line) => `• ${line}`),
+    );
+  }
+
+  return lines.join("\n");
+};
 
 export class TelegramNotifier extends Context.Service<
   TelegramNotifier,

@@ -8,6 +8,7 @@ const AVG_GAMES_PER_WEEK = 6.2;
 const AVG_PA_PER_STARTED_GAME = 4.2;
 const DEFAULT_ROS_TEAM_GAMES = 162;
 const LEAGUE_AVG_IMPLIED_RUNS = 4.5;
+const MIN_OPENER_IP = 1;
 
 export class ProjectionModelError extends Data.TaggedError("ProjectionModelError")<{
   readonly message: string;
@@ -35,6 +36,18 @@ export class DailyGameWindow extends Schema.Class<DailyGameWindow>("DailyGameWin
   lastGameTime: Schema.optional(Schema.String),
 }) {}
 
+export class ProbablePitcherStart extends Schema.Class<ProbablePitcherStart>(
+  "ProbablePitcherStart",
+)({
+  playerKey: Schema.String,
+  playerName: Schema.String,
+  team: Schema.String,
+  opponentTeam: Schema.String,
+  date: Schema.String,
+  gameTime: Schema.optional(Schema.String),
+  homeAway: Schema.Union([Schema.Literal("home"), Schema.Literal("away")]),
+}) {}
+
 export class StatcastPlayerContext extends Schema.Class<StatcastPlayerContext>(
   "StatcastPlayerContext",
 )({
@@ -60,6 +73,7 @@ export class WeeklyContext extends Schema.Class<WeeklyContext>("WeeklyContext")(
   schedules: Schema.Array(WeeklySchedule),
   dailyGameWindows: Schema.optional(Schema.Array(DailyGameWindow)),
   probableStartsByPlayerKey: Schema.Record(Schema.String, Schema.Finite),
+  probablePitcherStarts: Schema.optional(Schema.Array(ProbablePitcherStart)),
   impliedRunsByTeam: Schema.Record(Schema.String, Schema.Finite),
   statcastByPlayerKey: Schema.optional(Schema.Record(Schema.String, StatcastPlayerContext)),
   parkFactorsByTeam: Schema.optional(Schema.Record(Schema.String, ParkFactorContext)),
@@ -87,6 +101,7 @@ export class BatterProjectionSource extends Schema.Class<BatterProjectionSource>
   bb: Schema.optional(Schema.Finite),
   hbp: Schema.optional(Schema.Finite),
   sf: Schema.optional(Schema.Finite),
+  eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
 }) {}
 
 export class PitcherProjectionSource extends Schema.Class<PitcherProjectionSource>(
@@ -105,6 +120,7 @@ export class PitcherProjectionSource extends Schema.Class<PitcherProjectionSourc
   qs: Schema.Finite,
   svh: Schema.Finite,
   appearances: Schema.optional(Schema.Finite),
+  eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
 }) {}
 
 export class BlendedBatterProjection extends Schema.Class<BlendedBatterProjection>(
@@ -127,6 +143,7 @@ export class BlendedBatterProjection extends Schema.Class<BlendedBatterProjectio
   bb: Schema.Finite,
   hbp: Schema.Finite,
   sf: Schema.Finite,
+  eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
 }) {}
 
 export class BlendedPitcherProjection extends Schema.Class<BlendedPitcherProjection>(
@@ -145,6 +162,7 @@ export class BlendedPitcherProjection extends Schema.Class<BlendedPitcherProject
   qs: Schema.Finite,
   svh: Schema.Finite,
   appearances: Schema.Finite,
+  eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
 }) {}
 
 export class WeeklyBatterLine extends Schema.Class<WeeklyBatterLine>("WeeklyBatterLine")({
@@ -162,6 +180,7 @@ export class WeeklyBatterLine extends Schema.Class<WeeklyBatterLine>("WeeklyBatt
   obpNumerator: Schema.Finite,
   obpDenominator: Schema.Finite,
   obp: Schema.Finite,
+  eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
 }) {}
 
 export class WeeklyPitcherLine extends Schema.Class<WeeklyPitcherLine>("WeeklyPitcherLine")({
@@ -178,6 +197,8 @@ export class WeeklyPitcherLine extends Schema.Class<WeeklyPitcherLine>("WeeklyPi
   whip: Schema.Finite,
   qs: Schema.Finite,
   svh: Schema.Finite,
+  expectedStarts: Schema.optional(Schema.Finite),
+  eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
 }) {}
 
 export class ProjectionPool extends Schema.Class<ProjectionPool>("ProjectionPool")({
@@ -192,7 +213,9 @@ export class WeeklyProjectionSet extends Schema.Class<WeeklyProjectionSet>("Week
   myRoster: Schema.Array(Schema.Union([WeeklyBatterLine, WeeklyPitcherLine])),
   opponentRoster: Schema.Array(Schema.Union([WeeklyBatterLine, WeeklyPitcherLine])),
   freeAgents: Schema.Array(Schema.Union([WeeklyBatterLine, WeeklyPitcherLine])),
+  schedules: Schema.optional(Schema.Array(WeeklySchedule)),
   dailyGameWindows: Schema.optional(Schema.Array(DailyGameWindow)),
+  probablePitcherStarts: Schema.optional(Schema.Array(ProbablePitcherStart)),
 }) {}
 
 type WeightedRows<A extends { source: string }> = ReadonlyArray<A>;
@@ -359,6 +382,7 @@ export const blendBatterProjections = (
       bb: weightedMean(componentRows, weightIndex, (row) => row.bb),
       hbp: weightedMean(componentRows, weightIndex, (row) => row.hbp),
       sf: weightedMean(componentRows, weightIndex, (row) => row.sf),
+      eligiblePositions: first.eligiblePositions == null ? undefined : [...first.eligiblePositions],
     });
   });
 };
@@ -384,6 +408,7 @@ export const blendPitcherProjections = (
       qs: weightedMean(group, weightIndex, (row) => row.qs),
       svh: weightedMean(group, weightIndex, (row) => row.svh),
       appearances: weightedMean(group, weightIndex, (row) => row.appearances ?? row.gs),
+      eligiblePositions: first.eligiblePositions == null ? undefined : [...first.eligiblePositions],
     });
   });
 };
@@ -420,6 +445,8 @@ export const prorateBatterProjection = (
     obpNumerator: obpNumerator * contactMultiplier,
     obpDenominator,
     obp: safeDivide(obpNumerator * contactMultiplier, obpDenominator),
+    eligiblePositions:
+      projection.eligiblePositions == null ? undefined : [...projection.eligiblePositions],
   });
 };
 
@@ -434,7 +461,11 @@ export const proratePitcherProjection = (
     remainingGames(projection.team, context);
   const reliefScale = safeDivide(reliefAppearances, projection.appearances);
   const scale = projection.gs > 0 ? startScale : reliefScale;
-  const ip = projection.ip * scale;
+  const openerIp =
+    starts > 0 && projection.gs <= 0
+      ? Math.max(MIN_OPENER_IP, safeDivide(projection.ip, projection.appearances)) * starts
+      : 0;
+  const ip = Math.max(projection.ip * scale, openerIp);
   const statcast = context.statcastByPlayerKey?.[contextKey(projection)];
   const park = context.parkFactorsByTeam?.[projection.team];
   const skill = pitcherStatcastContext(statcast);
@@ -449,13 +480,19 @@ export const proratePitcherProjection = (
     team: projection.team,
     ip,
     out: ip * 3,
-    k: projection.k * scale * skill.strikeouts,
+    k:
+      projection.gs <= 0 && starts > 0
+        ? safeDivide(projection.k, projection.ip) * ip * skill.strikeouts
+        : projection.k * scale * skill.strikeouts,
     er,
     baserunners,
     era: ip > 0 ? (er * 9) / ip : 0,
     whip: safeDivide(baserunners, ip),
     qs: projection.qs * scale,
     svh: projection.svh * reliefScale,
+    expectedStarts: starts,
+    eligiblePositions:
+      projection.eligiblePositions == null ? undefined : [...projection.eligiblePositions],
   });
 };
 
@@ -477,7 +514,9 @@ export const buildWeeklyProjectionSet = (pool: ProjectionPool, context: WeeklyCo
     myRoster: collect(pool.myRoster),
     opponentRoster: collect(pool.opponentRoster),
     freeAgents: collect(pool.freeAgents),
+    schedules: context.schedules,
     dailyGameWindows: context.dailyGameWindows,
+    probablePitcherStarts: context.probablePitcherStarts,
   });
 };
 

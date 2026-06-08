@@ -241,6 +241,26 @@ describe("ProjectionData", () => {
         "mlb:456": 1,
         "mlb:789": 1,
       });
+      expect(context.probablePitcherStarts).toEqual([
+        {
+          playerKey: "mlb:456",
+          playerName: "Grace Starter",
+          team: "NYY",
+          opponentTeam: "SEA",
+          date: "2099-06-06",
+          gameTime: "2099-06-06T23:05:00.000Z",
+          homeAway: "away",
+        },
+        {
+          playerKey: "mlb:789",
+          playerName: "Home Starter",
+          team: "SEA",
+          opponentTeam: "NYY",
+          date: "2099-06-06",
+          gameTime: "2099-06-06T23:05:00.000Z",
+          homeAway: "home",
+        },
+      ]);
       expect(context.confirmedLineupsByTeam).toMatchObject({
         NYY: 1,
         SEA: 1,

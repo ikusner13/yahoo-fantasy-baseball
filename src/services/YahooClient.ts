@@ -7,6 +7,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SchemaGetter from "effect/SchemaGetter";
 import {
+  HttpBody,
   HttpClient,
   HttpClientError,
   HttpClientRequest,
@@ -607,6 +608,122 @@ export interface YahooClientConfig {
   readonly teamId: string;
 }
 
+export interface YahooRosterPositionMove {
+  readonly playerKey: string;
+  readonly position: string;
+}
+
+export type YahooTransactionWrite =
+  | {
+      readonly type: "add";
+      readonly playerKey: string;
+    }
+  | {
+      readonly type: "drop";
+      readonly playerKey: string;
+    }
+  | {
+      readonly type: "add/drop";
+      readonly addPlayerKey: string;
+      readonly dropPlayerKey: string;
+      readonly faabBid?: number;
+    }
+  | {
+      readonly type: "waiver";
+      readonly addPlayerKey: string;
+      readonly dropPlayerKey?: string;
+      readonly faabBid?: number;
+    };
+
+const xmlEscape = (value: string) =>
+  value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+
+export const buildRosterPositionsXml = (
+  date: string,
+  moves: ReadonlyArray<YahooRosterPositionMove>,
+) => `<?xml version="1.0" encoding="UTF-8"?>
+<fantasy_content>
+  <roster>
+    <coverage_type>date</coverage_type>
+    <date>${xmlEscape(date)}</date>
+    <players>
+${moves
+  .map(
+    (move) => `      <player>
+        <player_key>${xmlEscape(move.playerKey)}</player_key>
+        <selected_position>
+          <coverage_type>date</coverage_type>
+          <date>${xmlEscape(date)}</date>
+          <position>${xmlEscape(move.position)}</position>
+        </selected_position>
+      </player>`,
+  )
+  .join("\n")}
+    </players>
+  </roster>
+</fantasy_content>`;
+
+const buildTransactionPlayerXml = (
+  playerKey: string,
+  transactionType: "add" | "drop",
+  teamKey: string,
+) => `      <player>
+        <player_key>${xmlEscape(playerKey)}</player_key>
+        <transaction_data>
+          <type>${transactionType}</type>
+          ${
+            transactionType === "add"
+              ? `<destination_team_key>${xmlEscape(teamKey)}</destination_team_key>`
+              : `<source_team_key>${xmlEscape(teamKey)}</source_team_key>`
+          }
+        </transaction_data>
+      </player>`;
+
+const buildOptionalFaabBidXml = (faabBid: number | undefined) =>
+  faabBid == null ? "" : `    <faab_bid>${xmlEscape(String(faabBid))}</faab_bid>\n`;
+
+export const buildTransactionXml = (teamKey: string, transaction: YahooTransactionWrite) => {
+  if (transaction.type === "add" || transaction.type === "drop") {
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<fantasy_content>
+  <transaction>
+    <type>${transaction.type}</type>
+    <player>
+      <player_key>${xmlEscape(transaction.playerKey)}</player_key>
+      <transaction_data>
+        <type>${transaction.type}</type>
+        ${
+          transaction.type === "add"
+            ? `<destination_team_key>${xmlEscape(teamKey)}</destination_team_key>`
+            : `<source_team_key>${xmlEscape(teamKey)}</source_team_key>`
+        }
+      </transaction_data>
+    </player>
+  </transaction>
+</fantasy_content>`;
+  }
+
+  const dropPlayerXml =
+    transaction.dropPlayerKey == null
+      ? ""
+      : `\n${buildTransactionPlayerXml(transaction.dropPlayerKey, "drop", teamKey)}`;
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<fantasy_content>
+  <transaction>
+    <type>${transaction.type}</type>
+${buildOptionalFaabBidXml(transaction.faabBid)}    <players>
+${buildTransactionPlayerXml(transaction.addPlayerKey, "add", teamKey)}${dropPlayerXml}
+    </players>
+  </transaction>
+</fantasy_content>`;
+};
+
 export class YahooClient extends Context.Service<
   YahooClient,
   {
@@ -614,6 +731,7 @@ export class YahooClient extends Context.Service<
     readonly getLeagueSettings: Effect.Effect<YahooLeagueSettingsPayload, YahooApiError>;
     readonly getTeamMetadata: Effect.Effect<YahooTeamMetadataPayload, YahooApiError>;
     readonly getRoster: Effect.Effect<YahooRosterPayload, YahooApiError>;
+    readonly getRosterForDate: (date: string) => Effect.Effect<YahooRosterPayload, YahooApiError>;
     readonly getRosterForTeam: (
       teamKey: string,
     ) => Effect.Effect<YahooRosterPayload, YahooApiError>;
@@ -625,6 +743,10 @@ export class YahooClient extends Context.Service<
     ) => Effect.Effect<YahooLeagueTransactionsPayload, YahooApiError>;
     readonly getCurrentMatchup: Effect.Effect<YahooMatchupPayload, YahooApiError>;
     readonly getLeagueStandings: Effect.Effect<YahooStandingsPayload, YahooApiError>;
+    readonly putRosterPositions: (
+      date: string,
+      moves: ReadonlyArray<YahooRosterPositionMove>,
+    ) => Effect.Effect<void, YahooApiError>;
   }
 >()("fantasy-gm/YahooClient") {
   static readonly layer = Layer.effect(
@@ -643,6 +765,11 @@ export class YahooClient extends Context.Service<
 const makeYahooClientShape = (
   config: YahooClientConfig,
   request: <A>(path: string, schema: Schema.Schema<A>) => Effect.Effect<A, YahooApiError>,
+  writeRosterPositions: (
+    path: string,
+    date: string,
+    moves: ReadonlyArray<YahooRosterPositionMove>,
+  ) => Effect.Effect<void, YahooApiError>,
 ): Context.Service.Shape<typeof YahooClient> => {
   const leagueKey = `mlb.l.${config.leagueId}`;
   const teamKey = `${leagueKey}.t.${config.teamId}`;
@@ -652,6 +779,8 @@ const makeYahooClientShape = (
     getLeagueSettings: request(`/league/${leagueKey}/settings`, YahooLeagueSettingsPayload),
     getTeamMetadata: request(`/team/${teamKey}/metadata`, YahooTeamMetadataPayload),
     getRoster: request(`/team/${teamKey}/roster/players`, YahooRosterPayload),
+    getRosterForDate: (date) =>
+      request(`/team/${teamKey}/roster/players;date=${date}`, YahooRosterPayload),
     getRosterForTeam: (targetTeamKey) =>
       request(`/team/${targetTeamKey}/roster/players`, YahooRosterPayload),
     getAvailablePlayers: (count) =>
@@ -663,6 +792,8 @@ const makeYahooClientShape = (
       ),
     getCurrentMatchup: request(`/team/${teamKey}/matchups;weeks=current`, YahooMatchupPayload),
     getLeagueStandings: request(`/league/${leagueKey}/standings`, YahooStandingsPayload),
+    putRosterPositions: (date, moves) =>
+      writeRosterPositions(`/team/${teamKey}/roster/players`, date, moves),
   };
 };
 
@@ -704,5 +835,45 @@ export const makeYahooClient = (
       );
     });
 
-  return makeYahooClientShape(config, request);
+  const writeRosterPositions = (
+    path: string,
+    date: string,
+    moves: ReadonlyArray<YahooRosterPositionMove>,
+  ) =>
+    Effect.gen(function* () {
+      if (moves.length === 0) return;
+      const accessToken = yield* oauth.getAccessToken.pipe(
+        Effect.mapError((cause) => new YahooApiError({ message: cause.message, path })),
+      );
+      const yahooHttpClient = httpClient.pipe(
+        HttpClient.mapRequest(
+          flow(
+            HttpClientRequest.prependUrl(BASE_URL),
+            HttpClientRequest.acceptJson,
+            HttpClientRequest.bearerToken(accessToken),
+          ),
+        ),
+        HttpClient.filterStatusOk,
+      );
+      yield* yahooHttpClient
+        .put(path, {
+          body: HttpBody.text(buildRosterPositionsXml(date, moves), "application/xml"),
+          urlParams: { format: "json" },
+        })
+        .pipe(
+          Effect.asVoid,
+          Effect.mapError(
+            (cause) =>
+              new YahooApiError({
+                message: describeHttpCause(cause),
+                status: HttpClientError.isHttpClientError(cause)
+                  ? cause.response?.status
+                  : undefined,
+                path,
+              }),
+          ),
+        );
+    });
+
+  return makeYahooClientShape(config, request, writeRosterPositions);
 };

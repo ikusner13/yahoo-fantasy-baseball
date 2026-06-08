@@ -29,9 +29,14 @@ const EMPTY_SLOT_VOLUME_MULTIPLIER = 0.35;
 const STREAMING_SKILL_MIN_K_PER_IP = 0.85;
 const STREAMING_RATIO_ERA_LIMIT = 4.5;
 const STREAMING_RATIO_WHIP_LIMIT = 1.35;
+const STREAMING_RATIO_COIN_FLIP_ERA_LIMIT = 3.95;
+const STREAMING_RATIO_COIN_FLIP_WHIP_LIMIT = 1.24;
 const MIN_ADD_DROP_REPLACEMENT_EDGE = 1.25;
 const MIN_ACTIVE_DROP_REPLACEMENT_EDGE = 3;
 const MIN_SCARCE_POSITION_DROP_EDGE = 6;
+const TOP_WAIVER_PRIORITY_CUTOFF = 3;
+const TOP_WAIVER_MIN_SEASON_SGP = 1;
+const TOP_WAIVER_MIN_WEEKLY_DELTA = 2;
 const LEAGUE_AVG_OBP = 0.32;
 const LEAGUE_AVG_ERA = 4.1;
 const LEAGUE_AVG_WHIP = 1.28;
@@ -47,8 +52,10 @@ type Guardrail =
   | "streaming-skills"
   | "ratio-protection"
   | "ip-floor"
+  | "remaining-start"
   | "two-start-planning"
-  | "il-stash-stream";
+  | "il-stash-stream"
+  | "open-roster-capacity";
 
 type WeeklyLine = WeeklyBatterLine | WeeklyPitcherLine;
 
@@ -85,8 +92,10 @@ export class TransactionStep extends Schema.Class<TransactionStep>("TransactionS
       Schema.Literal("streaming-skills"),
       Schema.Literal("ratio-protection"),
       Schema.Literal("ip-floor"),
+      Schema.Literal("remaining-start"),
       Schema.Literal("two-start-planning"),
       Schema.Literal("il-stash-stream"),
+      Schema.Literal("open-roster-capacity"),
     ]),
   ),
   rationale: Schema.String,
@@ -113,6 +122,36 @@ export class RejectedTransaction extends Schema.Class<RejectedTransaction>("Reje
   reason: Schema.String,
 }) {}
 
+export class TransactionLineupRecommendation extends Schema.Class<TransactionLineupRecommendation>(
+  "TransactionLineupRecommendation",
+)({
+  startPlayerKey: Schema.String,
+  startPlayerName: Schema.String,
+  sitPlayerKey: Schema.String,
+  sitPlayerName: Schema.String,
+  scoreDelta: Schema.Finite,
+  affectedCategories: Schema.Array(Schema.String),
+}) {}
+
+export class TransactionPitcherStart extends Schema.Class<TransactionPitcherStart>(
+  "TransactionPitcherStart",
+)({
+  playerKey: Schema.String,
+  playerName: Schema.String,
+  selectedPosition: Schema.String,
+  expectedStarts: Schema.Finite,
+  projectedIp: Schema.Finite,
+  projectedK: Schema.Finite,
+  starts: Schema.Array(
+    Schema.Struct({
+      date: Schema.String,
+      opponentTeam: Schema.String,
+      gameTime: Schema.optional(Schema.String),
+      homeAway: Schema.Union([Schema.Literal("home"), Schema.Literal("away")]),
+    }),
+  ),
+}) {}
+
 export class TransactionDailyGameWindow extends Schema.Class<TransactionDailyGameWindow>(
   "TransactionDailyGameWindow",
 )({
@@ -127,9 +166,14 @@ export class TransactionPlan extends Schema.Class<TransactionPlan>("TransactionP
   addsRemaining: Schema.Finite,
   reservedAdds: Schema.Finite,
   projectedWeeklyIp: Schema.Finite,
+  sgpDenominatorSource: Schema.optional(
+    Schema.Union([Schema.Literal("standings-history"), Schema.Literal("fallback")]),
+  ),
   closestCategories: Schema.Array(Schema.String),
   categorySituations: Schema.Array(TransactionCategorySituation),
   todayGameWindow: Schema.optional(TransactionDailyGameWindow),
+  lineupRecommendations: Schema.Array(TransactionLineupRecommendation),
+  pitcherStarts: Schema.optional(Schema.Array(TransactionPitcherStart)),
   rejectedTransactions: Schema.Array(RejectedTransaction),
   steps: Schema.Array(TransactionStep),
 }) {}
@@ -146,9 +190,27 @@ export interface TransactionPlanOptions {
 const activeEmptySlots = (snapshot: LeagueStateSnapshot, line: WeeklyLine) =>
   snapshot.emptySlots.filter((slot) =>
     line.kind === "batter"
-      ? ACTIVE_BATTER_SLOTS.has(slot.position)
-      : ACTIVE_PITCHER_SLOTS.has(slot.position),
+      ? ACTIVE_BATTER_SLOTS.has(slot.position) && lineCanFillSlot(line, slot.position)
+      : ACTIVE_PITCHER_SLOTS.has(slot.position) && lineCanFillSlot(line, slot.position),
   );
+
+const lineCanFillSlot = (line: WeeklyLine, slot: string) => {
+  const positions = line.eligiblePositions;
+  if (positions == null || positions.length === 0) return true;
+  if (line.kind === "batter") {
+    if (slot === "Util") {
+      return positions.some((position) =>
+        ["C", "1B", "2B", "3B", "SS", "OF", "Util"].includes(position),
+      );
+    }
+    return positions.includes(slot);
+  }
+  if (slot === "P") return positions.some((position) => ["SP", "RP", "P"].includes(position));
+  return positions.includes(slot);
+};
+
+const benchEmptySlots = (snapshot: LeagueStateSnapshot) =>
+  snapshot.emptySlots.filter((slot) => slot.position === "BN");
 
 const slotCount = (slots: ReadonlyArray<RosterSlotCount>) =>
   slots.reduce((sum, slot) => sum + slot.count, 0);
@@ -246,22 +308,83 @@ const categorySituations = (snapshot: LeagueStateSnapshot) =>
 const affectedCategoryNames = (recommendation: AddRecommendation) =>
   recommendation.affectedCategories.map((delta) => delta.category);
 
+const isCredibleLineCategory = (line: WeeklyLine, category: string) => {
+  if (line.kind === "batter") {
+    if (category === "R") return line.r >= 2;
+    if (category === "H") return line.h >= 3;
+    if (category === "HR") return line.hr >= 0.5;
+    if (category === "RBI") return line.rbi >= 2;
+    if (category === "SB") return line.sb >= 1;
+    if (category === "TB") return line.tb >= 5;
+    if (category === "OBP") return line.obp >= LEAGUE_AVG_OBP + 0.015 && line.obpDenominator >= 10;
+    return false;
+  }
+  if (category === "OUT") return line.out >= 12;
+  if (category === "K") return line.k >= 4;
+  if (category === "QS") return line.qs >= 0.5;
+  if (category === "SV+H") return line.svh >= 0.5;
+  if (category === "ERA") return line.era <= LEAGUE_AVG_ERA - 0.25 && line.ip >= 3;
+  if (category === "WHIP") return line.whip <= LEAGUE_AVG_WHIP - 0.08 && line.ip >= 3;
+  return false;
+};
+
+const profileCategoryNames = (line: WeeklyLine) => {
+  const categories =
+    line.kind === "batter"
+      ? ["RBI", "R", "H", "TB", "HR", "OBP", "SB"]
+      : ["OUT", "K", "QS", "SV+H", "ERA", "WHIP"];
+  return categories.filter((category) => isCredibleLineCategory(line, category));
+};
+
+const decisionCategoryNames = (
+  recommendation: AddRecommendation,
+  line: WeeklyLine,
+  targetCategories: ReadonlySet<string>,
+) => {
+  const affected = affectedCategoryNames(recommendation).filter((category) =>
+    isCredibleLineCategory(line, category),
+  );
+  const targeted = affected.filter((category) => targetCategories.has(category));
+  const profile = profileCategoryNames(line);
+  return (targeted.length > 0 ? targeted : affected.length > 0 ? affected : profile).slice(0, 3);
+};
+
 const isSvhReliever = (line: WeeklyLine) =>
   line.kind === "pitcher" && line.svh >= 0.5 && line.svh >= line.qs;
+
+const isStartingPitcherStream = (line: WeeklyLine) =>
+  line.kind === "pitcher" &&
+  !isSvhReliever(line) &&
+  (line.eligiblePositions?.some((position) => position === "SP") === true ||
+    (line.eligiblePositions == null && ((line.expectedStarts ?? 0) > 0 || line.qs >= 0.5)));
+
+const hasRemainingExpectedStart = (line: WeeklyLine) =>
+  line.kind === "pitcher" && (line.expectedStarts ?? 0) > 0;
+
+const teamGamesRemaining = (set: WeeklyProjectionSet, team: string) =>
+  set.schedules?.find((schedule) => schedule.team === team)?.gamesRemaining;
+
+const hasUnlockedLineupVolume = (set: WeeklyProjectionSet, line: WeeklyLine) => {
+  if (line.kind === "pitcher" && hasRemainingExpectedStart(line)) return true;
+  const remaining = teamGamesRemaining(set, line.team);
+  return remaining == null || remaining > 0;
+};
 
 const passesStreamingGuardrails = (line: WeeklyLine, targetCategories: ReadonlySet<string>) => {
   if (line.kind !== "pitcher") return true;
   if (line.ip <= 0) return false;
   const skillPass = line.k / line.ip >= STREAMING_SKILL_MIN_K_PER_IP || line.qs >= 1.5;
   const ratioCoinFlip = targetCategories.has("ERA") || targetCategories.has("WHIP");
-  const ratioPass =
-    ratioCoinFlip ||
-    (line.era <= STREAMING_RATIO_ERA_LIMIT && line.whip <= STREAMING_RATIO_WHIP_LIMIT);
+  const eraLimit = ratioCoinFlip ? STREAMING_RATIO_COIN_FLIP_ERA_LIMIT : STREAMING_RATIO_ERA_LIMIT;
+  const whipLimit = ratioCoinFlip
+    ? STREAMING_RATIO_COIN_FLIP_WHIP_LIMIT
+    : STREAMING_RATIO_WHIP_LIMIT;
+  const ratioPass = line.era <= eraLimit && line.whip <= whipLimit;
   return skillPass && ratioPass;
 };
 
 const isBench = (player: LeagueStateSnapshot["roster"][number] | undefined) =>
-  player != null && ["BN", "NA"].includes(player.selectedPosition);
+  player != null && player.selectedPosition === "BN";
 
 const hasScarceEligibility = (player: LeagueStateSnapshot["roster"][number] | undefined) =>
   player != null && player.eligiblePositions.some((position) => SCARCE_POSITIONS.has(position));
@@ -335,7 +458,7 @@ const protectsScarcePosition = (
     const alternatives = roster.filter(
       (entry) =>
         entry.playerKey !== player.playerKey &&
-        !["IL", "IL+"].includes(entry.selectedPosition) &&
+        !["IL", "IL+", "NA"].includes(entry.selectedPosition) &&
         entry.eligiblePositions.includes(position),
     );
     if (alternatives.length === 0) return true;
@@ -355,7 +478,7 @@ const weakestDrop = (
     .flatMap((line) => {
       const rosterPlayer = rosterByKey.get(line.playerKey);
       if (rosterPlayer == null) return [];
-      if (["IL", "IL+"].includes(rosterPlayer.selectedPosition)) return [];
+      if (["IL", "IL+", "NA"].includes(rosterPlayer.selectedPosition)) return [];
       if (protectsScarcePosition(rosterPlayer, snapshot.roster)) return [];
       const value = replacementValue(line, weights);
       const activePenalty = isBench(rosterPlayer) ? 0 : 1000;
@@ -367,22 +490,113 @@ const weakestDrop = (
 const candidateLine = (set: WeeklyProjectionSet, playerKey: string) =>
   set.freeAgents.find((line) => line.playerKey === playerKey);
 
+const pitcherStarts = (set: WeeklyProjectionSet, snapshot: LeagueStateSnapshot) => {
+  const rosterByKey = new Map(snapshot.roster.map((player) => [player.playerKey, player]));
+  const startsByPlayerKey = new Map<
+    string,
+    Array<NonNullable<WeeklyProjectionSet["probablePitcherStarts"]>[number]>
+  >();
+  for (const start of set.probablePitcherStarts ?? []) {
+    const starts = startsByPlayerKey.get(start.playerKey) ?? [];
+    starts.push(start);
+    startsByPlayerKey.set(start.playerKey, starts);
+  }
+  return set.myRoster
+    .flatMap((line) => {
+      if (line.kind !== "pitcher") return [];
+      const rosterPlayer = rosterByKey.get(line.playerKey);
+      if (rosterPlayer == null) return [];
+      const starts = startsByPlayerKey.get(line.playerKey) ?? [];
+      return [
+        new TransactionPitcherStart({
+          playerKey: line.playerKey,
+          playerName: line.name,
+          selectedPosition: rosterPlayer.selectedPosition,
+          expectedStarts: line.expectedStarts ?? 0,
+          projectedIp: line.ip,
+          projectedK: line.k,
+          starts: starts.map((start) => ({
+            date: start.date,
+            opponentTeam: start.opponentTeam,
+            gameTime: start.gameTime,
+            homeAway: start.homeAway,
+          })),
+        }),
+      ];
+    })
+    .sort(
+      (a, b) =>
+        b.expectedStarts - a.expectedStarts ||
+        b.projectedIp - a.projectedIp ||
+        a.playerName.localeCompare(b.playerName),
+    );
+};
+
 const baseType = (availability: Availability, hasEmptySlot: boolean): TransactionType => {
   if (availability === "waiver") return "waiver-claim";
   return hasEmptySlot ? "free-agent-add" : "add-drop";
 };
 
+const clearsWaiverSpendThreshold = (
+  recommendation: AddRecommendation,
+  snapshot: LeagueStateSnapshot,
+) => {
+  if (snapshot.waiverPriority == null || snapshot.waiverPriority > TOP_WAIVER_PRIORITY_CUTOFF) {
+    return true;
+  }
+  return (
+    recommendation.seasonSgpDelta >= TOP_WAIVER_MIN_SEASON_SGP ||
+    recommendation.weeklyDelta >= TOP_WAIVER_MIN_WEEKLY_DELTA
+  );
+};
+
+const guardrailReason = (guardrail: Guardrail) => {
+  switch (guardrail) {
+    case "empty-slot-urgency":
+      return "open active slot creates immediate lineup value";
+    case "open-roster-capacity":
+      return "open bench capacity avoids dropping long-term value";
+    case "reserve-adds":
+      return "weekly add budget is being protected";
+    case "sixth-add-weekend":
+      return "late-week move must directly affect the matchup";
+    case "svh-program":
+      return "reliever helps the SV+H category";
+    case "streaming-skills":
+      return "pitcher clears strikeout/role streaming skill checks";
+    case "ratio-protection":
+      return "ERA/WHIP risk is inside the matchup guardrail";
+    case "ip-floor":
+      return "projected innings are below the 20-IP floor";
+    case "remaining-start":
+      return "starter has a remaining expected start";
+    case "two-start-planning":
+      return "probable schedule shows multi-start volume";
+    case "il-stash-stream":
+      return "IL capacity can preserve injured long-term value";
+  }
+};
+
 const buildRationale = (
   stepType: TransactionType,
   recommendation: AddRecommendation,
+  affectedCategories: ReadonlyArray<string>,
   guards: ReadonlyArray<Guardrail>,
 ) => {
   const action =
     stepType === "waiver-claim" ? "Claim" : stepType === "add-drop" ? "Add/drop" : "Add";
-  const categoryText = affectedCategoryNames(recommendation).slice(0, 3).join(", ") || "depth";
+  const decisionFocus =
+    affectedCategories.slice(0, 3).join(", ") ||
+    (guards.includes("empty-slot-urgency")
+      ? "open active slot without dropping long-term value"
+      : guards.includes("open-roster-capacity")
+        ? "open roster spot without dropping long-term value"
+        : "roster flexibility");
   const guardrailText =
-    guards.length > 0 ? guards.join(", ") : "replacement edge cleared; no extra urgency flags";
-  return `${action} ${recommendation.playerName}: ${recommendation.weeklyDelta.toFixed(2)} weekly category EV, ${recommendation.seasonSgpDelta.toFixed(2)} season SGP, targeting ${categoryText}. Guardrails: ${guardrailText}.`;
+    guards.length > 0
+      ? guards.map(guardrailReason).join("; ")
+      : "replacement edge cleared; no extra urgency flag is needed";
+  return `${action} ${recommendation.playerName}: ${recommendation.weeklyDelta.toFixed(2)} weekly category EV, ${recommendation.seasonSgpDelta.toFixed(2)} season SGP; focus ${decisionFocus}. Guardrails: ${guardrailText}.`;
 };
 
 export const planTransactions = (
@@ -403,21 +617,30 @@ export const planTransactions = (
     .flatMap((recommendation) => {
       const line = candidateLine(set, recommendation.playerKey);
       if (line == null) return [];
-      const emptySlots = activeEmptySlots(snapshot, line);
-      const hasEmptySlot = slotCount(emptySlots) > 0;
+      const activeSlots = activeEmptySlots(snapshot, line);
+      const hasActiveEmptySlot = slotCount(activeSlots) > 0;
+      const hasBenchEmptySlot = slotCount(benchEmptySlots(snapshot)) > 0;
+      const hasEmptySlot = hasActiveEmptySlot || hasBenchEmptySlot;
       const availability = options.availabilityByPlayerKey?.[line.playerKey] ?? "free-agent";
+      const type = baseType(availability, hasEmptySlot);
+      const weights = report.scout.categoryWeights;
+      const drop = type === "add-drop" ? weakestDrop(set, line, snapshot, weights) : undefined;
+      const hasUnlockedVolume = hasUnlockedLineupVolume(set, line);
       if (line.kind === "pitcher" && !passesStreamingGuardrails(line, targets) && !needIpFirst) {
         return [];
       }
 
       const guards: Array<Guardrail> = [];
       let score = recommendation.score;
-      if (hasEmptySlot) {
+      if (hasActiveEmptySlot) {
         guards.push("empty-slot-urgency");
         score +=
           line.kind === "batter"
             ? line.pa * EMPTY_SLOT_VOLUME_MULTIPLIER
             : line.out * EMPTY_SLOT_VOLUME_MULTIPLIER;
+      } else if (hasBenchEmptySlot) {
+        guards.push("open-roster-capacity");
+        score += line.kind === "batter" ? line.pa * 0.08 : line.out * 0.08;
       }
       if (addsRemaining <= reservedAdds && !hasEmptySlot) guards.push("reserve-adds");
       if (addsRemaining === 1 && weekDayIndex(asOf) >= 5) {
@@ -428,6 +651,9 @@ export const planTransactions = (
         guards.push("ip-floor");
         score += (WEEKLY_IP_FLOOR - ip) * 0.5 + line.ip;
       }
+      if (isStartingPitcherStream(line) && hasRemainingExpectedStart(line)) {
+        guards.push("remaining-start");
+      }
       if (line.kind === "pitcher" && line.qs >= 1.5) guards.push("two-start-planning");
       if (isSvhReliever(line)) guards.push("svh-program");
       if (line.kind === "pitcher") guards.push("streaming-skills", "ratio-protection");
@@ -437,8 +663,22 @@ export const planTransactions = (
       ) {
         guards.push("il-stash-stream");
       }
+      if (type === "add-drop" && drop != null) {
+        score = replacementValue(line, weights) - replacementValue(drop.line, weights);
+      }
 
-      return [{ recommendation, line, hasEmptySlot, availability, guards, score }];
+      return [
+        {
+          recommendation,
+          line,
+          hasEmptySlot,
+          hasUnlockedVolume,
+          availability,
+          guards,
+          score,
+          drop,
+        },
+      ];
     })
     .sort((a, b) => b.score - a.score);
 
@@ -457,22 +697,69 @@ export const planTransactions = (
         addPlayerName: entry.recommendation.playerName,
         dropPlayerName: dropName,
         score,
-        affectedCategories: affectedCategoryNames(entry.recommendation),
+        affectedCategories: decisionCategoryNames(entry.recommendation, entry.line, targets),
         reason,
       }),
     );
   };
 
+  if (addsRemaining <= 0) {
+    const top = ranked[0];
+    if (top != null) {
+      recordRejection(
+        top,
+        "weekly add limit is exhausted; no transaction can be made until the next matchup period",
+      );
+    }
+  }
+
   for (const [index, entry] of ranked.slice(0, actionableCount).entries()) {
     const type = baseType(entry.availability, entry.hasEmptySlot);
     const weights = report.scout.categoryWeights;
-    const drop = type === "add-drop" ? weakestDrop(set, entry.line, snapshot, weights) : undefined;
+    const drop = entry.drop;
     let score = entry.score;
-    let affectedCategories = affectedCategoryNames(entry.recommendation);
+    let affectedCategories = decisionCategoryNames(entry.recommendation, entry.line, targets);
     const timing = timingFor(index, addsRemaining, reservedAdds, asOf, entry.hasEmptySlot);
+    if (!entry.hasUnlockedVolume) {
+      recordRejection(
+        entry,
+        "player's team has no remaining games, so the add has no unlocked lineup volume",
+      );
+      continue;
+    }
+    if (type === "waiver-claim" && !clearsWaiverSpendThreshold(entry.recommendation, snapshot)) {
+      recordRejection(
+        entry,
+        `waiver priority ${snapshot.waiverPriority} is too valuable for a short-term streamer below the claim threshold`,
+      );
+      continue;
+    }
+    if (
+      isStartingPitcherStream(entry.line) &&
+      !hasRemainingExpectedStart(entry.line) &&
+      !entry.guards.includes("ip-floor")
+    ) {
+      recordRejection(
+        entry,
+        "SP stream has no remaining expected start in the current matchup window",
+      );
+      continue;
+    }
+    if (
+      type === "free-agent-add" &&
+      (entry.guards.includes("open-roster-capacity") ||
+        entry.guards.includes("empty-slot-urgency")) &&
+      affectedCategories.length === 0
+    ) {
+      const reason = entry.guards.includes("empty-slot-urgency")
+        ? "open active slot alone is not enough; add needs credible category value before using a move"
+        : "open bench slot alone is not enough; add needs credible category value before using a move";
+      recordRejection(entry, reason);
+      continue;
+    }
     if (type === "add-drop") {
       if (drop == null) {
-        recordRejection(entry, "no safe drop candidate was available");
+        recordRejection(entry, "no safe drop was available");
         continue;
       }
       if (entry.guards.length === 0 && timing === "now") {
@@ -495,18 +782,18 @@ export const planTransactions = (
       if (replacementEdge < minimumEdge) {
         recordRejection(
           entry,
-          `replacement edge ${replacementEdge.toFixed(2)} is below the ${minimumEdge.toFixed(2)} drop threshold`,
+          `replacement edge ${replacementEdge.toFixed(2)} is below the ${minimumEdge.toFixed(2)} drop threshold, so the manager is protecting roster value instead of forcing a drop`,
           replacementEdge,
           drop.line.name,
         );
         continue;
       }
-      score = Math.min(score, replacementEdge);
+      score = replacementEdge;
       affectedCategories = positiveReplacementCategories(entry.line, drop.line);
       if (affectedCategories.length === 0) {
         recordRejection(
           entry,
-          "candidate did not improve any category enough over the drop",
+          "add player did not improve any category enough over the drop",
           score,
           drop.line.name,
         );
@@ -524,7 +811,7 @@ export const planTransactions = (
         score,
         affectedCategories,
         guardrails: entry.guards,
-        rationale: buildRationale(type, entry.recommendation, entry.guards),
+        rationale: buildRationale(type, entry.recommendation, affectedCategories, entry.guards),
       }),
     );
   }
@@ -533,9 +820,22 @@ export const planTransactions = (
     addsRemaining,
     reservedAdds,
     projectedWeeklyIp: ip,
+    sgpDenominatorSource: report.sgpDenominatorSource ?? "fallback",
     closestCategories: [...targets],
     categorySituations: categorySituations(snapshot),
     todayGameWindow: todayGameWindow(set, asOf),
+    lineupRecommendations: report.lineupRecommendations.slice(0, 5).map(
+      (recommendation) =>
+        new TransactionLineupRecommendation({
+          startPlayerKey: recommendation.startPlayerKey,
+          startPlayerName: recommendation.startPlayerName,
+          sitPlayerKey: recommendation.sitPlayerKey,
+          sitPlayerName: recommendation.sitPlayerName,
+          scoreDelta: recommendation.scoreDelta,
+          affectedCategories: recommendation.affectedCategories.map((delta) => delta.category),
+        }),
+    ),
+    pitcherStarts: pitcherStarts(set, snapshot),
     rejectedTransactions,
     steps,
   });

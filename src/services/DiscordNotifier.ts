@@ -31,13 +31,15 @@ const DiscordActiveThreads = Schema.Struct({
 
 const threadNameForDate = (date: Date) => `Fantasy GM ${date.toISOString().slice(0, 10)}`;
 
-const actionLine = (action: ManualAction) => {
+const actionLine = (action: ManualAction, index?: number) => {
   const categories = action.categories.length > 0 ? action.categories.join(", ") : "depth";
-  return `${action.priority}. [${action.confidence.toUpperCase()}] ${action.action} (${categories})`;
+  const label =
+    action.confidence === "act" ? "ACT" : action.confidence === "hold" ? "WAIT" : "BLOCKED";
+  return `${index ?? action.priority}. [${label}] ${action.action} (${categories})`;
 };
 
-const actionBlock = (action: ManualAction) => {
-  const lines = [actionLine(action), `   Why: ${action.rationale}`];
+const actionBlock = (action: ManualAction, index?: number) => {
+  const lines = [actionLine(action, index), `   Why: ${action.rationale}`];
   const checks = action.checks.slice(0, 2);
   if (checks.length > 0) lines.push(`   Check: ${checks.join(" ")}`);
   const stopIf = action.stopIf[0];
@@ -82,7 +84,43 @@ const todayGameWindowLine = (briefing: ManagerBriefingReport) => {
   return `Today MLB games: ${window.remainingGames}/${window.games} not started; first ${first}; last ${last}`;
 };
 
+const isLineupMove = (line: string) =>
+  line.startsWith("Swap ") || line.startsWith("Move ") || line.startsWith("Replace ");
+
+const managerDecisionLine = (
+  briefing: ManagerBriefingReport,
+  lineupMoves: ReadonlyArray<string>,
+  actions: ReadonlyArray<ManualAction>,
+) => {
+  if (lineupMoves.length > 0) {
+    return `Fix lineup only: ${lineupMoves.length} internal move(s), then regenerate before any add/drop.`;
+  }
+  const actNow = actions.find((action) => action.confidence === "act");
+  if (actNow != null) return actNow.action;
+  const nextAction = actions[0];
+  if (nextAction?.confidence === "hold") {
+    return `Wait on ${nextAction.action}; timing guardrail is not clear yet.`;
+  }
+  if (nextAction != null) {
+    return `Decision blocked: ${nextAction.action}; execute only after the listed gate clears.`;
+  }
+  if (briefing.addsRemaining <= 0) {
+    return "No transaction available: weekly Yahoo add limit is exhausted.";
+  }
+  if (briefing.closestCategories.length > 0) {
+    return `No add/drop clears the manager bar; protect ${briefing.closestCategories.slice(0, 3).join(", ")}.`;
+  }
+  return "No add/drop clears the manager bar right now.";
+};
+
+const normalizeWarning = (warning: string) =>
+  warning.includes("manual manager decision")
+    ? "Manager decision generated from Yahoo roster, status, lock data, matchup context, and category guardrails."
+    : warning;
+
 export const renderManagerBriefingForDiscord = (briefing: ManagerBriefingReport) => {
+  const actions = briefing.doNow.length > 0 ? briefing.doNow : briefing.holdForLater.slice(0, 1);
+  const lineupMoves = briefing.lineupAlerts.filter(isLineupMove);
   const lines = [
     `**${briefing.summary}**`,
     "",
@@ -92,6 +130,9 @@ export const renderManagerBriefingForDiscord = (briefing: ManagerBriefingReport)
     `Reserved adds: ${briefing.reservedAdds}`,
     `Projected weekly IP: ${briefing.projectedWeeklyIp.toFixed(1)}`,
     `Closest categories: ${briefing.closestCategories.join(", ") || "none"}`,
+    "",
+    "**Manager decision**",
+    managerDecisionLine(briefing, lineupMoves, actions),
   ];
 
   if (briefing.categorySituations.length > 0) {
@@ -100,6 +141,10 @@ export const renderManagerBriefingForDiscord = (briefing: ManagerBriefingReport)
       "**Current categories**",
       ...briefing.categorySituations.map(categorySituationLine),
     );
+  }
+
+  if (briefing.managerTakeaways.length > 0) {
+    lines.push("", "**Manager read**", ...briefing.managerTakeaways.map((line) => `- ${line}`));
   }
 
   if (briefing.categoryPlan.length > 0) {
@@ -114,12 +159,33 @@ export const renderManagerBriefingForDiscord = (briefing: ManagerBriefingReport)
     );
   }
 
+  if (briefing.lineupAlerts.length > 0) {
+    lines.push("", "**Lineup alerts**", ...briefing.lineupAlerts.map((line) => `- ${line}`));
+  }
+
+  if ((briefing.pitcherStarts?.length ?? 0) > 0) {
+    lines.push("", "**Pitcher starts**", ...briefing.pitcherStarts!.map((line) => `- ${line}`));
+  }
+
   if (briefing.doNow.length > 0) {
-    lines.push("", "**Do now**", ...briefing.doNow.flatMap(actionBlock));
+    lines.push(
+      "",
+      "**Do now**",
+      ...briefing.doNow.flatMap((action, index) => actionBlock(action, index + 1)),
+    );
   }
 
   if (briefing.holdForLater.length > 0) {
-    lines.push("", "**Review / alternatives**", ...briefing.holdForLater.flatMap(actionBlock));
+    const holdHeading = briefing.holdForLater.some((action) => action.confidence === "review")
+      ? "**Blocked decision**"
+      : "**Hold for later**";
+    lines.push(
+      "",
+      holdHeading,
+      ...briefing.holdForLater
+        .slice(0, 1)
+        .flatMap((action, index) => actionBlock(action, index + 1)),
+    );
   }
 
   if (briefing.rejectedTransactions.length > 0) {
@@ -127,7 +193,11 @@ export const renderManagerBriefingForDiscord = (briefing: ManagerBriefingReport)
   }
 
   if (briefing.warnings.length > 0) {
-    lines.push("", "**Checks**", ...briefing.warnings.map((warning) => `- ${warning}`));
+    lines.push(
+      "",
+      "**Checks**",
+      ...briefing.warnings.map(normalizeWarning).map((warning) => `- ${warning}`),
+    );
   }
 
   return lines.join("\n");

@@ -209,6 +209,7 @@ describe("ProjectionModel Phase 2 math", () => {
     expect(line.era).toBe(3);
     expect(line.whip).toBe(1.1);
     expect(line.qs).toBeCloseTo(1.2);
+    expect(line.expectedStarts).toBe(2);
   });
 
   it("applies Statcast skill context to pitcher strikeouts and ratios", () => {
@@ -280,6 +281,35 @@ describe("ProjectionModel Phase 2 math", () => {
     expect(line.ip).toBeCloseTo((65 / 162) * 6);
     expect(line.out).toBeCloseTo((65 / 162) * 6 * 3);
     expect(line.svh).toBeCloseTo((24 / 162) * 6);
+  });
+
+  it("uses per-appearance workload when a reliever is listed for a probable start", () => {
+    const line = proratePitcherProjection(
+      new BlendedPitcherProjection({
+        kind: "pitcher",
+        playerKey: "mlb.p.opener",
+        name: "Listed Opener",
+        team: "MIA",
+        ip: 65,
+        gs: 0,
+        k: 78,
+        era: 3,
+        whip: 1.1,
+        qs: 0,
+        svh: 12,
+        appearances: 65,
+      }),
+      new WeeklyContext({
+        schedules: [new WeeklySchedule({ team: "MIA", gamesThisWeek: 6, gamesRemaining: 1 })],
+        probableStartsByPlayerKey: { "mlb.p.opener": 1 },
+        impliedRunsByTeam: {},
+      }),
+    );
+
+    expect(line.expectedStarts).toBe(1);
+    expect(line.ip).toBe(1);
+    expect(line.out).toBe(3);
+    expect(line.k).toBeCloseTo(1.2);
   });
 
   it("builds weekly expected lines for our roster, opponent roster, and free agents", () => {

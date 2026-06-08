@@ -146,6 +146,12 @@ export class LeagueState extends Context.Service<
           const matchup = matchupPayload.fantasy_content.team[1].matchups["0"].matchup;
           const teamMetadata = teamPayload.fantasy_content.team[0];
           const teamKey = `mlb.l.${yahoo.config.leagueId}.t.${yahoo.config.teamId}`;
+          const inferredAddsUsed = weeklyAddsUsed(
+            transactionsPayload.transactions,
+            teamKey,
+            matchup.week_start,
+            matchup.week_end,
+          );
           const opponentTeam = matchup["0"].teams["1"].team;
           const opponentInfo = opponentTeam[0];
           const myStats = matchup["0"].teams["0"].team[1].team_stats.stats;
@@ -170,12 +176,7 @@ export class LeagueState extends Context.Service<
             scoringCategories,
             weeklyAddLimit:
               rosterSettings?.max_weekly_adds ?? scoringSettings?.max_weekly_adds ?? 0,
-            addsUsed: weeklyAddsUsed(
-              transactionsPayload.transactions,
-              teamKey,
-              matchup.week_start,
-              matchup.week_end,
-            ),
+            addsUsed: teamMetadata.numberOfMoves ?? inferredAddsUsed,
             waiverPriority: teamMetadata.waiverPriority,
             faabBalance: teamMetadata.faabBalance,
             roster,

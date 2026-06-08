@@ -23,11 +23,12 @@ describe("Phase 0 health payload", () => {
       dailyTaskLimits: {
         "refresh-projections": 2,
         "refresh-context": 12,
-        "send-briefing": 1,
+        "apply-lineup": 1,
+        "send-briefing": 2,
       },
       defaults: {
         maxConfirmedLineupBoxscores: 0,
-        useStandingsHistory: false,
+        useStandingsHistory: true,
         dailyBriefingHourUtcFallback: 22,
       },
     });

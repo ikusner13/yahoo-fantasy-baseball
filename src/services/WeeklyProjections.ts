@@ -10,6 +10,7 @@ import {
   BatterProjectionSource,
   buildWeeklyProjectionSet,
   PitcherProjectionSource,
+  ProbablePitcherStart,
   ProjectionPool,
   WeeklyContext,
   WeeklyProjectionSet,
@@ -62,6 +63,7 @@ const availablePlayers = (payload: YahooPlayersPayload): ReadonlyArray<YahooProj
       playerKey: player.playerKey,
       name: player.name,
       team: player.team,
+      positions: player.eligiblePositions,
     };
   });
 
@@ -117,6 +119,7 @@ const canonicalizeBatters = (
         bb: row.bb,
         hbp: row.hbp,
         sf: row.sf,
+        eligiblePositions: player.positions == null ? undefined : [...player.positions],
       }),
     ];
   });
@@ -161,6 +164,7 @@ const canonicalizePitchers = (
         qs: row.qs,
         svh: row.svh,
         appearances: row.appearances,
+        eligiblePositions: player.positions == null ? undefined : [...player.positions],
       }),
     ];
   });
@@ -172,15 +176,33 @@ const remapProbableStarts = (
   pitchers: ReadonlyArray<PitcherProjectionSource>,
 ) => {
   const probableStartsByPlayerKey = { ...context.probableStartsByPlayerKey };
+  const probablePitcherStarts = [...(context.probablePitcherStarts ?? [])];
   for (const pitcher of pitchers) {
     if (pitcher.mlbId == null) continue;
-    const starts = context.probableStartsByPlayerKey[`mlb:${pitcher.mlbId}`];
+    const mlbKey = `mlb:${pitcher.mlbId}`;
+    const starts = context.probableStartsByPlayerKey[mlbKey];
     if (starts != null) probableStartsByPlayerKey[pitcher.playerKey] = starts;
+    for (const start of context.probablePitcherStarts?.filter(
+      (entry) => entry.playerKey === mlbKey,
+    ) ?? []) {
+      probablePitcherStarts.push(
+        new ProbablePitcherStart({
+          playerKey: pitcher.playerKey,
+          playerName: pitcher.name,
+          team: start.team,
+          opponentTeam: start.opponentTeam,
+          date: start.date,
+          gameTime: start.gameTime,
+          homeAway: start.homeAway,
+        }),
+      );
+    }
   }
   return new WeeklyContext({
     schedules: context.schedules,
     dailyGameWindows: context.dailyGameWindows,
     probableStartsByPlayerKey,
+    probablePitcherStarts,
     impliedRunsByTeam: context.impliedRunsByTeam,
     statcastByPlayerKey: context.statcastByPlayerKey,
     parkFactorsByTeam: context.parkFactorsByTeam,

@@ -6,6 +6,7 @@ import { LeagueState } from "../services/LeagueState.ts";
 import { ManagerBriefing } from "../services/ManagerBriefing.ts";
 import { Scheduler } from "../services/Scheduler.ts";
 import { TelegramNotifier } from "../services/TelegramNotifier.ts";
+import { deliverManagerBriefing } from "./delivery.ts";
 
 const briefingRoutines = new Set<string>([
   "daily-morning",
@@ -39,6 +40,5 @@ export const dispatchRoutine = (routine: RoutineName) =>
     const discord = yield* DiscordNotifier;
     const briefing = yield* managerBriefing.currentBriefing;
 
-    yield* telegram.postManagerBriefing(briefing);
-    yield* discord.postManagerBriefing(briefing);
+    yield* deliverManagerBriefing(briefing, telegram, discord);
   });

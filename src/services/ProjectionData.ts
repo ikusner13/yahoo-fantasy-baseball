@@ -23,6 +23,7 @@ import {
   DailyGameWindow,
   ParkFactorContext,
   PitcherProjectionSource,
+  ProbablePitcherStart,
   StatcastPlayerContext,
   WeeklyContext,
   WeeklySchedule,
@@ -632,6 +633,7 @@ export class ProjectionData extends Context.Service<
           { games: number; remainingGames: number; firstGameMs?: number; lastGameMs?: number }
         >();
         const probableStartsByPlayerKey: Record<string, number> = {};
+        const probablePitcherStarts: Array<ProbablePitcherStart> = [];
         const gamePks: Array<number> = [];
         for (const date of schedule.dates) {
           for (const game of date.games) {
@@ -674,11 +676,39 @@ export class ProjectionData extends Context.Service<
               const playerKey = `mlb:${away.probablePitcher.id}`;
               probableStartsByPlayerKey[playerKey] =
                 (probableStartsByPlayerKey[playerKey] ?? 0) + 1;
+              probablePitcherStarts.push(
+                new ProbablePitcherStart({
+                  playerKey,
+                  playerName: away.probablePitcher.fullName,
+                  team: away.team.abbreviation,
+                  opponentTeam: home.team.abbreviation,
+                  date: gameDateKey ?? startDate,
+                  gameTime:
+                    finiteGameStartMs == null
+                      ? undefined
+                      : new Date(finiteGameStartMs).toISOString(),
+                  homeAway: "away",
+                }),
+              );
             }
             if (isRemaining && home.probablePitcher != null) {
               const playerKey = `mlb:${home.probablePitcher.id}`;
               probableStartsByPlayerKey[playerKey] =
                 (probableStartsByPlayerKey[playerKey] ?? 0) + 1;
+              probablePitcherStarts.push(
+                new ProbablePitcherStart({
+                  playerKey,
+                  playerName: home.probablePitcher.fullName,
+                  team: home.team.abbreviation,
+                  opponentTeam: away.team.abbreviation,
+                  date: gameDateKey ?? startDate,
+                  gameTime:
+                    finiteGameStartMs == null
+                      ? undefined
+                      : new Date(finiteGameStartMs).toISOString(),
+                  homeAway: "home",
+                }),
+              );
             }
           }
         }
@@ -778,6 +808,12 @@ export class ProjectionData extends Context.Service<
             )
             .sort((a, b) => a.date.localeCompare(b.date)),
           probableStartsByPlayerKey,
+          probablePitcherStarts: probablePitcherStarts.sort(
+            (a, b) =>
+              a.date.localeCompare(b.date) ||
+              (a.gameTime ?? "").localeCompare(b.gameTime ?? "") ||
+              a.playerName.localeCompare(b.playerName),
+          ),
           impliedRunsByTeam,
           statcastByPlayerKey,
           parkFactorsByTeam,

@@ -9,13 +9,7 @@ export default defineConfig({
     target: "webworker",
   },
   test: {
-    include: [
-      "tests/phase0/**/*.test.ts",
-      "tests/phase1/**/*.test.ts",
-      "tests/phase2/**/*.test.ts",
-      "tests/phase3/**/*.test.ts",
-      "tests/phase4/**/*.test.ts",
-    ],
+    include: ["tests/**/*.test.ts"],
   },
   staged: {
     "*": "vp check --fix",

@@ -28,6 +28,22 @@ const httpClient = (body: unknown, status = 200): HttpClient.HttpClient =>
   );
 
 describe("YahooOAuth", () => {
+  it("requests Fantasy Sports read/write scope when building the authorization URL", () => {
+    const oauth = makeYahooOAuth(config, memoryYahooTokenStore(), httpClient({}));
+    const url = new URL(oauth.authorizationUrl("https://example.test/callback"));
+
+    expect(url.searchParams.get("scope")).toBe("fspt-w");
+  });
+
+  it("can include admin state in the authorization URL", () => {
+    const oauth = makeYahooOAuth(config, memoryYahooTokenStore(), httpClient({}));
+    const url = new URL(
+      oauth.authorizationUrlWithState("https://example.test/callback", "admin-state"),
+    );
+
+    expect(url.searchParams.get("state")).toBe("admin-state");
+  });
+
   it.effect("returns a stored access token when it has not expired", () =>
     Effect.gen(function* () {
       const store = memoryYahooTokenStore(
