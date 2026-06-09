@@ -90,123 +90,114 @@ export class LeagueState extends Context.Service<
     LeagueState,
     Effect.gen(function* () {
       const yahoo = yield* YahooClient;
-      const snapshot = yield* Effect.cached(
-        Effect.gen(function* () {
-          const [settingsPayload, teamPayload, rosterPayload, matchupPayload, transactionsPayload] =
-            yield* Effect.all([
-              yahoo.getLeagueSettings,
-              yahoo.getTeamMetadata,
-              yahoo.getRoster,
-              yahoo.getCurrentMatchup,
-              yahoo.getLeagueTransactions(100),
-            ]);
+      const snapshot = Effect.gen(function* () {
+        const [settingsPayload, teamPayload, rosterPayload, matchupPayload, transactionsPayload] =
+          yield* Effect.all([
+            yahoo.getLeagueSettings,
+            yahoo.getTeamMetadata,
+            yahoo.getRoster,
+            yahoo.getCurrentMatchup,
+            yahoo.getLeagueTransactions(100),
+          ]);
 
-          const settings = settingsPayload.fantasy_content.league[1].settings;
-          const scoringSettings = settings.find((entry) => entry.stat_categories != null);
-          const rosterSettings = settings.find((entry) => entry.roster_positions != null);
-          const rosterSlots =
-            rosterSettings?.roster_positions?.map(
-              (slot) => new RosterSlotCount({ position: slot.position, count: slot.count }),
-            ) ?? [];
-          const scoringCategories =
-            scoringSettings?.stat_categories?.stats
-              .filter((entry) => entry.stat.is_only_display_stat !== "1")
-              .map((entry) => entry.stat.display_name) ?? [];
+        const settings = settingsPayload.fantasy_content.league[1].settings;
+        const scoringSettings = settings.find((entry) => entry.stat_categories != null);
+        const rosterSettings = settings.find((entry) => entry.roster_positions != null);
+        const rosterSlots =
+          rosterSettings?.roster_positions?.map(
+            (slot) => new RosterSlotCount({ position: slot.position, count: slot.count }),
+          ) ?? [];
+        const scoringCategories =
+          scoringSettings?.stat_categories?.stats
+            .filter((entry) => entry.stat.is_only_display_stat !== "1")
+            .map((entry) => entry.stat.display_name) ?? [];
 
-          const rosterPlayers = rosterPayload.fantasy_content.team[1].roster["0"].players;
-          const roster = rosterPlayers.map((entry) => {
-            const [player, selectedPosition] = entry.player;
-            return new LeagueStatePlayer({
-              playerKey: player.playerKey,
-              name: player.name,
-              team: player.team,
-              eligiblePositions: player.eligiblePositions,
-              selectedPosition: selectedPosition?.position ?? "BN",
-              status: player.status,
-            });
+        const rosterPlayers = rosterPayload.fantasy_content.team[1].roster["0"].players;
+        const roster = rosterPlayers.map((entry) => {
+          const [player, selectedPosition] = entry.player;
+          return new LeagueStatePlayer({
+            playerKey: player.playerKey,
+            name: player.name,
+            team: player.team,
+            eligiblePositions: player.eligiblePositions,
+            selectedPosition: selectedPosition?.position ?? "BN",
+            status: player.status,
           });
+        });
 
-          const usedSlots = new Map<string, number>();
-          for (const player of roster) {
-            usedSlots.set(
-              player.selectedPosition,
-              (usedSlots.get(player.selectedPosition) ?? 0) + 1,
-            );
-          }
-          const emptySlots = rosterSlots
-            .map(
-              (slot) =>
-                new RosterSlotCount({
-                  position: slot.position,
-                  count: Math.max(0, slot.count - (usedSlots.get(slot.position) ?? 0)),
-                }),
-            )
-            .filter((slot) => slot.count > 0);
+        const usedSlots = new Map<string, number>();
+        for (const player of roster) {
+          usedSlots.set(player.selectedPosition, (usedSlots.get(player.selectedPosition) ?? 0) + 1);
+        }
+        const emptySlots = rosterSlots
+          .map(
+            (slot) =>
+              new RosterSlotCount({
+                position: slot.position,
+                count: Math.max(0, slot.count - (usedSlots.get(slot.position) ?? 0)),
+              }),
+          )
+          .filter((slot) => slot.count > 0);
 
-          const matchup = matchupPayload.fantasy_content.team[1].matchups["0"].matchup;
-          const teamMetadata = teamPayload.fantasy_content.team[0];
-          const teamKey = `mlb.l.${yahoo.config.leagueId}.t.${yahoo.config.teamId}`;
-          const inferredAddsUsed = weeklyAddsUsed(
-            transactionsPayload.transactions,
-            teamKey,
-            matchup.week_start,
-            matchup.week_end,
-          );
-          const opponentTeam = matchup["0"].teams["1"].team;
-          const opponentInfo = opponentTeam[0];
-          const myStats = matchup["0"].teams["0"].team[1].team_stats.stats;
-          const opponentStats = matchup["0"].teams["1"].team[1].team_stats.stats;
-          const opponentStatsById = new Map(
-            opponentStats.map((entry) => [
-              String(entry.stat.stat_id),
-              stringField(entry.stat.value),
-            ]),
-          );
-          const categoryNameById = new Map(
-            scoringSettings?.stat_categories?.stats.map((entry) => [
-              String(entry.stat.stat_id),
-              entry.stat.display_name,
-            ]) ?? [],
-          );
+        const matchup = matchupPayload.fantasy_content.team[1].matchups["0"].matchup;
+        const teamMetadata = teamPayload.fantasy_content.team[0];
+        const teamKey = `mlb.l.${yahoo.config.leagueId}.t.${yahoo.config.teamId}`;
+        const inferredAddsUsed = weeklyAddsUsed(
+          transactionsPayload.transactions,
+          teamKey,
+          matchup.week_start,
+          matchup.week_end,
+        );
+        const opponentTeam = matchup["0"].teams["1"].team;
+        const opponentInfo = opponentTeam[0];
+        const myStats = matchup["0"].teams["0"].team[1].team_stats.stats;
+        const opponentStats = matchup["0"].teams["1"].team[1].team_stats.stats;
+        const opponentStatsById = new Map(
+          opponentStats.map((entry) => [String(entry.stat.stat_id), stringField(entry.stat.value)]),
+        );
+        const categoryNameById = new Map(
+          scoringSettings?.stat_categories?.stats.map((entry) => [
+            String(entry.stat.stat_id),
+            entry.stat.display_name,
+          ]) ?? [],
+        );
 
-          return new LeagueStateSnapshot({
-            leagueId: yahoo.config.leagueId,
-            teamId: yahoo.config.teamId,
-            scoringFormat: "cumulative-category-h2h",
-            scoringCategories,
-            weeklyAddLimit:
-              rosterSettings?.max_weekly_adds ?? scoringSettings?.max_weekly_adds ?? 0,
-            addsUsed: teamMetadata.numberOfMoves ?? inferredAddsUsed,
-            waiverPriority: teamMetadata.waiverPriority,
-            faabBalance: teamMetadata.faabBalance,
-            roster,
-            rosterSlots,
-            emptySlots,
-            ilUsed: usedSlots.get("IL") ?? 0,
-            ilSlots: rosterSlots.find((slot) => slot.position === "IL")?.count ?? 0,
-            matchup: {
-              week: matchup.week,
-              weekStart: matchup.week_start,
-              weekEnd: matchup.week_end,
-              opponentTeamKey: opponentInfo.teamKey,
-              opponentTeamName: opponentInfo.teamName,
-              categories: myStats
-                .map((entry) => {
-                  const statId = String(entry.stat.stat_id);
-                  const category = categoryNameById.get(statId);
-                  const opponentValue = opponentStatsById.get(statId);
-                  if (category == null || opponentValue == null) return undefined;
-                  return new MatchupCategoryScore({
-                    category,
-                    myValue: stringField(entry.stat.value),
-                    opponentValue,
-                  });
-                })
-                .filter((entry): entry is MatchupCategoryScore => entry != null),
-            },
-          });
-        }),
-      );
+        return new LeagueStateSnapshot({
+          leagueId: yahoo.config.leagueId,
+          teamId: yahoo.config.teamId,
+          scoringFormat: "cumulative-category-h2h",
+          scoringCategories,
+          weeklyAddLimit: rosterSettings?.max_weekly_adds ?? scoringSettings?.max_weekly_adds ?? 0,
+          addsUsed: teamMetadata.numberOfMoves ?? inferredAddsUsed,
+          waiverPriority: teamMetadata.waiverPriority,
+          faabBalance: teamMetadata.faabBalance,
+          roster,
+          rosterSlots,
+          emptySlots,
+          ilUsed: usedSlots.get("IL") ?? 0,
+          ilSlots: rosterSlots.find((slot) => slot.position === "IL")?.count ?? 0,
+          matchup: {
+            week: matchup.week,
+            weekStart: matchup.week_start,
+            weekEnd: matchup.week_end,
+            opponentTeamKey: opponentInfo.teamKey,
+            opponentTeamName: opponentInfo.teamName,
+            categories: myStats
+              .map((entry) => {
+                const statId = String(entry.stat.stat_id);
+                const category = categoryNameById.get(statId);
+                const opponentValue = opponentStatsById.get(statId);
+                if (category == null || opponentValue == null) return undefined;
+                return new MatchupCategoryScore({
+                  category,
+                  myValue: stringField(entry.stat.value),
+                  opponentValue,
+                });
+              })
+              .filter((entry): entry is MatchupCategoryScore => entry != null),
+          },
+        });
+      });
 
       return LeagueState.of({
         snapshot,
