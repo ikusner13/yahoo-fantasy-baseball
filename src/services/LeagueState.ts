@@ -23,12 +23,19 @@ const weeklyAddsUsed = (
   const start = parseDateBoundary(weekStart, "start");
   const end = parseDateBoundary(weekEnd, "end");
   if (start == null || end == null) return 0;
+  const yahooTeamKeySuffix = teamKey.slice(teamKey.indexOf(".l."));
   const counted = new Set<string>();
   for (const transaction of transactions) {
     if (transaction.timestamp < start || transaction.timestamp > end) continue;
     if (transaction.status !== "successful") continue;
     if (!["add", "add/drop", "waiver"].includes(transaction.type)) continue;
-    if (!transaction.addsToTeamKeys.includes(teamKey)) continue;
+    if (
+      !transaction.addsToTeamKeys.some(
+        (addTeamKey) => addTeamKey === teamKey || addTeamKey.endsWith(yahooTeamKeySuffix),
+      )
+    ) {
+      continue;
+    }
     counted.add(transaction.transactionKey);
   }
   return counted.size;
@@ -168,7 +175,7 @@ export class LeagueState extends Context.Service<
           scoringFormat: "cumulative-category-h2h",
           scoringCategories,
           weeklyAddLimit: rosterSettings?.max_weekly_adds ?? scoringSettings?.max_weekly_adds ?? 0,
-          addsUsed: teamMetadata.numberOfMoves ?? inferredAddsUsed,
+          addsUsed: inferredAddsUsed,
           waiverPriority: teamMetadata.waiverPriority,
           faabBalance: teamMetadata.faabBalance,
           roster,

@@ -166,7 +166,7 @@ const transactionsFixture = {
         transactions: {
           "0": {
             transaction: {
-              transaction_key: "mlb.l.62744.tr.1",
+              transaction_key: "469.l.62744.tr.1",
               type: "add/drop",
               status: "successful",
               timestamp: `${Date.parse("2026-06-03T12:00:00.000Z") / 1000}`,
@@ -177,7 +177,7 @@ const transactionsFixture = {
                     {
                       transaction_data: {
                         type: "add",
-                        destination_team_key: "mlb.l.62744.t.12",
+                        destination_team_key: "469.l.62744.t.12",
                       },
                     },
                   ],
@@ -429,7 +429,7 @@ describe("LeagueState.layerLive", () => {
 
       expect(snapshot.scoringCategories).toEqual(["R", "HR"]);
       expect(snapshot.weeklyAddLimit).toBe(6);
-      expect(snapshot.addsUsed).toBe(4);
+      expect(snapshot.addsUsed).toBe(1);
       expect(snapshot.waiverPriority).toBe(2);
       expect(snapshot.faabBalance).toBe(81);
       expect(snapshot.roster[0]).toMatchObject({
@@ -460,7 +460,7 @@ describe("LeagueState.layerLive", () => {
     ),
   );
 
-  it.effect("falls back to weekly transaction inference when Yahoo omits number_of_moves", () =>
+  it.effect("uses weekly transaction inference when Yahoo omits number_of_moves", () =>
     Effect.gen(function* () {
       const leagueState = yield* LeagueState;
       const snapshot = yield* leagueState.snapshot;
