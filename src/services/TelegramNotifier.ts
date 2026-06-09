@@ -44,13 +44,21 @@ const compactGameWindow = (briefing: ManagerBriefingReport) => {
   return `Games: ${window.remainingGames}/${window.games} unlocked, first ${first}`;
 };
 
-const actionLabel = (confidence: ManagerBriefingReport["doNow"][number]["confidence"]) => {
+const actionLabel = (
+  confidence: ManagerBriefingReport["doNow"][number]["confidence"],
+  options: { readonly afterLineupFix?: boolean } = {},
+) => {
   if (confidence === "act") return "DO NOW";
   if (confidence === "hold") return "WAIT";
+  if (options.afterLineupFix) return "AFTER LINEUP FIX";
   return "BLOCKED";
 };
 
-const compactAction = (action: ManagerBriefingReport["doNow"][number], index: number) => {
+const compactAction = (
+  action: ManagerBriefingReport["doNow"][number],
+  index: number,
+  options: { readonly afterLineupFix?: boolean } = {},
+) => {
   const focus =
     action.categories.length > 0
       ? action.categories.join(", ")
@@ -60,7 +68,7 @@ const compactAction = (action: ManagerBriefingReport["doNow"][number], index: nu
           ? "open roster spot, no drop"
           : "roster flexibility";
   const lines = [
-    `${index}. [${actionLabel(action.confidence)}] ${action.action}`,
+    `${index}. [${actionLabel(action.confidence, options)}] ${action.action}`,
     `   Focus: ${focus}`,
     `   Why: ${action.rationale}`,
   ];
@@ -148,6 +156,16 @@ export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport
       : hasBlockedDecision
         ? "🧱 Blocked Decision"
         : "⏸️ Not Doing Now";
+  const actionSection =
+    actions.length === 0
+      ? []
+      : [
+          "",
+          actionHeader,
+          ...actions.flatMap((action, index) =>
+            compactAction(action, index + 1, { afterLineupFix: hasUrgentLineup }),
+          ),
+        ];
   const lines = [
     "⚾ Fantasy GM",
     briefing.summary,
@@ -169,6 +187,10 @@ export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport
       "🧾 Do This",
       ...briefing.bestActionSteps!.slice(0, 5).map((line) => `• ${line}`),
     );
+  }
+
+  if (hasUrgentLineup) {
+    lines.push(...actionSection);
   }
 
   if ((briefing.decisionEvidence?.length ?? 0) > 0) {
@@ -224,18 +246,8 @@ export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport
     );
   }
 
-  if (actions.length > 0 && (hasActNow || hasUrgentLineup)) {
-    lines.push(
-      "",
-      actionHeader,
-      ...actions.flatMap((action, index) => compactAction(action, index + 1)),
-    );
-  } else if (actions.length > 0) {
-    lines.push(
-      "",
-      actionHeader,
-      ...actions.flatMap((action, index) => compactAction(action, index + 1)),
-    );
+  if (!hasUrgentLineup) {
+    lines.push(...actionSection);
   }
 
   if (briefing.categorySituations.length > 0 && !hasUrgentLineup) {

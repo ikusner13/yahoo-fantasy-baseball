@@ -120,6 +120,7 @@ describe("TelegramNotifier", () => {
     expect(message).toContain("• Move Injured Catcher from C to IL");
     expect(message).toContain("🔎 Why");
     expect(message).toContain("adds: 2 left, 0 reserved");
+    expect(message.indexOf("🎯 Next Add After Lineup Fix")).toBeLessThan(message.indexOf("🔎 Why"));
     expect(message).toContain("🧠 Manager Read");
     expect(message).toContain("Lineup first");
     expect(message).toContain("🧭 Add Triggers");
@@ -137,7 +138,8 @@ describe("TelegramNotifier", () => {
     expect(message).toContain("4. Save roster changes, then re-run the lineup check.");
     expect(message).not.toContain("⛔ Skipped");
     expect(message).toContain("🎯 Next Add After Lineup Fix");
-    expect(message).toContain("1. [BLOCKED] Add Speed Bat into the open active slot");
+    expect(message).toContain("1. [AFTER LINEUP FIX] Add Speed Bat into the open active slot");
+    expect(message).not.toContain("1. [BLOCKED] Add Speed Bat into the open active slot");
     expect(message).not.toContain("[REVIEW]");
     expect(message).toContain("Why: Add Speed Bat");
     expect(message).toContain("Yahoo:");
