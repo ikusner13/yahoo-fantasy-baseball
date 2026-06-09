@@ -33,7 +33,11 @@ type YahooProjectionPlayer = {
   readonly name: string;
   readonly team: string;
   readonly positions?: ReadonlyArray<string>;
+  readonly status?: string;
 };
+
+export const isUnavailableFreeAgentStatus = (status: string | undefined) =>
+  status != null && (status.startsWith("IL") || ["NA", "O", "SUSP"].includes(status));
 
 const normalizeName = (name: string) =>
   name
@@ -53,19 +57,23 @@ const rosterPlayers = (payload: YahooRosterPayload): ReadonlyArray<YahooProjecti
       name: player.name,
       team: player.team,
       positions: player.eligiblePositions,
+      status: player.status,
     };
   });
 
 const availablePlayers = (payload: YahooPlayersPayload): ReadonlyArray<YahooProjectionPlayer> =>
-  payload.fantasy_content.league[1].players.map((entry) => {
-    const [player] = entry.player;
-    return {
-      playerKey: player.playerKey,
-      name: player.name,
-      team: player.team,
-      positions: player.eligiblePositions,
-    };
-  });
+  payload.fantasy_content.league[1].players
+    .map((entry) => {
+      const [player] = entry.player;
+      return {
+        playerKey: player.playerKey,
+        name: player.name,
+        team: player.team,
+        positions: player.eligiblePositions,
+        status: player.status,
+      };
+    })
+    .filter((player) => !isUnavailableFreeAgentStatus(player.status));
 
 const snapshotPlayers = (
   players: ReadonlyArray<LeagueStatePlayer>,
@@ -75,6 +83,7 @@ const snapshotPlayers = (
     name: player.name,
     team: player.team,
     positions: player.eligiblePositions,
+    status: player.status,
   }));
 
 const canonicalizeBatters = (

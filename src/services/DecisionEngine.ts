@@ -476,7 +476,8 @@ const isActive = (player: LeagueStatePlayer | undefined) =>
   player != null && !["BN", "IL", "IL+", "NA"].includes(player.selectedPosition);
 
 const isHardUnavailableStatus = (status: string | undefined) =>
-  status != null && (status.startsWith("IL") || status === "NA" || status === "O");
+  status != null &&
+  (status.startsWith("IL") || status === "NA" || status === "O" || status === "SUSP");
 
 const isStartableReserve = (player: LeagueStatePlayer | undefined) =>
   player != null && player.selectedPosition === "BN" && !isHardUnavailableStatus(player.status);

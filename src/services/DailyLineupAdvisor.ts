@@ -7,7 +7,7 @@ import * as Schema from "effect/Schema";
 import { type YahooApiError, YahooClient, type YahooRosterPayload } from "./YahooClient.ts";
 
 const RESERVE_SLOTS = new Set(["BN", "IL", "NA"]);
-const HARD_UNAVAILABLE_STATUSES = new Set(["NA", "O"]);
+const HARD_UNAVAILABLE_STATUSES = new Set(["NA", "O", "SUSP"]);
 
 export class DailyLineupPlayer extends Schema.Class<DailyLineupPlayer>("DailyLineupPlayer")({
   playerKey: Schema.String,
