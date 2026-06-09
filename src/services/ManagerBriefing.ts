@@ -828,7 +828,10 @@ export const buildManagerBriefing = (
 };
 
 const isLineupMove = (line: string) =>
-  line.startsWith("Swap ") || line.startsWith("Move ") || line.startsWith("Replace ");
+  line.startsWith("Swap ") ||
+  line.startsWith("Move ") ||
+  line.startsWith("Replace ") ||
+  line.startsWith("Start ");
 
 export const buildYahooApplyPlan = (briefing: ManagerBriefingReport) => {
   const lineupMoves = briefing.lineupAlerts.filter(isLineupMove);

@@ -631,6 +631,124 @@ describe("DecisionEngine Phase 3", () => {
     });
   });
 
+  it("recommends bench bats when a legal improvement requires reassigning active positions", () => {
+    const set = new WeeklyProjectionSet({
+      myRoster: [
+        batter({ playerKey: "active-second", name: "Active Second", pa: 12, r: 1, hr: 0 }),
+        batter({ playerKey: "active-third", name: "Active Third", pa: 8, r: 0, hr: 0 }),
+        batter({ playerKey: "active-short", name: "Active Short", pa: 22, r: 3, hr: 1 }),
+        batter({ playerKey: "active-util", name: "Active Util", pa: 18, r: 2, hr: 1 }),
+        batter({ playerKey: "bench-short", name: "Bench Short", pa: 30, r: 6, hr: 2 }),
+        batter({ playerKey: "bench-third", name: "Bench Third", pa: 26, r: 5, hr: 2 }),
+        batter({ playerKey: "il-bat", name: "IL Bat", pa: 34, r: 8, hr: 4 }),
+      ],
+      opponentRoster: [batter({ playerKey: "opp", hr: 3 })],
+      freeAgents: [],
+    });
+    const baseline = simulateMatchup(set.myRoster, set.opponentRoster, 1000, 7);
+    const snapshot = new LeagueStateSnapshot({
+      leagueId: "62744",
+      teamId: "12",
+      scoringFormat: "cumulative-category-h2h",
+      scoringCategories: [
+        "R",
+        "H",
+        "HR",
+        "RBI",
+        "SB",
+        "TB",
+        "OBP",
+        "OUT",
+        "K",
+        "ERA",
+        "WHIP",
+        "QS",
+        "SV+H",
+      ],
+      weeklyAddLimit: 6,
+      addsUsed: 0,
+      roster: [
+        new LeagueStatePlayer({
+          playerKey: "active-second",
+          name: "Active Second",
+          team: "NYY",
+          eligiblePositions: ["2B"],
+          selectedPosition: "2B",
+        }),
+        new LeagueStatePlayer({
+          playerKey: "active-third",
+          name: "Active Third",
+          team: "NYY",
+          eligiblePositions: ["3B"],
+          selectedPosition: "3B",
+        }),
+        new LeagueStatePlayer({
+          playerKey: "active-short",
+          name: "Active Short",
+          team: "NYY",
+          eligiblePositions: ["SS", "Util"],
+          selectedPosition: "SS",
+        }),
+        new LeagueStatePlayer({
+          playerKey: "active-util",
+          name: "Active Util",
+          team: "NYY",
+          eligiblePositions: ["1B", "Util"],
+          selectedPosition: "Util",
+        }),
+        new LeagueStatePlayer({
+          playerKey: "bench-short",
+          name: "Bench Short",
+          team: "LAD",
+          eligiblePositions: ["SS", "Util"],
+          selectedPosition: "BN",
+        }),
+        new LeagueStatePlayer({
+          playerKey: "bench-third",
+          name: "Bench Third",
+          team: "LAD",
+          eligiblePositions: ["3B", "Util"],
+          selectedPosition: "BN",
+        }),
+        new LeagueStatePlayer({
+          playerKey: "il-bat",
+          name: "IL Bat",
+          team: "LAD",
+          eligiblePositions: ["OF", "Util", "IL"],
+          selectedPosition: "IL",
+          status: "IL10",
+        }),
+      ],
+      rosterSlots: [
+        new RosterSlotCount({ position: "2B", count: 1 }),
+        new RosterSlotCount({ position: "3B", count: 1 }),
+        new RosterSlotCount({ position: "SS", count: 1 }),
+        new RosterSlotCount({ position: "Util", count: 1 }),
+      ],
+      emptySlots: [],
+      ilUsed: 1,
+      ilSlots: 1,
+      matchup: {
+        week: 11,
+        weekStart: "2026-06-01",
+        weekEnd: "2026-06-07",
+        opponentTeamKey: "mlb.l.62744.t.3",
+        opponentTeamName: "Opponent",
+        categories: [],
+      },
+    });
+
+    const moves = optimizeLineup(set, baseline, snapshot);
+
+    expect(moves.map((move) => [move.startPlayerKey, move.sitPlayerKey])).toEqual(
+      expect.arrayContaining([
+        ["bench-short", "active-util"],
+        ["bench-third", "active-third"],
+      ]),
+    );
+    expect(moves).toHaveLength(2);
+  });
+
   it("does not recommend starting players parked in IL slots", () => {
     const set = new WeeklyProjectionSet({
       myRoster: [

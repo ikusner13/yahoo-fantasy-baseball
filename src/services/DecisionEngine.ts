@@ -496,6 +496,60 @@ const canFillSelectedPosition = (
   return player.eligiblePositions.includes(selectedPosition);
 };
 
+type LineupAssignment = {
+  readonly line: WeeklyLine;
+  readonly score: number;
+  readonly slot: string;
+};
+
+const optimalAssignments = (
+  ranked: ReadonlyArray<{ readonly line: WeeklyLine; readonly score: number }>,
+  slots: ReadonlyArray<string>,
+  rosterByKey: ReadonlyMap<string, LeagueStatePlayer>,
+  kind: WeeklyLine["kind"],
+) => {
+  const orderedSlots = [...slots].sort((a, b) => {
+    const aEligible = ranked.filter((entry) =>
+      canFillSelectedPosition(rosterByKey.get(entry.line.playerKey), a, kind),
+    ).length;
+    const bEligible = ranked.filter((entry) =>
+      canFillSelectedPosition(rosterByKey.get(entry.line.playerKey), b, kind),
+    ).length;
+    return aEligible - bEligible;
+  });
+
+  let bestScore = -Infinity;
+  let bestAssignments: ReadonlyArray<LineupAssignment> = [];
+
+  const search = (
+    slotIndex: number,
+    usedKeys: ReadonlySet<string>,
+    score: number,
+    assignments: ReadonlyArray<LineupAssignment>,
+  ) => {
+    if (slotIndex >= orderedSlots.length) {
+      if (score > bestScore) {
+        bestScore = score;
+        bestAssignments = assignments;
+      }
+      return;
+    }
+
+    const slot = orderedSlots[slotIndex]!;
+    for (const entry of ranked) {
+      if (usedKeys.has(entry.line.playerKey)) continue;
+      if (!canFillSelectedPosition(rosterByKey.get(entry.line.playerKey), slot, kind)) continue;
+      search(slotIndex + 1, new Set([...usedKeys, entry.line.playerKey]), score + entry.score, [
+        ...assignments,
+        { ...entry, slot },
+      ]);
+    }
+  };
+
+  search(0, new Set(), 0, []);
+  return bestAssignments;
+};
+
 export const activeWeeklyLines = (
   lines: ReadonlyArray<WeeklyLine>,
   snapshot: LeagueStateSnapshot | undefined,
@@ -526,15 +580,35 @@ export const optimizeLineup = (
     snapshot?.roster.filter((player) => isActive(player)).map((player) => player.playerKey) ?? [],
   );
   const buildRecommendations = (kind: WeeklyLine["kind"]) => {
-    const lines = set.myRoster.filter((line) => line.kind === kind);
-    const activeCount =
-      activeSlotCount(snapshot, kind) ||
-      lines.filter((line) => currentActive.has(line.playerKey)).length;
-    if (activeCount <= 0) return [];
+    const lines = set.myRoster.filter((line) => {
+      if (line.kind !== kind) return false;
+      if (snapshot == null) return true;
+      const player = rosterByKey.get(line.playerKey);
+      return currentActive.has(line.playerKey) || isStartableReserve(player);
+    });
+    const activeSlots =
+      snapshot == null
+        ? Array.from(
+            { length: Math.min(activeSlotCount(snapshot, kind) || lines.length, lines.length) },
+            () => (kind === "batter" ? "Util" : "P"),
+          )
+        : lines.flatMap((line) => {
+            if (!currentActive.has(line.playerKey)) return [];
+            const position = rosterByKey.get(line.playerKey)?.selectedPosition;
+            return position == null ? [] : [position];
+          });
+    if (activeSlots.length <= 0) return [];
     const ranked = lines
       .map((line) => ({ line, score: lineScore(line, denominators, weights) }))
       .sort((a, b) => b.score - a.score);
-    const shouldStart = new Set(ranked.slice(0, activeCount).map((entry) => entry.line.playerKey));
+    const assignments =
+      snapshot == null
+        ? ranked.slice(0, activeSlots.length).map((entry, index) => ({
+            ...entry,
+            slot: activeSlots[index] ?? (kind === "batter" ? "Util" : "P"),
+          }))
+        : optimalAssignments(ranked, activeSlots, rosterByKey, kind);
+    const shouldStart = new Set(assignments.map((entry) => entry.line.playerKey));
     const sitCandidates = ranked
       .filter(
         (entry) =>
