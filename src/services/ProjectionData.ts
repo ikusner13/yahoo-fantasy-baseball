@@ -182,8 +182,9 @@ const MlbBoxscorePayload = Schema.Struct({
 });
 
 const savantBatterSelections =
-  "xwoba,barrel_batted_rate,hard_hit_percent,avg_hit_speed,k_percent,sprint_speed";
-const savantPitcherSelections = "xwoba,barrel_batted_rate,whiff_percent,k_percent";
+  "pa,xwoba,barrel_batted_rate,hard_hit_percent,avg_hit_speed,k_percent,sprint_speed";
+// `pa` ≈ batters faced (TBF) for pitchers; `pitches` is the pitch count used to stabilize whiff%.
+const savantPitcherSelections = "pa,pitches,xwoba,barrel_batted_rate,whiff_percent,k_percent";
 
 export class ProjectionDataError extends Data.TaggedError("ProjectionDataError")<{
   readonly message: string;
@@ -571,6 +572,7 @@ export class ProjectionData extends Context.Service<
                 if (playerId == null) continue;
                 const context = compactStatcastContext(
                   new StatcastPlayerContext({
+                    pa: numberFromCsv(row.pa),
                     xwoba: numberFromCsv(row.xwoba),
                     barrelPct: numberFromCsv(row.barrel_batted_rate),
                     hardHitPct: numberFromCsv(row.hard_hit_percent),
@@ -585,6 +587,8 @@ export class ProjectionData extends Context.Service<
                 if (playerId == null) continue;
                 const context = compactStatcastContext(
                   new StatcastPlayerContext({
+                    pa: numberFromCsv(row.pa),
+                    pitches: numberFromCsv(row.pitches),
                     xwoba: numberFromCsv(row.xwoba),
                     barrelPct: numberFromCsv(row.barrel_batted_rate),
                     whiffPct: numberFromCsv(row.whiff_percent),

@@ -57,6 +57,11 @@ export class StatcastPlayerContext extends Schema.Class<StatcastPlayerContext>(
   whiffPct: Schema.optional(Schema.Finite),
   kPct: Schema.optional(Schema.Finite),
   sprintSpeed: Schema.optional(Schema.Finite),
+  // In-season sample sizes used as the shrinkage pseudo-count n (F3). `pa` is plate
+  // appearances for batters, ≈ batters-faced (TBF) for pitchers; `pitches` is pitch count
+  // (used for whiff% stabilization). Absent/0 ⇒ zero reliability ⇒ neutral (multiplier 1).
+  pa: Schema.optional(Schema.Finite),
+  pitches: Schema.optional(Schema.Finite),
 }) {}
 
 export class ParkFactorContext extends Schema.Class<ParkFactorContext>("ParkFactorContext")({
@@ -290,43 +295,115 @@ const vegasMultiplier = (impliedRuns: number | undefined) => {
 const boundedMultiplier = (value: number, min: number, max: number) =>
   Math.max(min, Math.min(max, value));
 
+// --- F3: sample-size-aware Bayesian shrinkage of in-season Statcast (docs §3.3) ---
+//
+// Replaces the old fixed threshold bumps + tight clamps with a continuous deviation from a
+// league-average baseline, shrunk toward neutral (multiplier 1.0) by each metric's reliability
+// w = n / (n + M), where M is the stabilization point (reliability = 0.5) and n is the in-season
+// sample size. Because the projection feed carries no projected Statcast rates, the prior is
+// "neutral skill" (multiplier 1.0); the observed metric supplies a small +/- delta that is 0 at
+// the league baseline. final = 1 + Σ_metrics deviation_metric · w_metric.
+//
+// This also subsumes the dormant legacy/analysis/recent-performance.ts ±15% recency nudge:
+// recency is now handled through shrinkage (in-season data weighted by sample size) rather than a
+// separate flat adjustment. League-average baselines below reuse that module's values
+// (barrel 7.5, hardHit 37.0, K% 22.7) — see legacy/analysis/recent-performance.ts.
+
+// Stabilization points (M), in the units of the n we actually have. Doc §3.3 gives batted-ball M
+// in BBE; we convert to PA-equivalent via BBE/PA ≈ 0.65 (M_PA ≈ M_BBE / 0.65). This conversion is
+// an approximation to refine via backtest (F8).
+const M_BATTER_XWOBA = 85; // ≈ 55 BBE / 0.65
+const M_BATTER_BARREL = 115; // ≈ 75 BBE / 0.65
+const M_BATTER_HARDHIT = 115; // ≈ 75 BBE / 0.65
+const M_BATTER_SPRINT = 10; // sprint speed stabilizes almost immediately
+// Batter K% (M = 60 PA, doc §3.3) is intentionally not wired in: the current metric→stat mapping
+// uses xwOBA for contact/overall, barrel/hardHit for power, sprint for speed — matching the prior
+// code's set. Hitter K% is a future addition (would shrink contact/OBP).
+const M_PITCHER_XWOBA = 85; // TBF (≈ PA-against)
+const M_PITCHER_K = 70; // doc §3.3: 70 BF
+const M_PITCHER_WHIFF = 400; // doc §3.3: ~400 pitches
+
+// League-average baselines (source: legacy/analysis/recent-performance.ts, 2025 season).
+const BASE_XWOBA = 0.32;
+const BASE_BARREL = 7.5;
+const BASE_HARDHIT = 37;
+const BASE_SPRINT = 27;
+const BASE_PITCHER_XWOBA = 0.31;
+const BASE_WHIFF = 24;
+const BASE_K = 22.7;
+
+// Per-metric slopes (multiplier delta per unit of metric) and raw-deviation caps. Calibrated so
+// that at full reliability the magnitude matches the old threshold bumps, keeping behavior
+// continuous rather than a regime change.
+const reliability = (n: number | undefined, m: number) => (n != null && n > 0 ? n / (n + m) : 0);
+
+const clampMagnitude = (value: number, cap: number) => Math.max(-cap, Math.min(cap, value));
+
+// Loose sanity bound only (pathological inputs); NOT the old behavior-shaping clamp.
+const SAFETY_MIN = 0.7;
+const SAFETY_MAX = 1.3;
+
 const batterStatcastMultiplier = (
   skill: StatcastPlayerContext | undefined,
   stat: "contact" | "power" | "speed",
 ) => {
   if (skill == null) return 1;
-  let multiplier = 1;
+  let deviation = 0;
+  // xwOBA contributes to all stat groups (overall skill). slope 1.25/pt: +0.04 xwOBA → +0.05.
   if (skill.xwoba != null) {
-    if (skill.xwoba >= 0.36) multiplier += 0.05;
-    if (skill.xwoba <= 0.29) multiplier -= 0.05;
+    const raw = clampMagnitude((skill.xwoba - BASE_XWOBA) * 1.25, 0.08);
+    deviation += raw * reliability(skill.pa, M_BATTER_XWOBA);
   }
   if (stat === "power") {
-    if (skill.barrelPct != null && skill.barrelPct >= 12) multiplier += 0.08;
-    if (skill.barrelPct != null && skill.barrelPct <= 5) multiplier -= 0.05;
-    if (skill.hardHitPct != null && skill.hardHitPct >= 45) multiplier += 0.04;
+    // barrel: 12 → +0.0081·4.5 ≈ +0.08; 5 → ≈ −0.04 at full reliability.
+    if (skill.barrelPct != null) {
+      const raw = clampMagnitude((skill.barrelPct - BASE_BARREL) * 0.018, 0.1);
+      deviation += raw * reliability(skill.pa, M_BATTER_BARREL);
+    }
+    // hardHit: 45 → +8·0.005 = +0.04 at full reliability.
+    if (skill.hardHitPct != null) {
+      const raw = clampMagnitude((skill.hardHitPct - BASE_HARDHIT) * 0.005, 0.06);
+      deviation += raw * reliability(skill.pa, M_BATTER_HARDHIT);
+    }
   }
   if (stat === "speed" && skill.sprintSpeed != null) {
-    if (skill.sprintSpeed >= 28.5) multiplier += 0.06;
-    if (skill.sprintSpeed <= 26) multiplier -= 0.04;
+    // sprint: 28.5 → +1.5·0.04 = +0.06; 26 → −1·0.04 = −0.04 at full reliability.
+    const raw = clampMagnitude((skill.sprintSpeed - BASE_SPRINT) * 0.04, 0.08);
+    deviation += raw * reliability(skill.pa, M_BATTER_SPRINT);
   }
-  return boundedMultiplier(multiplier, 0.85, 1.15);
+  return boundedMultiplier(1 + deviation, SAFETY_MIN, SAFETY_MAX);
 };
 
 const pitcherStatcastContext = (skill: StatcastPlayerContext | undefined) => {
   if (skill == null) return { runPrevention: 1, strikeouts: 1 };
-  let runPrevention = 1;
-  let strikeouts = 1;
+  let runPrevention = 0;
+  let strikeouts = 0;
+  // Run-prevention deliberately stabilizes on xwOBA-against (+barrel), NOT ERA: ERA never
+  // stabilizes in-season (doc §3.3). FIP/xFIP/SIERA are not yet ingested — adding them is future
+  // work, out of F3 scope. runPrevention scales er/baserunners, so higher xwOBA-against ⇒ higher
+  // multiplier ⇒ more runs (worse), matching the old direction.
   if (skill.xwoba != null) {
-    if (skill.xwoba <= 0.285) runPrevention -= 0.06;
-    if (skill.xwoba >= 0.34) runPrevention += 0.08;
+    // 0.285 → −0.025·2.4 ≈ −0.06; 0.34 → +0.03·2.4 ≈ +0.072 at full reliability.
+    const raw = clampMagnitude((skill.xwoba - BASE_PITCHER_XWOBA) * 2.4, 0.1);
+    runPrevention += raw * reliability(skill.pa, M_PITCHER_XWOBA);
   }
-  if (skill.barrelPct != null && skill.barrelPct >= 10) runPrevention += 0.04;
-  if (skill.whiffPct != null && skill.whiffPct >= 28) strikeouts += 0.06;
-  if (skill.kPct != null && skill.kPct >= 26) strikeouts += 0.05;
-  if (skill.kPct != null && skill.kPct <= 18) strikeouts -= 0.06;
+  if (skill.barrelPct != null) {
+    const raw = clampMagnitude((skill.barrelPct - BASE_BARREL) * 0.016, 0.08);
+    runPrevention += raw * reliability(skill.pa, M_PITCHER_XWOBA);
+  }
+  // whiff% stabilizes on pitch count; fall back to pa as the n proxy if pitches absent.
+  if (skill.whiffPct != null) {
+    const raw = clampMagnitude((skill.whiffPct - BASE_WHIFF) * 0.0075, 0.08);
+    strikeouts += raw * reliability(skill.pitches ?? skill.pa, M_PITCHER_WHIFF);
+  }
+  if (skill.kPct != null) {
+    // 26 → +3.3·0.0152 ≈ +0.05; 18 → −4.7·0.0152 ≈ −0.07 at full reliability.
+    const raw = clampMagnitude((skill.kPct - BASE_K) * 0.0152, 0.08);
+    strikeouts += raw * reliability(skill.pa, M_PITCHER_K);
+  }
   return {
-    runPrevention: boundedMultiplier(runPrevention, 0.86, 1.16),
-    strikeouts: boundedMultiplier(strikeouts, 0.88, 1.14),
+    runPrevention: boundedMultiplier(1 + runPrevention, SAFETY_MIN, SAFETY_MAX),
+    strikeouts: boundedMultiplier(1 + strikeouts, SAFETY_MIN, SAFETY_MAX),
   };
 };
 

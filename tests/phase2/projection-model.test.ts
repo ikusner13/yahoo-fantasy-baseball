@@ -119,6 +119,8 @@ describe("ProjectionModel Phase 2 math", () => {
         impliedRunsByTeam: {},
         statcastByPlayerKey: {
           "mlb:111": new StatcastPlayerContext({
+            // Large pa ⇒ near-full reliability, the closest analogue to the old always-on bumps.
+            pa: 100000,
             xwoba: 0.38,
             barrelPct: 15,
             hardHitPct: 49,
@@ -239,6 +241,9 @@ describe("ProjectionModel Phase 2 math", () => {
       impliedRunsByTeam: {},
       statcastByPlayerKey: {
         "mlb:456": new StatcastPlayerContext({
+          // Large pa/pitches ⇒ near-full reliability (old always-on behavior analogue).
+          pa: 100000,
+          pitches: 100000,
           xwoba: 0.27,
           barrelPct: 5,
           whiffPct: 32,
@@ -253,6 +258,176 @@ describe("ProjectionModel Phase 2 math", () => {
     expect(skilled.k).toBeGreaterThan(baseline.k);
     expect(skilled.era).toBeLessThan(baseline.era);
     expect(skilled.whip).toBeLessThan(baseline.whip);
+  });
+
+  // --- F3: stabilization shrinkage boundary cases ---
+
+  const batterStatcastContext = (statcast: StatcastPlayerContext) =>
+    new WeeklyContext({
+      schedules: [new WeeklySchedule({ team: "NYY", gamesThisWeek: 6, gamesRemaining: 6 })],
+      probableStartsByPlayerKey: {},
+      impliedRunsByTeam: {},
+      statcastByPlayerKey: { "mlb:111": statcast },
+    });
+
+  const pitcherStatcastWeekly = (statcast: StatcastPlayerContext) =>
+    new WeeklyContext({
+      schedules: [new WeeklySchedule({ team: "SEA", gamesThisWeek: 6, gamesRemaining: 6 })],
+      probableStartsByPlayerKey: { "mlb.p.pitcher": 2 },
+      impliedRunsByTeam: {},
+      statcastByPlayerKey: { "mlb:456": statcast },
+    });
+
+  const makePitcherProjection = () =>
+    new BlendedPitcherProjection({
+      kind: "pitcher",
+      playerKey: "mlb.p.pitcher",
+      mlbId: 456,
+      name: "Grace Starter",
+      team: "SEA",
+      ip: 120,
+      gs: 20,
+      k: 140,
+      era: 3,
+      whip: 1.1,
+      qs: 12,
+      svh: 0,
+      appearances: 20,
+    });
+
+  it("F3: zero / absent sample size leaves the projection unchanged (multiplier 1.0)", () => {
+    const [projection] = blendBatterProjections(batterRows, [
+      new ProjectionSourceWeight({ source: "rthebatx", weight: 1 }),
+    ]);
+    const baseline = prorateBatterProjection(
+      projection!,
+      new WeeklyContext({
+        schedules: [new WeeklySchedule({ team: "NYY", gamesThisWeek: 6, gamesRemaining: 6 })],
+        probableStartsByPlayerKey: {},
+        impliedRunsByTeam: {},
+      }),
+    );
+    // Strong rates but pa = 0 ⇒ reliability 0 ⇒ exactly neutral.
+    const zeroN = prorateBatterProjection(
+      projection!,
+      batterStatcastContext(
+        new StatcastPlayerContext({
+          pa: 0,
+          xwoba: 0.42,
+          barrelPct: 18,
+          hardHitPct: 52,
+          sprintSpeed: 30,
+        }),
+      ),
+    );
+    expect(zeroN.hr).toBe(baseline.hr);
+    expect(zeroN.tb).toBe(baseline.tb);
+    expect(zeroN.r).toBe(baseline.r);
+    expect(zeroN.sb).toBe(baseline.sb);
+
+    // Absent pa behaves identically to pa = 0.
+    const absentN = prorateBatterProjection(
+      projection!,
+      batterStatcastContext(new StatcastPlayerContext({ xwoba: 0.42, barrelPct: 18 })),
+    );
+    expect(absentN.hr).toBe(baseline.hr);
+    expect(absentN.tb).toBe(baseline.tb);
+
+    // Pitcher: zero pa/pitches ⇒ unchanged.
+    const projection2 = makePitcherProjection();
+    const pBaseline = proratePitcherProjection(
+      projection2,
+      new WeeklyContext({
+        schedules: [new WeeklySchedule({ team: "SEA", gamesThisWeek: 6, gamesRemaining: 6 })],
+        probableStartsByPlayerKey: { "mlb.p.pitcher": 2 },
+        impliedRunsByTeam: {},
+      }),
+    );
+    const pZeroN = proratePitcherProjection(
+      projection2,
+      pitcherStatcastWeekly(
+        new StatcastPlayerContext({ pa: 0, pitches: 0, xwoba: 0.25, whiffPct: 36, kPct: 32 }),
+      ),
+    );
+    expect(pZeroN.k).toBe(pBaseline.k);
+    expect(pZeroN.era).toBe(pBaseline.era);
+    expect(pZeroN.whip).toBe(pBaseline.whip);
+  });
+
+  it("F3: n = M yields exactly half the full-reliability adjustment (single metric)", () => {
+    const [projection] = blendBatterProjections(batterRows, [
+      new ProjectionSourceWeight({ source: "rthebatx", weight: 1 }),
+    ]);
+    // Single active metric: xwOBA only. M_BATTER_XWOBA = 85.
+    const atM = prorateBatterProjection(
+      projection!,
+      batterStatcastContext(new StatcastPlayerContext({ pa: 85, xwoba: 0.4 })),
+    );
+    const full = prorateBatterProjection(
+      projection!,
+      batterStatcastContext(new StatcastPlayerContext({ pa: 1e9, xwoba: 0.4 })),
+    );
+    const baseline = prorateBatterProjection(
+      projection!,
+      new WeeklyContext({
+        schedules: [new WeeklySchedule({ team: "NYY", gamesThisWeek: 6, gamesRemaining: 6 })],
+        probableStartsByPlayerKey: {},
+        impliedRunsByTeam: {},
+      }),
+    );
+    // hr scales by the (xwOBA-driven) power multiplier; deviation from baseline is the adjustment.
+    // At pa = 1e9 reliability ≈ 1.0; at pa = M it is exactly 0.5, so devAtM = devFull · 0.5.
+    const devAtM = atM.hr - baseline.hr;
+    const devFull = full.hr - baseline.hr;
+    expect(devFull).toBeGreaterThan(0);
+    expect(devAtM).toBeCloseTo(devFull * 0.5, 6);
+
+    // Pitcher: single metric kPct only, M_PITCHER_K = 70.
+    const projection2 = makePitcherProjection();
+    const pBaseline = proratePitcherProjection(
+      projection2,
+      new WeeklyContext({
+        schedules: [new WeeklySchedule({ team: "SEA", gamesThisWeek: 6, gamesRemaining: 6 })],
+        probableStartsByPlayerKey: { "mlb.p.pitcher": 2 },
+        impliedRunsByTeam: {},
+      }),
+    );
+    const pAtM = proratePitcherProjection(
+      projection2,
+      pitcherStatcastWeekly(new StatcastPlayerContext({ pa: 70, kPct: 30 })),
+    );
+    const pFull = proratePitcherProjection(
+      projection2,
+      pitcherStatcastWeekly(new StatcastPlayerContext({ pa: 1e9, kPct: 30 })),
+    );
+    const pDevAtM = pAtM.k - pBaseline.k;
+    const pDevFull = pFull.k - pBaseline.k;
+    expect(pDevFull).toBeGreaterThan(0);
+    expect(pDevAtM).toBeCloseTo(pDevFull * 0.5, 6);
+  });
+
+  it("F3: larger sample size produces a larger adjustment in the same direction", () => {
+    const [projection] = blendBatterProjections(batterRows, [
+      new ProjectionSourceWeight({ source: "rthebatx", weight: 1 }),
+    ]);
+    const baseline = prorateBatterProjection(
+      projection!,
+      new WeeklyContext({
+        schedules: [new WeeklySchedule({ team: "NYY", gamesThisWeek: 6, gamesRemaining: 6 })],
+        probableStartsByPlayerKey: {},
+        impliedRunsByTeam: {},
+      }),
+    );
+    const small = prorateBatterProjection(
+      projection!,
+      batterStatcastContext(new StatcastPlayerContext({ pa: 30, xwoba: 0.4 })),
+    );
+    const large = prorateBatterProjection(
+      projection!,
+      batterStatcastContext(new StatcastPlayerContext({ pa: 300, xwoba: 0.4 })),
+    );
+    expect(small.hr).toBeGreaterThan(baseline.hr);
+    expect(large.hr).toBeGreaterThan(small.hr);
   });
 
   it("prorates reliever ROS innings by expected weekly appearances", () => {
