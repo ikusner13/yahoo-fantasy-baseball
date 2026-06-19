@@ -129,6 +129,9 @@ const canonicalizeBatters = (
         hbp: row.hbp,
         sf: row.sf,
         status: player.status,
+        // F6 handedness HR park split. Undefined today (no upstream batSide source); a neutral
+        // default ⇒ overall park factor. Wiring MLB Stats /people/{id} batSide is a follow-up.
+        bats: row.bats,
         eligiblePositions: player.positions == null ? undefined : [...player.positions],
       }),
     ];

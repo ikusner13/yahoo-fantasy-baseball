@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
+import { parkFactorsByTeam } from "../../src/services/ProjectionData";
 import {
   BatterProjectionSource,
   BattingOrderContext,
@@ -7,6 +8,7 @@ import {
   BlendedPitcherProjection,
   buildWeeklyProjectionSet,
   ParkFactorContext,
+  parkHrFactor,
   PitcherProjectionSource,
   ProjectionPool,
   ProjectionSourceWeight,
@@ -738,6 +740,138 @@ describe("ProjectionModel Phase 2 math", () => {
     expect(projection?.hr).toBe(8.5); // 10·0.75 + 4·0.25
     expect(projection?.obp).toBeCloseTo(0.38); // 0.40·0.75 + 0.32·0.25
     expect(projection?.ab).toBe(77); // 80·0.75 + 68·0.25
+  });
+
+  // --- F6: handedness HR park splits ---
+
+  const makeBlendedHandedBatter = (bats?: string) =>
+    blendBatterProjections(
+      [
+        new BatterProjectionSource({
+          source: "rthebatx",
+          playerKey: "mlb.p.handed",
+          mlbId: 222,
+          name: "Handed Batter",
+          team: "NYY",
+          pa: 100,
+          r: 20,
+          h: 30,
+          hr: 10,
+          rbi: 25,
+          sb: 5,
+          tb: 70,
+          obp: 0.4,
+          ab: 80,
+          bb: 15,
+          hbp: 2,
+          sf: 3,
+          bats,
+        }),
+      ],
+      [new ProjectionSourceWeight({ source: "rthebatx", weight: 1 })],
+    )[0]!;
+
+  // Park with a handedness split (LHB > RHB) and neutral Statcast so the park factor is the only
+  // variable acting on hr/tb.
+  const splitParkContext = (hrFactorLHB: number, hrFactorRHB: number, hrFactor: number) =>
+    new WeeklyContext({
+      schedules: [new WeeklySchedule({ team: "NYY", gamesThisWeek: 6, gamesRemaining: 6 })],
+      probableStartsByPlayerKey: {},
+      impliedRunsByTeam: {},
+      parkFactorsByTeam: {
+        NYY: new ParkFactorContext({ runsFactor: 1, hrFactor, hrFactorLHB, hrFactorRHB }),
+      },
+    });
+
+  it("F6: handedness HR split boosts the favored side and falls back to overall for switch", () => {
+    const ctx = splitParkContext(1.15, 1.04, 1.08);
+    const left = prorateBatterProjection(makeBlendedHandedBatter("L"), ctx);
+    const right = prorateBatterProjection(makeBlendedHandedBatter("R"), ctx);
+    const switchHit = prorateBatterProjection(makeBlendedHandedBatter("S"), ctx);
+    const unknown = prorateBatterProjection(makeBlendedHandedBatter(), ctx);
+
+    // LHB park factor (1.15) > RHB (1.04) ⇒ left's HR/TB exceed right's.
+    expect(left.hr).toBeGreaterThan(right.hr);
+    expect(left.tb).toBeGreaterThan(right.tb);
+
+    // Switch and unknown both use the overall hrFactor (1.08), between the two sides.
+    expect(switchHit.hr).toBe(unknown.hr);
+    expect(switchHit.hr).toBeGreaterThan(right.hr);
+    expect(switchHit.hr).toBeLessThan(left.hr);
+
+    // Magnitudes track the factors exactly (neutral Statcast ⇒ hr scales by the park factor).
+    expect(left.hr / switchHit.hr).toBeCloseTo(1.15 / 1.08, 6);
+    expect(right.hr / switchHit.hr).toBeCloseTo(1.04 / 1.08, 6);
+  });
+
+  it("F6: park with no split applies the overall hrFactor to every handedness", () => {
+    const ctx = new WeeklyContext({
+      schedules: [new WeeklySchedule({ team: "NYY", gamesThisWeek: 6, gamesRemaining: 6 })],
+      probableStartsByPlayerKey: {},
+      impliedRunsByTeam: {},
+      parkFactorsByTeam: { NYY: new ParkFactorContext({ runsFactor: 1, hrFactor: 1.1 }) },
+    });
+    const left = prorateBatterProjection(makeBlendedHandedBatter("L"), ctx);
+    const right = prorateBatterProjection(makeBlendedHandedBatter("R"), ctx);
+    const unknown = prorateBatterProjection(makeBlendedHandedBatter(), ctx);
+
+    expect(left.hr).toBe(right.hr);
+    expect(left.hr).toBe(unknown.hr);
+    expect(left.tb).toBe(right.tb);
+  });
+
+  it("F6: parkHrFactor resolves L→LHB, R→RHB, S/undefined→overall, undefined park→1", () => {
+    const park = new ParkFactorContext({
+      runsFactor: 1,
+      hrFactor: 1.08,
+      hrFactorLHB: 1.15,
+      hrFactorRHB: 1.04,
+    });
+    expect(parkHrFactor(park, "L")).toBe(1.15);
+    expect(parkHrFactor(park, "R")).toBe(1.04);
+    expect(parkHrFactor(park, "S")).toBe(1.08);
+    expect(parkHrFactor(park, undefined)).toBe(1.08);
+
+    // Park with no split ⇒ overall for every side.
+    const noSplit = new ParkFactorContext({ runsFactor: 1, hrFactor: 0.9 });
+    expect(parkHrFactor(noSplit, "L")).toBe(0.9);
+    expect(parkHrFactor(noSplit, "R")).toBe(0.9);
+
+    // Undefined park ⇒ neutral 1.
+    expect(parkHrFactor(undefined, "L")).toBe(1);
+    expect(parkHrFactor(undefined, undefined)).toBe(1);
+  });
+
+  it("F6: bats is absent today ⇒ behaves as a plain regressed-table upgrade (overall factor)", () => {
+    // No upstream provides bats, so a real blended line carries bats=undefined ⇒ overall hrFactor.
+    const ctx = splitParkContext(1.15, 1.04, 1.08);
+    const defaultBatter = prorateBatterProjection(makeBlendedHandedBatter(), ctx);
+    const switchHit = prorateBatterProjection(makeBlendedHandedBatter("S"), ctx);
+    expect(defaultBatter.hr).toBe(switchHit.hr);
+  });
+
+  it("F6: regressed park table reflects expected direction within a sane band", () => {
+    const coors = parkFactorsByTeam.COL!;
+    const oracle = parkFactorsByTeam.SF!;
+    // Coors boosts HR, Oracle suppresses HR.
+    expect(coors.hrFactor).toBeGreaterThan(1);
+    expect(oracle.hrFactor).toBeLessThan(1);
+    // Coors runs is the highest run environment.
+    expect(coors.runsFactor).toBeGreaterThan(1.1);
+    // Handedness splits are present and directionally correct.
+    expect(parkFactorsByTeam.NYY!.hrFactorLHB!).toBeGreaterThan(
+      parkFactorsByTeam.NYY!.hrFactorRHB!,
+    );
+    expect(parkFactorsByTeam.COL!.hrFactorRHB!).toBeGreaterThan(
+      parkFactorsByTeam.COL!.hrFactorLHB!,
+    );
+    // Every park HR factor sits within a sane regressed band after 3-yr regression.
+    for (const park of Object.values(parkFactorsByTeam)) {
+      expect(park.hrFactor).toBeGreaterThanOrEqual(0.8);
+      expect(park.hrFactor).toBeLessThanOrEqual(1.2);
+      expect(park.runsFactor).toBeGreaterThanOrEqual(0.8);
+      expect(park.runsFactor).toBeLessThanOrEqual(1.2);
+    }
   });
 
   it("F5: renormalization holds when a player is missing from one source", () => {

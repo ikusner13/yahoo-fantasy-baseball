@@ -73,8 +73,29 @@ export class StatcastPlayerContext extends Schema.Class<StatcastPlayerContext>(
 
 export class ParkFactorContext extends Schema.Class<ParkFactorContext>("ParkFactorContext")({
   runsFactor: Schema.Finite,
+  // Overall HR factor: the default/fallback, used for switch hitters, unknown handedness, and
+  // parks with no known L/R split. 1.0-centered (>1 boosts HR, <1 suppresses).
   hrFactor: Schema.Finite,
+  // Optional handedness HR splits (F6, 1.0-centered). When absent for a park, the overall
+  // `hrFactor` applies to both sides. `bats:"L"` uses LHB, `bats:"R"` uses RHB; switch/unknown
+  // always falls back to overall.
+  hrFactorLHB: Schema.optional(Schema.Finite),
+  hrFactorRHB: Schema.optional(Schema.Finite),
 }) {}
+
+// F6: returns the HR park factor for a batter's handedness, falling back to the overall factor
+// when the side-specific split is absent (incl. switch hitters and unknown handedness). Returns
+// 1 (neutral) when the park is undefined.
+export const parkHrFactor = (
+  park: ParkFactorContext | undefined,
+  bats: string | undefined,
+): number => {
+  if (park == null) return 1;
+  const side = bats?.trim().toUpperCase();
+  if (side === "L") return park.hrFactorLHB ?? park.hrFactor;
+  if (side === "R") return park.hrFactorRHB ?? park.hrFactor;
+  return park.hrFactor;
+};
 
 export class BattingOrderContext extends Schema.Class<BattingOrderContext>("BattingOrderContext")({
   confirmedStarts: Schema.Finite,
@@ -116,6 +137,10 @@ export class BatterProjectionSource extends Schema.Class<BatterProjectionSource>
   // Yahoo player status (e.g. "", "DTD", "IL10", "O", "NA", "SUSP"); drives the F4
   // playing-time/injury volume discount. Absent ⇒ healthy ⇒ neutral.
   status: Schema.optional(Schema.String),
+  // Batter handedness ("L"/"R"/"S"), drives the F6 handedness HR park split. Absent ⇒ unknown ⇒
+  // overall hrFactor applies (neutral default). No upstream provides this yet (see canonicalize
+  // in WeeklyProjections.ts); wiring an MLB Stats batSide source is the remaining follow-up.
+  bats: Schema.optional(Schema.String),
   eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
 }) {}
 
@@ -162,6 +187,8 @@ export class BlendedBatterProjection extends Schema.Class<BlendedBatterProjectio
   sf: Schema.Finite,
   // See BatterProjectionSource.status (F4 playing-time/injury discount).
   status: Schema.optional(Schema.String),
+  // See BatterProjectionSource.bats (F6 handedness HR park split).
+  bats: Schema.optional(Schema.String),
   eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
 }) {}
 
@@ -606,6 +633,7 @@ export const blendBatterProjections = (
       hbp: weightedMean(componentRows, weightIndex, "hbp", (row) => row.hbp),
       sf: weightedMean(componentRows, weightIndex, "sf", (row) => row.sf),
       status: first.status,
+      bats: first.bats,
       eligiblePositions: first.eligiblePositions == null ? undefined : [...first.eligiblePositions],
     });
   });
@@ -658,7 +686,9 @@ export const prorateBatterProjection = (
   const statcast = context.statcastByPlayerKey?.[contextKey(projection)];
   const park = context.parkFactorsByTeam?.[projection.team];
   const contactMultiplier = batterStatcastMultiplier(statcast, "contact");
-  const powerMultiplier = batterStatcastMultiplier(statcast, "power") * (park?.hrFactor ?? 1);
+  // F6: handedness-aware park HR factor (overall when bats is absent/switch/unknown).
+  const powerMultiplier =
+    batterStatcastMultiplier(statcast, "power") * parkHrFactor(park, projection.bats);
   const speedMultiplier = batterStatcastMultiplier(statcast, "speed");
   const runEnvironmentMultiplier = park?.runsFactor ?? 1;
   const obpNumerator = (projection.h + projection.bb + projection.hbp) * scale;

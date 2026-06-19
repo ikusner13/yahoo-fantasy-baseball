@@ -289,37 +289,86 @@ const numberFromCsv = (value: string | undefined) => {
 const compactStatcastContext = (context: StatcastPlayerContext) =>
   Object.values(context).some((value) => value != null) ? context : undefined;
 
-const parkFactorsByTeam: Record<string, ParkFactorContext> = {
-  ARI: new ParkFactorContext({ runsFactor: 1.01, hrFactor: 0.99 }),
-  ATL: new ParkFactorContext({ runsFactor: 1.02, hrFactor: 1.05 }),
-  BAL: new ParkFactorContext({ runsFactor: 0.96, hrFactor: 0.92 }),
-  BOS: new ParkFactorContext({ runsFactor: 1.04, hrFactor: 0.98 }),
-  CHC: new ParkFactorContext({ runsFactor: 1.01, hrFactor: 1.02 }),
-  CWS: new ParkFactorContext({ runsFactor: 0.99, hrFactor: 1.08 }),
-  CIN: new ParkFactorContext({ runsFactor: 1.03, hrFactor: 1.16 }),
-  CLE: new ParkFactorContext({ runsFactor: 0.98, hrFactor: 0.94 }),
-  COL: new ParkFactorContext({ runsFactor: 1.18, hrFactor: 1.12 }),
-  DET: new ParkFactorContext({ runsFactor: 0.97, hrFactor: 0.9 }),
-  HOU: new ParkFactorContext({ runsFactor: 1.01, hrFactor: 1.04 }),
-  KC: new ParkFactorContext({ runsFactor: 1.02, hrFactor: 0.88 }),
-  LAA: new ParkFactorContext({ runsFactor: 0.99, hrFactor: 1 }),
-  LAD: new ParkFactorContext({ runsFactor: 1, hrFactor: 1.03 }),
-  MIA: new ParkFactorContext({ runsFactor: 0.96, hrFactor: 0.9 }),
-  MIL: new ParkFactorContext({ runsFactor: 1.01, hrFactor: 1.07 }),
-  MIN: new ParkFactorContext({ runsFactor: 0.99, hrFactor: 1.01 }),
-  NYM: new ParkFactorContext({ runsFactor: 0.97, hrFactor: 0.93 }),
-  NYY: new ParkFactorContext({ runsFactor: 1.01, hrFactor: 1.12 }),
-  OAK: new ParkFactorContext({ runsFactor: 0.95, hrFactor: 0.91 }),
-  PHI: new ParkFactorContext({ runsFactor: 1.02, hrFactor: 1.08 }),
-  PIT: new ParkFactorContext({ runsFactor: 0.98, hrFactor: 0.9 }),
-  SD: new ParkFactorContext({ runsFactor: 0.97, hrFactor: 0.91 }),
-  SEA: new ParkFactorContext({ runsFactor: 0.96, hrFactor: 0.94 }),
-  SF: new ParkFactorContext({ runsFactor: 0.96, hrFactor: 0.86 }),
-  STL: new ParkFactorContext({ runsFactor: 0.99, hrFactor: 0.92 }),
-  TB: new ParkFactorContext({ runsFactor: 0.98, hrFactor: 0.97 }),
-  TEX: new ParkFactorContext({ runsFactor: 1.02, hrFactor: 1.04 }),
-  TOR: new ParkFactorContext({ runsFactor: 1.01, hrFactor: 1.05 }),
-  WSH: new ParkFactorContext({ runsFactor: 1, hrFactor: 1.01 }),
+// --- F6: park factors — 3-year regressed + handedness HR splits (docs §3.5) ---
+//
+// Sources: Baseball Savant Statcast park factors (handedness via the batSide filter),
+// RotoWire 2024 park factors, and the FanGraphs park-factor methodology. Gathered 2026-06.
+//
+// Convention: all values are 1.0-CENTERED multipliers (>1 boosts, <1 suppresses), NOT 100-based.
+//
+// 3-year regression: single-year park factors swing ±8-12 points from sampling noise alone, so
+// we regress the deviation from neutral toward 1.0. FanGraphs' guidance: a 3-yr factor is ~20%
+// regressed ⇒ regressed = 1 + (raw - 1) * 0.8 (5-yr would use 0.9, 1-yr 0.6). Every value below
+// has the 0.8 factor already applied to its raw deviation.
+//
+// Handedness HR splits (hrFactorLHB / hrFactorRHB, also 1.0-centered + regressed) are set only for
+// parks with documented, large L/R asymmetry (COL, CIN, NYY, BOS, SF). All other parks omit the
+// split, so the overall `hrFactor` applies to both sides. `runsFactor` has no split (pitchers and
+// the run environment face a mix of handedness).
+//
+// These are research-informed PRIORS: refresh each preseason (park factors shift year to year)
+// and fit via the F8 backtest. They are NOT final values.
+export const parkFactorsByTeam: Record<string, ParkFactorContext> = {
+  ARI: new ParkFactorContext({ runsFactor: 1.008, hrFactor: 0.992 }),
+  ATL: new ParkFactorContext({ runsFactor: 1.016, hrFactor: 1.04 }),
+  BAL: new ParkFactorContext({ runsFactor: 0.968, hrFactor: 0.936 }),
+  // Fenway: runs ~107, HR ~102 overall; Green Monster suppresses LHB HR (97), RHB neutral+ (104).
+  BOS: new ParkFactorContext({
+    runsFactor: 1.056,
+    hrFactor: 1.016,
+    hrFactorLHB: 0.976,
+    hrFactorRHB: 1.032,
+  }),
+  CHC: new ParkFactorContext({ runsFactor: 1.008, hrFactor: 1.016 }),
+  CWS: new ParkFactorContext({ runsFactor: 0.992, hrFactor: 1.064 }),
+  // GABP: runs ~106, HR ~118 overall; LHB porch (122) > RHB (114).
+  CIN: new ParkFactorContext({
+    runsFactor: 1.048,
+    hrFactor: 1.144,
+    hrFactorLHB: 1.176,
+    hrFactorRHB: 1.112,
+  }),
+  CLE: new ParkFactorContext({ runsFactor: 0.984, hrFactor: 0.952 }),
+  // Coors: runs ~117 (altitude); HR ~112 overall but skewed RHB (113) over LHB (101).
+  COL: new ParkFactorContext({
+    runsFactor: 1.136,
+    hrFactor: 1.096,
+    hrFactorLHB: 1.008,
+    hrFactorRHB: 1.104,
+  }),
+  DET: new ParkFactorContext({ runsFactor: 0.976, hrFactor: 0.92 }),
+  HOU: new ParkFactorContext({ runsFactor: 1.008, hrFactor: 1.032 }),
+  KC: new ParkFactorContext({ runsFactor: 1.016, hrFactor: 0.904 }),
+  LAA: new ParkFactorContext({ runsFactor: 0.992, hrFactor: 1 }),
+  LAD: new ParkFactorContext({ runsFactor: 1, hrFactor: 1.024 }),
+  MIA: new ParkFactorContext({ runsFactor: 0.968, hrFactor: 0.92 }),
+  MIL: new ParkFactorContext({ runsFactor: 1.008, hrFactor: 1.056 }),
+  MIN: new ParkFactorContext({ runsFactor: 0.992, hrFactor: 1.008 }),
+  NYM: new ParkFactorContext({ runsFactor: 0.976, hrFactor: 0.944 }),
+  // Yankee Stadium: runs ~neutral; HR ~108 overall, short RF porch favors LHB (115) over RHB (104).
+  NYY: new ParkFactorContext({
+    runsFactor: 0.996,
+    hrFactor: 1.064,
+    hrFactorLHB: 1.12,
+    hrFactorRHB: 1.032,
+  }),
+  OAK: new ParkFactorContext({ runsFactor: 0.96, hrFactor: 0.928 }),
+  PHI: new ParkFactorContext({ runsFactor: 1.016, hrFactor: 1.064 }),
+  PIT: new ParkFactorContext({ runsFactor: 0.984, hrFactor: 0.92 }),
+  SD: new ParkFactorContext({ runsFactor: 0.976, hrFactor: 0.928 }),
+  SEA: new ParkFactorContext({ runsFactor: 0.968, hrFactor: 0.952 }),
+  // Oracle Park: runs ~97, HR ~91 overall; suppresses both sides (LHB 91, RHB 93).
+  SF: new ParkFactorContext({
+    runsFactor: 0.976,
+    hrFactor: 0.928,
+    hrFactorLHB: 0.928,
+    hrFactorRHB: 0.944,
+  }),
+  STL: new ParkFactorContext({ runsFactor: 0.992, hrFactor: 0.936 }),
+  TB: new ParkFactorContext({ runsFactor: 0.984, hrFactor: 0.976 }),
+  TEX: new ParkFactorContext({ runsFactor: 1.016, hrFactor: 1.032 }),
+  TOR: new ParkFactorContext({ runsFactor: 1.008, hrFactor: 1.04 }),
+  WSH: new ParkFactorContext({ runsFactor: 1, hrFactor: 1.008 }),
 };
 
 type OddsEvent = Schema.Schema.Type<typeof OddsPayload>[number];
