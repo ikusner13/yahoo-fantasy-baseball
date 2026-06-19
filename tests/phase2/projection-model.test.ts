@@ -182,6 +182,10 @@ describe("ProjectionModel Phase 2 math", () => {
 
     expect(leadoff.pa).toBeGreaterThan(baseline.pa);
     expect(ninth.pa).toBeLessThan(baseline.pa);
+    // F7: empirical curve — leadoff ≈4.63 PA/game, #9 ≈3.75, for the one confirmed start
+    // (remaining 5 unknown games fall back to AVG_PA_PER_STARTED_GAME = 4.2).
+    expect(leadoff.pa).toBeCloseTo(4.63 + 5 * 4.2, 5);
+    expect(ninth.pa).toBeCloseTo(3.75 + 5 * 4.2, 5);
   });
 
   it("prorates starting pitchers by probable starts and accumulates rate components", () => {

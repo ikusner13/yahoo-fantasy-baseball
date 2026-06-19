@@ -304,6 +304,59 @@ const tagCategory = (winProbability: number) => {
   return "lean" as const;
 };
 
+// Inverse standard-normal CDF (Acklam's rational approximation). Used to map a win
+// probability back to the z-score (margin/σ) that produced it. The a/b/c/d coefficients and the
+// 0.02425 breakpoint are FIXED constants of the published algorithm (accurate to ~1e-9), not
+// tunable parameters; 1e-9 just keeps p inside the open interval (0,1).
+const probit = (p: number) => {
+  const clamped = Math.min(Math.max(p, 1e-9), 1 - 1e-9);
+  const a = [
+    -3.969683028665376e1, 2.209460984245205e2, -2.759285104469687e2, 1.38357751867269e2,
+    -3.066479806614716e1, 2.506628277459239,
+  ];
+  const b = [
+    -5.447609879822406e1, 1.615858368580409e2, -1.556989798598866e2, 6.680131188771972e1,
+    -1.328068155288572e1,
+  ];
+  const c = [
+    -7.784894002430293e-3, -3.223964580411365e-1, -2.400758277161838, -2.549732539343734,
+    4.374664141464968, 2.938163982698783,
+  ];
+  const d = [7.784695709041462e-3, 3.224671290700398e-1, 2.445134137142996, 3.754408661907416];
+  const plow = 0.02425;
+  const phigh = 1 - plow;
+  if (clamped < plow) {
+    const q = Math.sqrt(-2 * Math.log(clamped));
+    return (
+      (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
+      ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1)
+    );
+  }
+  if (clamped > phigh) {
+    const q = Math.sqrt(-2 * Math.log(1 - clamped));
+    return (
+      -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
+      ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1)
+    );
+  }
+  const q = clamped - 0.5;
+  const r = q * q;
+  return (
+    ((((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q) /
+    (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1)
+  );
+};
+
+// F7: continuous category importance weight. Marginal value of one stat-unit is proportional to
+// the probability density of the win-prob curve at the 0/0 margin threshold — i.e. φ(z) where
+// z = Φ⁻¹(P(win)) (§1.3, §4.2). Peaks at a coin-flip (z=0 → exp(0)=1) and decays smoothly toward a
+// non-zero floor for locks/lost-causes (soft-punt). exp(-z²/2) == φ(z)/φ(0), so no constant needed.
+const CATEGORY_WEIGHT_PEAK = 1.75;
+const CATEGORY_WEIGHT_FLOOR = 0.2;
+export const categoryWeight = (winProbability: number) =>
+  CATEGORY_WEIGHT_FLOOR +
+  (CATEGORY_WEIGHT_PEAK - CATEGORY_WEIGHT_FLOOR) * Math.exp(-(probit(winProbability) ** 2) / 2);
+
 const slope = (points: ReadonlyArray<readonly [number, number]>) => {
   const count = points.length;
   if (count < 2) return 0;
@@ -405,10 +458,10 @@ export const simulateMatchup = (
 
 const categoryWeightsFromScout = (baseline: MatchupSimulation) =>
   Object.fromEntries(
-    baseline.categories.map((category) => {
-      const weight = category.tag === "coin-flip" ? 1.75 : category.tag === "lean" ? 1 : 0.2;
-      return [category.category, weight];
-    }),
+    baseline.categories.map((category) => [
+      category.category,
+      categoryWeight(category.winProbability),
+    ]),
   ) as Record<Category, number>;
 
 const scoutOpponent = (baseline: MatchupSimulation) => {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  categoryWeight,
   computeSgpDenominators,
   MAX_SIMULATED_ADD_CANDIDATES,
   optimizeLineup,
@@ -59,6 +60,30 @@ const pitcher = (overrides: Partial<ConstructorParameters<typeof WeeklyPitcherLi
 describe("DecisionEngine Phase 3", () => {
   it("uses a research-backed production Monte Carlo floor", () => {
     expect(PRODUCTION_SIMULATION_COUNT).toBeGreaterThanOrEqual(5000);
+  });
+
+  describe("F7 continuous category weight", () => {
+    it("peaks at a coin-flip and stays continuous across the old 0.34/0.36 bucket boundary", () => {
+      // Peak at 0.5; symmetric; no cliff at the old coin-flip cutoff.
+      expect(categoryWeight(0.5)).toBeCloseTo(1.75, 5);
+      expect(categoryWeight(0.4)).toBeCloseTo(categoryWeight(0.6), 5);
+      // The old buckets jumped 1.0 → 1.75 (Δ0.75) here; the smooth curve barely moves.
+      expect(Math.abs(categoryWeight(0.36) - categoryWeight(0.34))).toBeLessThan(0.05);
+    });
+
+    it("decays monotonically toward a non-zero soft-punt floor at the extremes", () => {
+      for (const p of [0.5, 0.6, 0.7, 0.85, 0.95, 0.99]) {
+        expect(categoryWeight(p)).toBeGreaterThan(0.2);
+      }
+      // Strictly decreasing as the category gets more locked.
+      expect(categoryWeight(0.6)).toBeLessThan(categoryWeight(0.5));
+      expect(categoryWeight(0.85)).toBeLessThan(categoryWeight(0.6));
+      expect(categoryWeight(0.99)).toBeLessThan(categoryWeight(0.85));
+      // Soft-punt: a near-locked/near-lost category keeps a small but non-zero weight.
+      expect(categoryWeight(0.999)).toBeGreaterThan(0.2);
+      expect(categoryWeight(0.999)).toBeLessThan(0.4);
+      expect(categoryWeight(0.001)).toBeCloseTo(categoryWeight(0.999), 5);
+    });
   });
 
   it("keeps add-candidate simulation breadth within Worker CPU limits", () => {

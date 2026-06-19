@@ -10,6 +10,14 @@ const DEFAULT_ROS_TEAM_GAMES = 162;
 const LEAGUE_AVG_IMPLIED_RUNS = 4.5;
 const MIN_OPENER_IP = 1;
 
+// F7: empirical PA-per-game by batting-order slot. Leadoff gets the most PA, each slot down the
+// order loses ~16 PA/season (≈0.11 PA/game), #9 is the floor. Source: Spaeder 2023 actuals
+// (doc §3.6), the latest PA-by-slot dataset as of 2026-06. The curve is structural (lineup
+// mechanics, not roster talent) so it drifts little, but re-verify each preseason per repo convention.
+const LEADOFF_PA_PER_GAME = 4.63;
+const PA_PER_GAME_PER_SLOT = 0.11;
+const NINTH_SLOT_PA_PER_GAME = 3.75;
+
 export class ProjectionModelError extends Data.TaggedError("ProjectionModelError")<{
   readonly message: string;
   readonly playerKey?: string;
@@ -577,9 +585,15 @@ const pitcherStatcastContext = (skill: StatcastPlayerContext | undefined) => {
 const contextKey = (projection: { readonly playerKey: string; readonly mlbId?: number }) =>
   projection.mlbId == null ? projection.playerKey : `mlb:${projection.mlbId}`;
 
+// F7: empirical PA-by-slot curve (leadoff → #9). Replaces the old 4.9−(order−1)·0.18 which
+// overweighted leadoff and spread too wide.
 const battingOrderPa = (order: number) => {
   if (order <= 0) return AVG_PA_PER_STARTED_GAME;
-  return boundedMultiplier(4.9 - (order - 1) * 0.18, 3.4, 4.9);
+  return boundedMultiplier(
+    LEADOFF_PA_PER_GAME - (order - 1) * PA_PER_GAME_PER_SLOT,
+    NINTH_SLOT_PA_PER_GAME,
+    LEADOFF_PA_PER_GAME,
+  );
 };
 
 const expectedBatterPa = (projection: BlendedBatterProjection, context: WeeklyContext) => {
