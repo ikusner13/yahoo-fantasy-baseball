@@ -15,11 +15,18 @@ export class ProjectionModelError extends Data.TaggedError("ProjectionModelError
   readonly playerKey?: string;
 }> {}
 
+// A blend weight for one projection source. `weight` is the source's BASE weight, applied to any
+// blend category lacking an explicit per-category override. An optional `category` makes this an
+// override that applies only to that single blend category (e.g. lean THE BAT X more for `hr`).
+// This "source base + optional per-category override" shape (F5) generalizes ATC's per-category
+// weighting while keeping backward compatibility: a list of category-less weights reproduces the
+// old flat-weight behavior exactly.
 export class ProjectionSourceWeight extends Schema.Class<ProjectionSourceWeight>(
   "ProjectionSourceWeight",
 )({
   source: Schema.String,
   weight: Schema.Finite,
+  category: Schema.optional(Schema.String),
 }) {}
 
 export class WeeklySchedule extends Schema.Class<WeeklySchedule>("WeeklySchedule")({
@@ -241,32 +248,124 @@ export class WeeklyProjectionSet extends Schema.Class<WeeklyProjectionSet>("Week
 type WeightedRows<A extends { source: string }> = ReadonlyArray<A>;
 type Line = WeeklyBatterLine | WeeklyPitcherLine;
 
+// Blend-input categories: the stat fields the blend actually averages. These are the BLEND inputs
+// (incl. OBP rate components ab/bb/hbp/sf), distinct from the 13 scoring categories. Per-category
+// weight overrides may key off any of these.
+export const batterBlendCategories = [
+  "pa",
+  "r",
+  "h",
+  "hr",
+  "rbi",
+  "sb",
+  "tb",
+  "obp",
+  "ab",
+  "bb",
+  "hbp",
+  "sf",
+] as const;
+export type BatterBlendCategory = (typeof batterBlendCategories)[number];
+
+export const pitcherBlendCategories = [
+  "ip",
+  "gs",
+  "k",
+  "era",
+  "whip",
+  "qs",
+  "svh",
+  "appearances",
+] as const;
+export type PitcherBlendCategory = (typeof pitcherBlendCategories)[number];
+
+// --- F5: projection-system blend weights (docs §3.1) ---
+//
+// Source key reconciliation: `ratcdc` is FanGraphs `type=ratcdc` = **rest-of-season ATC Depth
+// Charts** (Ariel Cohen's ATC). ATC is therefore ALREADY in the blend — no separate `atc` source is
+// added. For an in-season weekly engine the RoS variant is the correct one.
+//
+// Rationale (FantasyPros accuracy rankings 2023-2025; docs §3.1):
+//   - ATC (`ratcdc`) and THE BAT X (`rthebatx`) are consistently the top-2 most accurate systems.
+//   - ZiPS DC (`zipsdc`) is consistently bottom-tier ⇒ its weight is cut (batters 0.10→0.05,
+//     pitchers 0.20→0.10) and the freed weight goes to the two top systems.
+//   - ATC itself is an accuracy-weighted average that weights constituents PER STAT CATEGORY; the
+//     per-category overrides below emulate that idea with a few defensible priors:
+//       * power (hr, tb): lean THE BAT X (its Statcast-driven power modeling is a known strength).
+//       * rate / role (obp, qs, svh): lean ATC (strong on rates and role/usage).
+//   - These are PRIORS to be fit empirically by the F8 backtest, NOT final values. Most categories
+//     intentionally stay at the source base weight to avoid overfitting.
 const defaultBatterWeights = [
-  new ProjectionSourceWeight({ source: "rthebatx", weight: 0.4 }),
+  // Base weights (apply to any category without an override). ZiPS cut 0.10→0.05; freed 0.05
+  // redistributed to the top-2 (rthebatx 0.40→0.42, ratcdc 0.25→0.28).
+  new ProjectionSourceWeight({ source: "rthebatx", weight: 0.42 }),
   new ProjectionSourceWeight({ source: "steamerr", weight: 0.25 }),
-  new ProjectionSourceWeight({ source: "ratcdc", weight: 0.25 }),
-  new ProjectionSourceWeight({ source: "zipsdc", weight: 0.1 }),
+  new ProjectionSourceWeight({ source: "ratcdc", weight: 0.28 }),
+  new ProjectionSourceWeight({ source: "zipsdc", weight: 0.05 }),
+  // Power priors: lean THE BAT X.
+  new ProjectionSourceWeight({ source: "rthebatx", weight: 0.5, category: "hr" }),
+  new ProjectionSourceWeight({ source: "ratcdc", weight: 0.22, category: "hr" }),
+  new ProjectionSourceWeight({ source: "rthebatx", weight: 0.5, category: "tb" }),
+  new ProjectionSourceWeight({ source: "ratcdc", weight: 0.22, category: "tb" }),
+  // Rate prior (OBP): lean ATC.
+  new ProjectionSourceWeight({ source: "rthebatx", weight: 0.34, category: "obp" }),
+  new ProjectionSourceWeight({ source: "ratcdc", weight: 0.36, category: "obp" }),
 ] as const;
 
 const defaultPitcherWeights = [
-  new ProjectionSourceWeight({ source: "ratcdc", weight: 0.4 }),
+  // Base weights. ZiPS cut 0.20→0.10; freed 0.10 redistributed to the top-2 (ratcdc 0.40→0.45,
+  // rthebatx 0.15→0.20).
+  new ProjectionSourceWeight({ source: "ratcdc", weight: 0.45 }),
   new ProjectionSourceWeight({ source: "steamerr", weight: 0.25 }),
-  new ProjectionSourceWeight({ source: "zipsdc", weight: 0.2 }),
-  new ProjectionSourceWeight({ source: "rthebatx", weight: 0.15 }),
+  new ProjectionSourceWeight({ source: "zipsdc", weight: 0.1 }),
+  new ProjectionSourceWeight({ source: "rthebatx", weight: 0.2 }),
+  // Strikeout prior: lean THE BAT X (Statcast/whiff-driven K modeling).
+  new ProjectionSourceWeight({ source: "rthebatx", weight: 0.28, category: "k" }),
+  new ProjectionSourceWeight({ source: "ratcdc", weight: 0.4, category: "k" }),
+  // Role / usage priors (qs, svh): lean ATC.
+  new ProjectionSourceWeight({ source: "ratcdc", weight: 0.5, category: "qs" }),
+  new ProjectionSourceWeight({ source: "rthebatx", weight: 0.15, category: "qs" }),
+  new ProjectionSourceWeight({ source: "ratcdc", weight: 0.5, category: "svh" }),
+  new ProjectionSourceWeight({ source: "rthebatx", weight: 0.15, category: "svh" }),
 ] as const;
 
-const indexWeights = (weights: ReadonlyArray<ProjectionSourceWeight>) =>
-  new Map(weights.map((weight) => [weight.source, weight.weight]));
+// Resolves a per-(source, category) weight with a per-source base fallback. `base` holds the
+// category-less weights; `overrides` is keyed "source category". A category without an override
+// for a given source falls back to that source's base weight, so flat weight lists behave exactly
+// as before.
+interface BlendWeightIndex {
+  readonly base: ReadonlyMap<string, number>;
+  readonly overrides: ReadonlyMap<string, number>;
+}
+
+const overrideKey = (source: string, category: string) => `${source} ${category}`;
+
+const indexWeights = (weights: ReadonlyArray<ProjectionSourceWeight>): BlendWeightIndex => {
+  const base = new Map<string, number>();
+  const overrides = new Map<string, number>();
+  for (const entry of weights) {
+    if (entry.category == null) {
+      base.set(entry.source, entry.weight);
+    } else {
+      overrides.set(overrideKey(entry.source, entry.category), entry.weight);
+    }
+  }
+  return { base, overrides };
+};
+
+const weightFor = (index: BlendWeightIndex, source: string, category: string) =>
+  index.overrides.get(overrideKey(source, category)) ?? index.base.get(source) ?? 0;
 
 const weightedMean = <A extends { source: string }>(
   rows: WeightedRows<A>,
-  weights: Map<string, number>,
+  weights: BlendWeightIndex,
+  category: string,
   select: (row: A) => number,
 ) => {
   let total = 0;
   let totalWeight = 0;
   for (const row of rows) {
-    const weight = weights.get(row.source) ?? 0;
+    const weight = weightFor(weights, row.source, category);
     if (weight <= 0) continue;
     total += select(row) * weight;
     totalWeight += weight;
@@ -494,18 +593,18 @@ export const blendBatterProjections = (
       mlbId: first.mlbId,
       name: first.name,
       team: first.team,
-      pa: weightedMean(group, weightIndex, (row) => row.pa),
-      r: weightedMean(group, weightIndex, (row) => row.r),
-      h: weightedMean(group, weightIndex, (row) => row.h),
-      hr: weightedMean(group, weightIndex, (row) => row.hr),
-      rbi: weightedMean(group, weightIndex, (row) => row.rbi),
-      sb: weightedMean(group, weightIndex, (row) => row.sb),
-      tb: weightedMean(group, weightIndex, (row) => row.tb),
-      obp: weightedMean(group, weightIndex, (row) => row.obp),
-      ab: weightedMean(componentRows, weightIndex, (row) => row.ab),
-      bb: weightedMean(componentRows, weightIndex, (row) => row.bb),
-      hbp: weightedMean(componentRows, weightIndex, (row) => row.hbp),
-      sf: weightedMean(componentRows, weightIndex, (row) => row.sf),
+      pa: weightedMean(group, weightIndex, "pa", (row) => row.pa),
+      r: weightedMean(group, weightIndex, "r", (row) => row.r),
+      h: weightedMean(group, weightIndex, "h", (row) => row.h),
+      hr: weightedMean(group, weightIndex, "hr", (row) => row.hr),
+      rbi: weightedMean(group, weightIndex, "rbi", (row) => row.rbi),
+      sb: weightedMean(group, weightIndex, "sb", (row) => row.sb),
+      tb: weightedMean(group, weightIndex, "tb", (row) => row.tb),
+      obp: weightedMean(group, weightIndex, "obp", (row) => row.obp),
+      ab: weightedMean(componentRows, weightIndex, "ab", (row) => row.ab),
+      bb: weightedMean(componentRows, weightIndex, "bb", (row) => row.bb),
+      hbp: weightedMean(componentRows, weightIndex, "hbp", (row) => row.hbp),
+      sf: weightedMean(componentRows, weightIndex, "sf", (row) => row.sf),
       status: first.status,
       eligiblePositions: first.eligiblePositions == null ? undefined : [...first.eligiblePositions],
     });
@@ -525,14 +624,19 @@ export const blendPitcherProjections = (
       mlbId: first.mlbId,
       name: first.name,
       team: first.team,
-      ip: weightedMean(group, weightIndex, (row) => row.ip),
-      gs: weightedMean(group, weightIndex, (row) => row.gs),
-      k: weightedMean(group, weightIndex, (row) => row.k),
-      era: weightedMean(group, weightIndex, (row) => row.era),
-      whip: weightedMean(group, weightIndex, (row) => row.whip),
-      qs: weightedMean(group, weightIndex, (row) => row.qs),
-      svh: weightedMean(group, weightIndex, (row) => row.svh),
-      appearances: weightedMean(group, weightIndex, (row) => row.appearances ?? row.gs),
+      ip: weightedMean(group, weightIndex, "ip", (row) => row.ip),
+      gs: weightedMean(group, weightIndex, "gs", (row) => row.gs),
+      k: weightedMean(group, weightIndex, "k", (row) => row.k),
+      era: weightedMean(group, weightIndex, "era", (row) => row.era),
+      whip: weightedMean(group, weightIndex, "whip", (row) => row.whip),
+      qs: weightedMean(group, weightIndex, "qs", (row) => row.qs),
+      svh: weightedMean(group, weightIndex, "svh", (row) => row.svh),
+      appearances: weightedMean(
+        group,
+        weightIndex,
+        "appearances",
+        (row) => row.appearances ?? row.gs,
+      ),
       status: first.status,
       eligiblePositions: first.eligiblePositions == null ? undefined : [...first.eligiblePositions],
     });

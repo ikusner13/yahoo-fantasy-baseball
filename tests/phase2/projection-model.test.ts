@@ -663,4 +663,97 @@ describe("ProjectionModel Phase 2 math", () => {
     expect(set.freeAgents).toHaveLength(1);
     expect(set.freeAgents[0]).toMatchObject({ playerKey: "mlb.p.free-agent", kind: "batter" });
   });
+
+  // --- F5: per-(source, category) blend weights ---
+
+  it("F5: weights blend differently per category (per-category overrides)", () => {
+    // Source A: high HR, low SB. Source B: low HR, high SB. Same player.
+    const sourceA = new BatterProjectionSource({
+      source: "rthebatx",
+      playerKey: "mlb.p.cat",
+      name: "Cat Test",
+      team: "NYY",
+      pa: 100,
+      r: 20,
+      h: 30,
+      hr: 40,
+      rbi: 25,
+      sb: 2,
+      tb: 80,
+      obp: 0.4,
+      ab: 80,
+      bb: 15,
+      hbp: 2,
+      sf: 3,
+    });
+    const sourceB = new BatterProjectionSource({
+      source: "steamerr",
+      playerKey: "mlb.p.cat",
+      name: "Cat Test",
+      team: "NYY",
+      pa: 100,
+      r: 20,
+      h: 30,
+      hr: 0,
+      rbi: 25,
+      sb: 40,
+      tb: 40,
+      obp: 0.32,
+      ab: 80,
+      bb: 15,
+      hbp: 2,
+      sf: 3,
+    });
+
+    // Equal base weights, but HR leans hard to A and SB leans hard to B.
+    const [projection] = blendBatterProjections(
+      [sourceA, sourceB],
+      [
+        new ProjectionSourceWeight({ source: "rthebatx", weight: 0.5 }),
+        new ProjectionSourceWeight({ source: "steamerr", weight: 0.5 }),
+        new ProjectionSourceWeight({ source: "rthebatx", weight: 0.9, category: "hr" }),
+        new ProjectionSourceWeight({ source: "steamerr", weight: 0.1, category: "hr" }),
+        new ProjectionSourceWeight({ source: "rthebatx", weight: 0.1, category: "sb" }),
+        new ProjectionSourceWeight({ source: "steamerr", weight: 0.9, category: "sb" }),
+      ],
+    );
+
+    // HR: (40·0.9 + 0·0.1)/(0.9+0.1) = 36 ⇒ pulled toward A's 40.
+    expect(projection?.hr).toBeCloseTo(36, 6);
+    // SB: (2·0.1 + 40·0.9)/(0.1+0.9) = 36.2 ⇒ pulled toward B's 40.
+    expect(projection?.sb).toBeCloseTo(36.2, 6);
+    // A category without an override uses the equal base weights ⇒ simple mean.
+    expect(projection?.r).toBeCloseTo(20, 6);
+    expect(projection?.tb).toBeCloseTo((80 + 40) / 2, 6);
+  });
+
+  it("F5: source-base-only weights reproduce the old flat-weight behavior", () => {
+    // Same fixture & weights as the original flat-weight test; assert identical math.
+    const [projection] = blendBatterProjections(batterRows, [
+      new ProjectionSourceWeight({ source: "rthebatx", weight: 0.75 }),
+      new ProjectionSourceWeight({ source: "steamerr", weight: 0.25 }),
+    ]);
+
+    expect(projection?.pa).toBe(95); // 100·0.75 + 80·0.25
+    expect(projection?.hr).toBe(8.5); // 10·0.75 + 4·0.25
+    expect(projection?.obp).toBeCloseTo(0.38); // 0.40·0.75 + 0.32·0.25
+    expect(projection?.ab).toBe(77); // 80·0.75 + 68·0.25
+  });
+
+  it("F5: renormalization holds when a player is missing from one source", () => {
+    // Player present in rthebatx only; steamerr weight has nothing to apply to.
+    const [projection] = blendBatterProjections(
+      [makeBatter({ playerKey: "mlb.p.solo" })],
+      [
+        new ProjectionSourceWeight({ source: "rthebatx", weight: 0.25 }),
+        new ProjectionSourceWeight({ source: "steamerr", weight: 0.75 }),
+        new ProjectionSourceWeight({ source: "rthebatx", weight: 0.9, category: "hr" }),
+      ],
+    );
+
+    // Only the rthebatx row survives ⇒ totalWeight renormalizes to that single source's value.
+    expect(projection?.pa).toBe(100);
+    expect(projection?.hr).toBe(10);
+    expect(projection?.obp).toBeCloseTo(0.4, 6);
+  });
 });
