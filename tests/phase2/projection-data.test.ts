@@ -4,7 +4,11 @@ import * as Layer from "effect/Layer";
 import { HttpClient, HttpClientResponse, UrlParams } from "effect/unstable/http";
 import { describe, expect, it } from "@effect/vitest";
 
-import { ProjectionData } from "../../src/services/ProjectionData";
+import {
+  canonicalTeam,
+  parkFactorsByTeam,
+  ProjectionData,
+} from "../../src/services/ProjectionData";
 
 const batterRow = {
   playerid: "sa3022683",
@@ -310,5 +314,90 @@ describe("ProjectionData", () => {
         4,
       );
     }).pipe(Effect.provide(makeLayer(seenUrls)));
+  });
+});
+
+describe("team-key canonicalization", () => {
+  // The abbreviations each external source actually emits. Park factors, Vegas implied runs, and
+  // weekly game counts all join on the canonical team key, so every source abbreviation MUST map to
+  // a park-table key or that team silently falls back to neutral park / no Vegas / average games.
+  const fangraphsAbbrs = [
+    "ARI",
+    "ATH",
+    "ATL",
+    "BAL",
+    "BOS",
+    "CHC",
+    "CHW",
+    "CIN",
+    "CLE",
+    "COL",
+    "DET",
+    "HOU",
+    "KCR",
+    "LAA",
+    "LAD",
+    "MIA",
+    "MIL",
+    "MIN",
+    "NYM",
+    "NYY",
+    "PHI",
+    "PIT",
+    "SDP",
+    "SEA",
+    "SFG",
+    "STL",
+    "TBR",
+    "TEX",
+    "TOR",
+    "WSN",
+  ];
+  const statsApiAbbrs = [
+    "ATH",
+    "ATL",
+    "AZ",
+    "BAL",
+    "BOS",
+    "CHC",
+    "CIN",
+    "CLE",
+    "COL",
+    "CWS",
+    "DET",
+    "HOU",
+    "KC",
+    "LAA",
+    "LAD",
+    "MIA",
+    "MIL",
+    "MIN",
+    "NYM",
+    "NYY",
+    "PHI",
+    "PIT",
+    "SD",
+    "SEA",
+    "SF",
+    "STL",
+    "TB",
+    "TEX",
+    "TOR",
+    "WSH",
+  ];
+
+  it("maps every FanGraphs + StatsAPI abbreviation onto a park-table key", () => {
+    for (const abbr of [...fangraphsAbbrs, ...statsApiAbbrs]) {
+      expect(
+        parkFactorsByTeam[canonicalTeam(abbr)],
+        `${abbr} -> ${canonicalTeam(abbr)}`,
+      ).toBeDefined();
+    }
+  });
+
+  it("normalizes the relocated Athletics (OAK/ATH) to a single hitter-friendly park", () => {
+    expect(canonicalTeam("OAK")).toBe("ATH");
+    expect(canonicalTeam("ATH")).toBe("ATH");
+    expect(parkFactorsByTeam["ATH"]?.runsFactor).toBeGreaterThan(1);
   });
 });

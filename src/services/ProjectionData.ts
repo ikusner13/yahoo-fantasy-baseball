@@ -58,7 +58,6 @@ const TEAM_NAME_TO_ABBR: Record<string, string> = {
   "Minnesota Twins": "MIN",
   "New York Mets": "NYM",
   "New York Yankees": "NYY",
-  "Oakland Athletics": "OAK",
   "Philadelphia Phillies": "PHI",
   "Pittsburgh Pirates": "PIT",
   "San Diego Padres": "SD",
@@ -69,7 +68,31 @@ const TEAM_NAME_TO_ABBR: Record<string, string> = {
   "Texas Rangers": "TEX",
   "Toronto Blue Jays": "TOR",
   "Washington Nationals": "WSH",
+  // A's relocated to Sutter Health Park (Sacramento) for 2025+; odds feeds vary on the city prefix.
+  Athletics: "ATH",
+  "Oakland Athletics": "ATH",
+  "Sacramento Athletics": "ATH",
 };
+
+// Team abbreviations differ across our three external sources — FanGraphs (projection.team:
+// CHW/KCR/SDP/SFG/TBR/WSN/ATH), MLB StatsAPI (schedule/lineups: AZ/CWS/KC/SD/SF/TB/WSH/ATH), and
+// our internal park-factor / odds convention (ARI/CWS/KC/SD/SF/TB/WSH). They get joined by team
+// key (park factors, Vegas implied runs, weekly game counts), so they MUST be normalized to one
+// canonical convention or ~8 teams silently fall back to neutral park / no-Vegas / average games.
+// Canonical = the park-table convention; `ATH` is the post-relocation Athletics key.
+const TEAM_ALIAS: Record<string, string> = {
+  AZ: "ARI",
+  CHW: "CWS",
+  KCR: "KC",
+  SDP: "SD",
+  SFG: "SF",
+  TBR: "TB",
+  WSN: "WSH",
+  OAK: "ATH",
+};
+
+export const canonicalTeam = (abbreviation: string): string =>
+  TEAM_ALIAS[abbreviation] ?? abbreviation;
 
 const NumberFromUnknown = Schema.Union([Schema.Finite, Schema.FiniteFromString]);
 const OptionalNumberFromUnknown = Schema.optional(NumberFromUnknown);
@@ -352,7 +375,10 @@ export const parkFactorsByTeam: Record<string, ParkFactorContext> = {
     hrFactorLHB: 1.12,
     hrFactorRHB: 1.032,
   }),
-  OAK: new ParkFactorContext({ runsFactor: 0.96, hrFactor: 0.928 }),
+  // Athletics play at Sutter Health Park (Sacramento) for 2025+ — a Triple-A park that has played
+  // hitter-friendly (heat, smaller dimensions), the opposite of the old Oakland Coliseum. PROVISIONAL
+  // single-year 2025 prior (no 3-yr history yet), lightly regressed; refresh from Savant + fit via F8.
+  ATH: new ParkFactorContext({ runsFactor: 1.04, hrFactor: 1.064 }),
   PHI: new ParkFactorContext({ runsFactor: 1.016, hrFactor: 1.064 }),
   PIT: new ParkFactorContext({ runsFactor: 0.984, hrFactor: 0.92 }),
   SD: new ParkFactorContext({ runsFactor: 0.976, hrFactor: 0.928 }),
@@ -455,7 +481,7 @@ export class ProjectionData extends Context.Service<
                     playerKey: fgPlayerKey(row.playerid),
                     mlbId: row.xMLBAMID,
                     name: row.PlayerName,
-                    team: row.Team,
+                    team: canonicalTeam(row.Team),
                     pa: row.PA,
                     r: row.R,
                     h: row.H,
@@ -492,7 +518,7 @@ export class ProjectionData extends Context.Service<
                     playerKey: fgPlayerKey(row.playerid),
                     mlbId: row.xMLBAMID,
                     name: row.PlayerName,
-                    team: row.Team,
+                    team: canonicalTeam(row.Team),
                     ip: row.IP,
                     gs: row.GS,
                     k: row.SO,
@@ -694,6 +720,8 @@ export class ProjectionData extends Context.Service<
             gamePks.push(game.gamePk);
             const away = game.teams.away;
             const home = game.teams.home;
+            const awayTeam = canonicalTeam(away.team.abbreviation);
+            const homeTeam = canonicalTeam(home.team.abbreviation);
             const gameStartMs = game.gameDate == null ? undefined : Date.parse(game.gameDate);
             const finiteGameStartMs =
               gameStartMs != null && Number.isFinite(gameStartMs) ? gameStartMs : undefined;
@@ -714,17 +742,11 @@ export class ProjectionData extends Context.Service<
                   : Math.max(window.lastGameMs, finiteGameStartMs);
               dailyWindows.set(gameDateKey, window);
             }
-            teamGames.set(away.team.abbreviation, (teamGames.get(away.team.abbreviation) ?? 0) + 1);
-            teamGames.set(home.team.abbreviation, (teamGames.get(home.team.abbreviation) ?? 0) + 1);
+            teamGames.set(awayTeam, (teamGames.get(awayTeam) ?? 0) + 1);
+            teamGames.set(homeTeam, (teamGames.get(homeTeam) ?? 0) + 1);
             if (isRemaining) {
-              teamRemainingGames.set(
-                away.team.abbreviation,
-                (teamRemainingGames.get(away.team.abbreviation) ?? 0) + 1,
-              );
-              teamRemainingGames.set(
-                home.team.abbreviation,
-                (teamRemainingGames.get(home.team.abbreviation) ?? 0) + 1,
-              );
+              teamRemainingGames.set(awayTeam, (teamRemainingGames.get(awayTeam) ?? 0) + 1);
+              teamRemainingGames.set(homeTeam, (teamRemainingGames.get(homeTeam) ?? 0) + 1);
             }
             if (isRemaining && away.probablePitcher != null) {
               const playerKey = `mlb:${away.probablePitcher.id}`;
@@ -734,8 +756,8 @@ export class ProjectionData extends Context.Service<
                 new ProbablePitcherStart({
                   playerKey,
                   playerName: away.probablePitcher.fullName,
-                  team: away.team.abbreviation,
-                  opponentTeam: home.team.abbreviation,
+                  team: awayTeam,
+                  opponentTeam: homeTeam,
                   date: gameDateKey ?? startDate,
                   gameTime:
                     finiteGameStartMs == null
@@ -753,8 +775,8 @@ export class ProjectionData extends Context.Service<
                 new ProbablePitcherStart({
                   playerKey,
                   playerName: home.probablePitcher.fullName,
-                  team: home.team.abbreviation,
-                  opponentTeam: away.team.abbreviation,
+                  team: homeTeam,
+                  opponentTeam: awayTeam,
                   date: gameDateKey ?? startDate,
                   gameTime:
                     finiteGameStartMs == null
@@ -776,7 +798,7 @@ export class ProjectionData extends Context.Service<
           for (const side of [boxscore.teams.away, boxscore.teams.home]) {
             const battingOrder = side.battingOrder ?? [];
             if (battingOrder.length === 0) continue;
-            const team = side.team.abbreviation;
+            const team = canonicalTeam(side.team.abbreviation);
             confirmedLineupsByTeam[team] = (confirmedLineupsByTeam[team] ?? 0) + 1;
             for (const [index, mlbId] of battingOrder.entries()) {
               const playerKey = mlbPlayerKey(mlbId);
