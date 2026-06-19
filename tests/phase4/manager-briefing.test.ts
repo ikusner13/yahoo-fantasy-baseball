@@ -1451,4 +1451,100 @@ describe("ManagerBriefing Phase 4", () => {
     expect(briefing.bestAvailableAdd?.clearsBar).toBe(false);
     expect(briefing.bestAvailableAdd?.reason).toBe("no upgrade available in the FA pool");
   });
+
+  it("headlines an injured active starter even when no legal fix exists (IL full, no replacement)", () => {
+    const briefing = buildManagerBriefing(
+      new TransactionPlan({
+        addsRemaining: 6,
+        reservedAdds: 0,
+        projectedWeeklyIp: 32.1,
+        closestCategories: ["HR"],
+        categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
+        lineupRecommendations: [],
+        rejectedTransactions: [],
+        steps: [],
+      }),
+      new DailyLineupReport({
+        date: "2026-06-19",
+        posture: "lineup-only; no drop recommendations",
+        emptySlots: [],
+        activeUnavailable: [
+          new DailyLineupPlayer({
+            playerKey: "rooker",
+            playerId: "1",
+            name: "Brent Rooker",
+            team: "ATH",
+            eligiblePositions: ["OF", "Util", "IL"],
+            selectedPosition: "OF",
+            status: "IL10",
+          }),
+        ],
+        activeStatusRisks: [],
+        ilActivationMoves: [],
+        activeToIlMoves: [],
+        blockedIlMoves: 1,
+        replacementOptions: [],
+        fillableOpenSlots: [],
+        guardrails: [],
+      }),
+    );
+
+    expect(briefing.bestAction).toContain("Bench injured starter(s) now");
+    expect(briefing.decisionConfidence).toBe("high");
+    expect(briefing.lineupAlerts.join(" ")).toContain(
+      "Brent Rooker is active at OF with status IL10",
+    );
+    expect(briefing.bestActionSteps?.join(" ")).toContain("Brent Rooker is active at OF");
+    expect(briefing.bestActionSteps?.join(" ")).toContain("Open an IL slot");
+  });
+
+  it("surfaces a day-to-day active starter that the old logic dropped entirely", () => {
+    const briefing = buildManagerBriefing(
+      new TransactionPlan({
+        addsRemaining: 6,
+        reservedAdds: 0,
+        projectedWeeklyIp: 32.1,
+        closestCategories: ["OBP"],
+        categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
+        lineupRecommendations: [],
+        rejectedTransactions: [],
+        steps: [],
+      }),
+      new DailyLineupReport({
+        date: "2026-06-19",
+        posture: "lineup-only; no drop recommendations",
+        emptySlots: [],
+        activeUnavailable: [],
+        activeStatusRisks: [
+          new DailyLineupPlayer({
+            playerKey: "adley",
+            playerId: "2",
+            name: "Adley Rutschman",
+            team: "BAL",
+            eligiblePositions: ["C", "Util"],
+            selectedPosition: "C",
+            status: "DTD",
+          }),
+        ],
+        ilActivationMoves: [],
+        activeToIlMoves: [],
+        blockedIlMoves: 0,
+        replacementOptions: [],
+        fillableOpenSlots: [],
+        guardrails: [],
+      }),
+    );
+
+    expect(briefing.summary).toContain("Injury risk in your active lineup");
+    expect(briefing.summary).toContain("Adley Rutschman (DTD)");
+    expect(briefing.lineupAlerts.join(" ")).toContain(
+      "Adley Rutschman is active at C with status DTD",
+    );
+    expect(briefing.bestAction).toContain("Bench injured starter(s) now");
+    expect(briefing.decisionConfidence).toBe("high");
+  });
 });

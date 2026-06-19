@@ -553,6 +553,10 @@ const buildLineupAlerts = (plan: TransactionPlan, report: DailyLineupReport | un
       (player) =>
         `${player.name} is active at ${player.selectedPosition} with status ${player.status}.`,
     ) ?? []),
+    ...(report?.activeStatusRisks.map(
+      (player) =>
+        `${player.name} is active at ${player.selectedPosition} with status ${player.status} (day-to-day; bench if ruled out).`,
+    ) ?? []),
     ...pairedIlSwapAlerts,
     ...pairedBenchSwapAlerts,
     ...(report?.ilActivationMoves
@@ -657,6 +661,12 @@ const buildSummary = (
         : "no complete internal lineup fix is available yet";
     return `${unavailable} active player(s) are unavailable; ${moveText}. ${categoryText}`;
   }
+  if ((lineup?.activeStatusRisks.length ?? 0) > 0) {
+    const names = (lineup?.activeStatusRisks ?? [])
+      .map((player) => `${player.name} (${player.status})`)
+      .join(", ");
+    return `Injury risk in your active lineup: ${names}. Bench anyone ruled out before games lock. ${categoryText}`;
+  }
   if (openActiveSlotText.length > 0) {
     return `Open active slot(s): ${openActiveSlotText}; fill legal unlocked lineup volume before add/drop speculation. ${categoryText}`;
   }
@@ -687,21 +697,24 @@ const buildBestDecision = (
   warnings: ReadonlyArray<string>,
 ) => {
   const lineupMoves = lineupAlerts.filter(isLineupMove);
+  const lineupProblems = lineupAlerts.filter(isLineupProblem);
   const transactionAction = doNow[0] ?? holdForLater[0];
   const bestAction =
     lineupMoves.length > 0
       ? `Fix lineup only: ${lineupMoves.length} internal move(s), then regenerate.`
-      : transactionAction != null
-        ? transactionAction.confidence === "act"
-          ? transactionAction.action
-          : transactionAction.confidence === "hold"
-            ? `Hold: ${transactionAction.action}`
-            : `Blocked: ${transactionAction.action}`
-        : plan.addsRemaining <= 0
-          ? "No transaction: weekly add limit is exhausted."
-          : "No transaction clears the manager bar right now.";
+      : lineupProblems.length > 0
+        ? `Bench injured starter(s) now: ${lineupProblems.length} hurt player(s) are in your active lineup with no automatic fix — clear an IL slot or sit them before lock.`
+        : transactionAction != null
+          ? transactionAction.confidence === "act"
+            ? transactionAction.action
+            : transactionAction.confidence === "hold"
+              ? `Hold: ${transactionAction.action}`
+              : `Blocked: ${transactionAction.action}`
+          : plan.addsRemaining <= 0
+            ? "No transaction: weekly add limit is exhausted."
+            : "No transaction clears the manager bar right now.";
   const decisionConfidence =
-    lineupMoves.length > 0
+    lineupMoves.length > 0 || lineupProblems.length > 0
       ? "high"
       : transactionAction?.confidence === "act"
         ? "medium"
@@ -715,9 +728,15 @@ const buildBestDecision = (
           "Save roster changes.",
           "Regenerate the manager plan before applying any transaction.",
         ]
-      : transactionAction != null
-        ? transactionAction.yahooSteps
-        : ["Do nothing right now; re-check after lineup/status/category context changes."];
+      : lineupProblems.length > 0
+        ? [
+            ...lineupProblems,
+            "Open an IL slot (activate a healthy IL player or drop a bench player), or move each hurt player to your bench in Yahoo before lock.",
+            "Save roster changes, then regenerate the manager plan.",
+          ]
+        : transactionAction != null
+          ? transactionAction.yahooSteps
+          : ["Do nothing right now; re-check after lineup/status/category context changes."];
   const decisionEvidence = [
     `summary: ${summary}`,
     `adds: ${plan.addsRemaining} left, ${plan.reservedAdds} reserved`,
@@ -919,6 +938,10 @@ const isLineupMove = (line: string) =>
   line.startsWith("Move ") ||
   line.startsWith("Replace ") ||
   line.startsWith("Start ");
+
+// A "problem" alert names a hurt/unavailable player sitting in an active slot. Unlike a move, there
+// may be no legal auto-fix (IL full, no replacement) — it must still headline the briefing.
+const isLineupProblem = (line: string) => line.includes(" is active at ");
 
 export const buildYahooApplyPlan = (briefing: ManagerBriefingReport) => {
   const lineupMoves = briefing.lineupAlerts.filter(isLineupMove);
