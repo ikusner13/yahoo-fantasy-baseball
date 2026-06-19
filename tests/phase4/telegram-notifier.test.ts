@@ -4,11 +4,13 @@ import { renderManagerBriefingForTelegram } from "../../src/services/TelegramNot
 import { ManagerBriefingReport, ManualAction } from "../../src/services/ManagerBriefing";
 
 describe("TelegramNotifier", () => {
-  it("renders exhausted add budget without add/stream instructions", () => {
+  it("collapses an exhausted-add-budget HOLD day to a tight summary", () => {
     const message = renderManagerBriefingForTelegram(
       new ManagerBriefingReport({
         summary: "No transaction available: weekly add limit is exhausted.",
         generatedAt: "2026-06-06T18:00:00.000Z",
+        bestAction: "No transaction: weekly add limit is exhausted.",
+        decisionConfidence: "hold",
         addsRemaining: 0,
         reservedAdds: 0,
         projectedWeeklyIp: 21,
@@ -23,17 +25,87 @@ describe("TelegramNotifier", () => {
         ],
         lineupAlerts: [],
         rejectedTransactions: [],
+        optimalLineup: [],
+        optimalBench: [],
         doNow: [],
         holdForLater: [],
         warnings: [],
       }),
     );
 
-    expect(message).toContain("No transaction available: weekly Yahoo add limit is exhausted.");
-    expect(message).toContain("No add triggers are active");
+    // HOLD collapse: only title + reason + closest + compact header. The verbose
+    // add-trigger / manager-read / decision sections are echoes and are suppressed.
+    expect(message).toContain("⚾ Fantasy GM — HOLD");
+    expect(message).toContain("No transaction: weekly add limit is exhausted.");
+    expect(message).toContain("Closest: SB");
+    expect(message).toContain("➕ 0 adds left");
+    expect(message).not.toContain("🧭 Add Triggers");
+    expect(message).not.toContain("No add triggers are active");
+    expect(message).not.toContain("🧠 Manager Read");
     expect(message).not.toContain("Hitter stream");
     expect(message).not.toContain("SP stream");
     expect(message).not.toContain("Late-week snipe");
+    expect(message.split("\n").length).toBeLessThan(10);
+  });
+
+  it("renders the full optimal lineup as a slot-by-slot block", () => {
+    const message = renderManagerBriefingForTelegram(
+      new ManagerBriefingReport({
+        summary: "Lineup is set.",
+        generatedAt: "2026-06-06T18:00:00.000Z",
+        addsRemaining: 3,
+        reservedAdds: 0,
+        projectedWeeklyIp: 24,
+        closestCategories: [],
+        categorySituations: [],
+        managerTakeaways: [],
+        categoryPlan: [],
+        addTriggers: [],
+        lineupAlerts: [],
+        optimalLineup: [
+          {
+            slot: "SP",
+            kind: "pitcher",
+            playerKey: "ace",
+            playerName: "Ace Pitcher",
+            score: 5,
+            isCurrentStarter: true,
+          },
+          {
+            slot: "C",
+            kind: "batter",
+            playerKey: "catcher",
+            playerName: "Sánchez",
+            score: 2,
+            isCurrentStarter: true,
+          },
+          {
+            slot: "Util",
+            kind: "batter",
+            playerKey: "power-bench",
+            playerName: "Power Bench",
+            score: 4,
+            isCurrentStarter: false,
+          },
+        ],
+        optimalBench: [
+          { kind: "batter", playerKey: "low-power", playerName: "Low Power", score: 1 },
+        ],
+        rejectedTransactions: [],
+        doNow: [],
+        holdForLater: [],
+        warnings: [],
+      }),
+    );
+
+    expect(message).toContain("🟢 Lineup");
+    expect(message).toContain("C  Sánchez");
+    expect(message).toContain("Util  Power Bench");
+    expect(message).toContain("SP  Ace Pitcher");
+    expect(message).toContain("Bench: Low Power");
+    const cIndex = message.indexOf("C  Sánchez");
+    const spIndex = message.indexOf("SP  Ace Pitcher");
+    expect(cIndex).toBeLessThan(spIndex);
   });
 
   it("renders urgent lineup briefings as a scannable Telegram digest", () => {
@@ -82,6 +154,8 @@ describe("TelegramNotifier", () => {
           "Move Injured Catcher from C to IL (IL10).",
         ],
         rejectedTransactions: [],
+        optimalLineup: [],
+        optimalBench: [],
         doNow: [
           new ManualAction({
             priority: 1,
@@ -118,9 +192,12 @@ describe("TelegramNotifier", () => {
     expect(message).toContain("Fix lineup only: 1 internal move(s), then regenerate");
     expect(message).toContain("🧾 Do This");
     expect(message).toContain("• Move Injured Catcher from C to IL");
-    expect(message).toContain("🔎 Why");
-    expect(message).toContain("adds: 2 left, 0 reserved");
-    expect(message.indexOf("🎯 Next Add After Lineup Fix")).toBeLessThan(message.indexOf("🔎 Why"));
+    // "🔎 Why" / "🧱 Blockers" sections are removed: decisionEvidence is a pure echo of
+    // the header (summary/adds/IP/closest) + Manager Read, and decisionBlockers echoes
+    // the Add Triggers / Yahoo Writes / Guardrails sections.
+    expect(message).not.toContain("🔎 Why");
+    expect(message).not.toContain("🧱 Blockers");
+    expect(message).not.toContain("adds: 2 left, 0 reserved");
     expect(message).toContain("🧠 Manager Read");
     expect(message).toContain("Lineup first");
     expect(message).toContain("🧭 Add Triggers");
@@ -155,11 +232,13 @@ describe("TelegramNotifier", () => {
     expect(message).not.toContain("**");
   });
 
-  it("keeps the scoreboard when there is no urgent lineup fix", () => {
+  it("collapses a do-nothing HOLD day but keeps the real write-auth and next-start alerts", () => {
     const message = renderManagerBriefingForTelegram(
       new ManagerBriefingReport({
         summary: "No urgent lineup change; closest categories are SB, OBP.",
         generatedAt: "2026-06-06T18:00:00.000Z",
+        bestAction: "No transaction clears the manager bar right now.",
+        decisionConfidence: "hold",
         addsRemaining: 2,
         reservedAdds: 0,
         projectedWeeklyIp: 21,
@@ -175,19 +254,22 @@ describe("TelegramNotifier", () => {
         writeAlerts: ["Yahoo writes are not authorized yet; complete read/write Yahoo auth."],
         pitcherStarts: ["Scheduled Starter (SP): 1.0 expected start(s), 6.2 IP, 7.4 K."],
         rejectedTransactions: [],
+        optimalLineup: [],
+        optimalBench: [],
         doNow: [],
         holdForLater: [],
         warnings: [],
       }),
     );
 
-    expect(message).toContain("📊 Scoreboard");
-    expect(message).toContain("Trail SB: 2-3");
-    expect(message).toContain("Lead OBP: .331-.328");
-    expect(message).toContain("🔐 Yahoo Writes");
+    // The scoreboard is echo noise on a do-nothing day, so it is suppressed; the
+    // genuinely-actionable write-auth and next-start lines are still surfaced.
+    expect(message).toContain("⚾ Fantasy GM — HOLD");
+    expect(message).not.toContain("📊 Scoreboard");
+    expect(message).not.toContain("Trail SB: 2-3");
+    expect(message).toContain("Closest: SB, OBP");
     expect(message).toContain("Yahoo writes are not authorized yet");
-    expect(message).toContain("🗓️ Pitcher Starts");
-    expect(message).toContain("Scheduled Starter (SP): 1.0 expected start(s), 6.2 IP, 7.4 K.");
+    expect(message).toContain("🗓️ Next: Scheduled Starter (SP): 1.0 expected start(s)");
   });
 
   it("normalizes stale cached warning copy at render time", () => {
@@ -205,7 +287,20 @@ describe("TelegramNotifier", () => {
         addTriggers: [],
         lineupAlerts: [],
         rejectedTransactions: [],
-        doNow: [],
+        optimalLineup: [],
+        optimalBench: [],
+        doNow: [
+          new ManualAction({
+            priority: 1,
+            action: "Add Speed Bat into the open active slot",
+            confidence: "act",
+            categories: ["SB"],
+            rationale: "Add Speed Bat: targets SB.",
+            checks: [],
+            stopIf: [],
+            yahooSteps: [],
+          }),
+        ],
         holdForLater: [],
         warnings: [
           "This is a manual manager decision generated from Yahoo roster, status, and lock data.",
@@ -219,21 +314,25 @@ describe("TelegramNotifier", () => {
     expect(message).not.toContain("manual manager decision");
   });
 
-  it("labels the best non-urgent action as a hold decision", () => {
+  it("collapses a blocked (review-only) decision into the HOLD summary", () => {
     const message = renderManagerBriefingForTelegram(
       new ManagerBriefingReport({
         summary: "One add clears the model but not the timing guardrail.",
         generatedAt: "2026-06-06T18:00:00.000Z",
+        bestAction: "Blocked: Add Speed Bat into the open roster spot",
+        decisionConfidence: "low",
+        closestCategories: ["SB"],
         addsRemaining: 2,
         reservedAdds: 0,
         projectedWeeklyIp: 21,
-        closestCategories: ["SB"],
         categorySituations: [],
         managerTakeaways: [],
         categoryPlan: [],
         addTriggers: [],
         lineupAlerts: [],
         rejectedTransactions: [],
+        optimalLineup: [],
+        optimalBench: [],
         doNow: [],
         holdForLater: [
           new ManualAction({
@@ -251,54 +350,13 @@ describe("TelegramNotifier", () => {
       }),
     );
 
-    expect(message).toContain("🧱 Blocked Decision");
-    expect(message).toContain(
-      "Decision blocked: Add Speed Bat into the open roster spot; execute only after the listed gate clears.",
-    );
-    expect(message).toContain("1. [BLOCKED] Add Speed Bat");
-    expect(message).toContain("Focus: SB");
-    expect(message).not.toContain("🎯 Next Add");
-    expect(message).not.toContain("🔎 Review");
-    expect(message).not.toContain("Add Candidates");
-  });
-
-  it("explains no-category adds as roster-fit decisions instead of depth", () => {
-    const message = renderManagerBriefingForTelegram(
-      new ManagerBriefingReport({
-        summary: "Use the open roster spot without forcing a category claim.",
-        generatedAt: "2026-06-06T18:00:00.000Z",
-        addsRemaining: 2,
-        reservedAdds: 0,
-        projectedWeeklyIp: 21,
-        closestCategories: ["OUT", "ERA"],
-        categorySituations: [],
-        managerTakeaways: [],
-        categoryPlan: [],
-        addTriggers: [],
-        lineupAlerts: [],
-        rejectedTransactions: [],
-        doNow: [],
-        holdForLater: [
-          new ManualAction({
-            priority: 1,
-            action: "Add Catcher Bat into the open roster spot",
-            confidence: "review",
-            categories: [],
-            rationale:
-              "Add Catcher Bat: 0.23 weekly category EV, 0.02 season SGP; focus open roster spot without dropping long-term value.",
-            checks: [],
-            stopIf: [],
-            yahooSteps: [],
-          }),
-        ],
-        warnings: [],
-      }),
-    );
-
-    expect(message).toContain("Focus: open roster spot, no drop");
-    expect(message).toContain("focus open roster spot without dropping long-term value");
-    expect(message).not.toContain("Categories: depth");
-    expect(message).not.toContain("targeting depth");
+    // A review/blocked add does not clear the bar, so it is a HOLD day: collapse the
+    // verbose blocked-decision block down to the one-line bestAction summary.
+    expect(message).toContain("⚾ Fantasy GM — HOLD");
+    expect(message).toContain("Blocked: Add Speed Bat into the open roster spot");
+    expect(message).not.toContain("🧱 Blocked Decision");
+    expect(message).not.toContain("[BLOCKED]");
+    expect(message).not.toContain("Focus:");
   });
 
   it("keeps projection-only start recommendations out of Yahoo save steps", () => {
@@ -319,6 +377,8 @@ describe("TelegramNotifier", () => {
           "Move Injured Catcher from C to IL (IL10).",
         ],
         rejectedTransactions: [],
+        optimalLineup: [],
+        optimalBench: [],
         doNow: [],
         holdForLater: [],
         warnings: [],
@@ -328,5 +388,299 @@ describe("TelegramNotifier", () => {
     expect(message).toContain("3. Move Injured Catcher from C to IL");
     expect(message).not.toContain("Consider starting");
     expect(message).not.toContain("Start Bench Bat over Cold Starter");
+  });
+
+  it("renders the best available add when nothing clears the bar", () => {
+    const message = renderManagerBriefingForTelegram(
+      new ManagerBriefingReport({
+        summary: "No transaction clears the current safety bar.",
+        generatedAt: "2026-06-06T18:00:00.000Z",
+        addsRemaining: 6,
+        reservedAdds: 0,
+        projectedWeeklyIp: 24,
+        closestCategories: ["HR"],
+        categorySituations: [],
+        bestAvailableAdd: {
+          playerName: "Carrasco",
+          score: -0.05,
+          categories: [],
+          reason: "below add bar, would not improve a category",
+          clearsBar: false,
+        },
+        managerTakeaways: [],
+        categoryPlan: [],
+        addTriggers: [],
+        lineupAlerts: [],
+        rejectedTransactions: [],
+        optimalLineup: [],
+        optimalBench: [],
+        doNow: [],
+        holdForLater: [],
+        warnings: [],
+      }),
+    );
+
+    expect(message).toContain(
+      "Best available: Carrasco (-0.05) — below add bar, would not improve a category.",
+    );
+  });
+
+  it("omits the best available line when the add clears the bar", () => {
+    const message = renderManagerBriefingForTelegram(
+      new ManagerBriefingReport({
+        summary: "Act-now move found.",
+        generatedAt: "2026-06-06T18:00:00.000Z",
+        addsRemaining: 6,
+        reservedAdds: 0,
+        projectedWeeklyIp: 24,
+        closestCategories: ["RBI"],
+        categorySituations: [],
+        bestAvailableAdd: {
+          playerName: "Useful Add",
+          score: 2.2,
+          categories: ["RBI"],
+          reason: "clears the add bar",
+          clearsBar: true,
+        },
+        managerTakeaways: [],
+        categoryPlan: [],
+        addTriggers: [],
+        lineupAlerts: [],
+        rejectedTransactions: [],
+        optimalLineup: [],
+        optimalBench: [],
+        doNow: [],
+        holdForLater: [],
+        warnings: [],
+      }),
+    );
+
+    expect(message).not.toContain("Best available:");
+  });
+
+  it("renders the approved compact HOLD layout with no echoed sections", () => {
+    const message = renderManagerBriefingForTelegram(
+      new ManagerBriefingReport({
+        summary: "No act-now move clears the bar from the current Yahoo setup.",
+        generatedAt: "2026-06-19T13:38:00.000Z",
+        bestAction: "No move clears the bar today.",
+        decisionConfidence: "hold",
+        addsRemaining: 6,
+        reservedAdds: 0,
+        projectedWeeklyIp: 28,
+        closestCategories: ["WHIP", "OBP", "ERA", "HR", "RBI"],
+        todayGameWindow: {
+          date: "2026-06-19",
+          games: 14,
+          remainingGames: 14,
+          firstGameTime: "2026-06-19T18:20:00.000Z",
+        },
+        categorySituations: [
+          { category: "WHIP", myValue: "1.20", opponentValue: "1.18", status: "losing" },
+        ],
+        managerTakeaways: [
+          "Lineup first: no hard-unavailable active player is blocking decisions.",
+        ],
+        categoryPlan: ["Protect: HR 10-9."],
+        addTriggers: [
+          "Hitter stream: only if HR/TB/RBI/H can move without dropping a protected player.",
+        ],
+        lineupAlerts: ["Brent Rooker (IL10) stuck active at OF — no IL/BN slot open yet."],
+        writeAlerts: ["Yahoo write auth missing — dry-run only."],
+        pitcherStarts: ["Emmet Sheehan SP, ~1 start vs BAL (6/21)"],
+        rejectedTransactions: [
+          {
+            addPlayerName: "Bench Arm",
+            score: -0.1,
+            affectedCategories: [],
+            reason: "below add bar",
+          },
+        ],
+        optimalLineup: [],
+        optimalBench: [],
+        doNow: [],
+        holdForLater: [],
+        warnings: ["The 20-IP floor appears covered; do not add risky pitchers just for volume."],
+      }),
+    );
+
+    expect(message).toContain("⚾ Fantasy GM — HOLD");
+    expect(message).toContain("No move clears the bar today.");
+    expect(message).toContain("Closest: WHIP, OBP, ERA, HR, RBI");
+    expect(message).toContain("🕒 Jun 19,");
+    expect(message).toContain("14/14 games");
+    expect(message).toContain("(first Jun 19, 2:20 PM EDT)");
+    expect(message).toContain("➕ 6 adds left · ⚾ 28.0 IP");
+    expect(message).toContain("🚨 Brent Rooker (IL10) stuck active at OF");
+    expect(message).toContain("🔐 Yahoo write auth missing — dry-run only.");
+    expect(message).toContain("🗓️ Next: Emmet Sheehan SP, ~1 start vs BAL (6/21)");
+
+    // No echo sections at all on a HOLD day.
+    expect(message).not.toContain("🔎 Why");
+    expect(message).not.toContain("🧱 Blockers");
+    expect(message).not.toContain("🧭 Add Triggers");
+    expect(message).not.toContain("🛑 Guardrails");
+    expect(message).not.toContain("🧠 Manager Read");
+    expect(message).not.toContain("📊 Scoreboard");
+    expect(message).not.toContain("✅ Best Current Action");
+    expect(message.split("\n").length).toBeLessThan(14);
+  });
+
+  it("renders the full optimal lineup with promotions on an action day", () => {
+    const message = renderManagerBriefingForTelegram(
+      new ManagerBriefingReport({
+        summary: "Set the optimal lineup; a bench bat is a promotion.",
+        generatedAt: "2026-06-19T13:38:00.000Z",
+        bestAction: "Set optimal lineup before lock.",
+        decisionConfidence: "high",
+        addsRemaining: 3,
+        reservedAdds: 0,
+        projectedWeeklyIp: 24,
+        closestCategories: ["HR"],
+        categorySituations: [],
+        managerTakeaways: [],
+        categoryPlan: [],
+        addTriggers: [],
+        lineupAlerts: [],
+        optimalLineup: [
+          {
+            slot: "C",
+            kind: "batter",
+            playerKey: "c1",
+            playerName: "Starter Catcher",
+            score: 2,
+            isCurrentStarter: true,
+          },
+          {
+            slot: "Util",
+            kind: "batter",
+            playerKey: "promo",
+            playerName: "Promote Me",
+            score: 4,
+            isCurrentStarter: false,
+          },
+        ],
+        optimalBench: [{ kind: "batter", playerKey: "bn1", playerName: "Cold Bat", score: 1 }],
+        rejectedTransactions: [],
+        doNow: [],
+        holdForLater: [],
+        warnings: [],
+      }),
+    );
+
+    expect(message).toContain("⚾ Fantasy GM");
+    expect(message).not.toContain("— HOLD");
+    expect(message).toContain("🟢 Lineup");
+    expect(message).toContain("C  Starter Catcher");
+    expect(message).toContain("Util  Promote Me ⬆️");
+    expect(message).toContain("Bench: Cold Bat");
+  });
+
+  it("does not repeat the best-available add in the skipped section", () => {
+    const message = renderManagerBriefingForTelegram(
+      new ManagerBriefingReport({
+        summary: "Nothing clears the bar.",
+        generatedAt: "2026-06-19T13:38:00.000Z",
+        bestAction: "No transaction clears the manager bar right now.",
+        decisionConfidence: "hold",
+        addsRemaining: 6,
+        reservedAdds: 0,
+        projectedWeeklyIp: 24,
+        closestCategories: ["HR"],
+        categorySituations: [],
+        bestAvailableAdd: {
+          playerName: "Carrasco",
+          score: -0.05,
+          categories: [],
+          reason: "below add bar",
+          clearsBar: false,
+        },
+        managerTakeaways: [],
+        categoryPlan: [],
+        addTriggers: [],
+        lineupAlerts: ["Hot Bat (IL10) stuck active at OF — no IL/BN slot open yet."],
+        writeAlerts: ["Yahoo write auth missing — dry-run only."],
+        rejectedTransactions: [
+          {
+            addPlayerName: "Carrasco",
+            score: -0.05,
+            affectedCategories: [],
+            reason: "below add bar",
+          },
+        ],
+        optimalLineup: [],
+        optimalBench: [],
+        doNow: [],
+        holdForLater: [],
+        warnings: [],
+      }),
+    );
+
+    const occurrences = (haystack: string, needle: string) => haystack.split(needle).length - 1;
+
+    // HOLD shows the best-available line once; the skipped section is suppressed on HOLD
+    // anyway, but Carrasco/below add bar must never appear twice.
+    expect(occurrences(message, "Carrasco")).toBe(1);
+    expect(occurrences(message, "Yahoo write auth missing — dry-run only.")).toBe(1);
+    expect(occurrences(message, "WHIP")).toBeLessThanOrEqual(0);
+    expect(occurrences(message, "Closest: HR")).toBe(1);
+  });
+
+  it("de-dups the best-available add against skipped on an action day", () => {
+    const message = renderManagerBriefingForTelegram(
+      new ManagerBriefingReport({
+        summary: "Set the optimal lineup.",
+        generatedAt: "2026-06-19T13:38:00.000Z",
+        bestAction: "Set optimal lineup before lock.",
+        decisionConfidence: "high",
+        addsRemaining: 6,
+        reservedAdds: 0,
+        projectedWeeklyIp: 24,
+        closestCategories: ["HR"],
+        categorySituations: [],
+        bestAvailableAdd: {
+          playerName: "Carrasco",
+          score: -0.05,
+          categories: [],
+          reason: "below add bar",
+          clearsBar: false,
+        },
+        managerTakeaways: [],
+        categoryPlan: [],
+        addTriggers: [],
+        lineupAlerts: [],
+        rejectedTransactions: [
+          {
+            addPlayerName: "Carrasco",
+            score: -0.05,
+            affectedCategories: [],
+            reason: "below add bar",
+          },
+          { addPlayerName: "Other Guy", score: -0.2, affectedCategories: [], reason: "worse fit" },
+        ],
+        optimalLineup: [
+          {
+            slot: "Util",
+            kind: "batter",
+            playerKey: "promo",
+            playerName: "Promote Me",
+            score: 4,
+            isCurrentStarter: false,
+          },
+        ],
+        optimalBench: [],
+        doNow: [],
+        holdForLater: [],
+        warnings: [],
+      }),
+    );
+
+    const occurrences = (haystack: string, needle: string) => haystack.split(needle).length - 1;
+
+    // Carrasco is the best-available line; it must not be repeated under ⛔ Skipped.
+    expect(message).toContain("Best available: Carrasco");
+    expect(occurrences(message, "Carrasco")).toBe(1);
+    expect(message).toContain("⛔ Skipped");
+    expect(message).toContain("Other Guy: worse fit");
   });
 });

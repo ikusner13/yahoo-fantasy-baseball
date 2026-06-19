@@ -125,6 +125,13 @@ const managerDecisionLine = (
   return "No add/drop clears the manager bar right now.";
 };
 
+const bestAvailableLine = (briefing: ManagerBriefingReport) => {
+  const best = briefing.bestAvailableAdd;
+  if (best == null || best.clearsBar) return [];
+  const drop = best.dropPlayerName == null ? "" : `/${best.dropPlayerName}`;
+  return [`Best available: ${best.playerName}${drop} (${best.score.toFixed(2)}) — ${best.reason}.`];
+};
+
 const confidenceLabel = (briefing: ManagerBriefingReport) => {
   const confidence = briefing.decisionConfidence;
   if (confidence == null) return undefined;
@@ -139,6 +146,53 @@ const normalizeWarning = (warning: string) =>
     ? "Manager decision generated from Yahoo roster, status, lock data, matchup context, and category guardrails."
     : warning;
 
+const LINEUP_SLOT_ORDER = ["C", "1B", "2B", "3B", "SS", "OF", "Util", "SP", "RP", "P"];
+
+const lineupSlotRank = (slot: string) => {
+  const index = LINEUP_SLOT_ORDER.indexOf(slot);
+  return index < 0 ? LINEUP_SLOT_ORDER.length : index;
+};
+
+const buildOptimalLineupBlock = (briefing: ManagerBriefingReport) => {
+  if (briefing.optimalLineup.length === 0) return [];
+  const slots = [...briefing.optimalLineup].sort(
+    (a, b) => lineupSlotRank(a.slot) - lineupSlotRank(b.slot),
+  );
+  const lines = [
+    "",
+    "🟢 Lineup",
+    ...slots.map((slot) => `${slot.slot}  ${slot.playerName}${slot.isCurrentStarter ? "" : " ⬆️"}`),
+  ];
+  if (briefing.optimalBench.length > 0) {
+    lines.push(
+      `Bench: ${briefing.optimalBench
+        .slice(0, 6)
+        .map((player) => player.playerName)
+        .join(", ")}`,
+    );
+  }
+  return lines;
+};
+
+const compactHeader = (briefing: ManagerBriefingReport) => {
+  const window = briefing.todayGameWindow;
+  const games =
+    window == null
+      ? "schedule unavailable"
+      : `${window.remainingGames}/${window.games} games${
+          window.firstGameTime == null ? "" : ` (first ${compactDateTime(window.firstGameTime)})`
+        }`;
+  return [
+    `🕒 ${compactDateTime(briefing.generatedAt)} · ${games}`,
+    `➕ ${briefing.addsRemaining} adds left · ⚾ ${briefing.projectedWeeklyIp.toFixed(1)} IP`,
+  ];
+};
+
+const nextPitcherStartLine = (briefing: ManagerBriefingReport) => {
+  const start = briefing.pitcherStarts?.[0];
+  return start == null ? [] : [`🗓️ Next: ${start}`];
+};
+
 export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport) => {
   const actions = briefing.doNow.length > 0 ? briefing.doNow : briefing.holdForLater.slice(0, 1);
   const lineupProblems = briefing.lineupAlerts.filter(isLineupProblem);
@@ -149,6 +203,28 @@ export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport
   const hasUrgentLineup = lineupProblems.length > 0 || lineupMoves.length > 0;
   const hasActNow = actions.some((action) => action.confidence === "act");
   const hasBlockedDecision = actions.some((action) => action.confidence === "review");
+  const addClearsBar = briefing.bestAvailableAdd?.clearsBar === true;
+  const hasLineupPromotion = briefing.optimalLineup.some((slot) => !slot.isCurrentStarter);
+  const isHold = !hasActNow && !hasUrgentLineup && !addClearsBar && !hasLineupPromotion;
+
+  if (isHold) {
+    const lines = [
+      "⚾ Fantasy GM — HOLD",
+      briefing.bestAction ?? briefing.summary,
+      `Closest: ${briefing.closestCategories.join(", ") || "none"}`,
+      ...bestAvailableLine(briefing),
+      "",
+      ...compactHeader(briefing),
+    ];
+    const alerts = [...lineupProblems, ...otherLineupAlerts];
+    const writeAlerts = (briefing.writeAlerts ?? []).map((line) => `🔐 ${line}`);
+    if (alerts.length > 0 || writeAlerts.length > 0) {
+      lines.push("", ...alerts.slice(0, 5).map((line) => `🚨 ${line}`), ...writeAlerts.slice(0, 2));
+    }
+    lines.push(...nextPitcherStartLine(briefing));
+    return lines.join("\n");
+  }
+
   const actionHeader = hasActNow
     ? "✅ Do Now"
     : hasUrgentLineup
@@ -166,6 +242,7 @@ export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport
             compactAction(action, index + 1, { afterLineupFix: hasUrgentLineup }),
           ),
         ];
+  const hasOptimalLineup = briefing.optimalLineup.length > 0;
   const lines = [
     "⚾ Fantasy GM",
     briefing.summary,
@@ -179,6 +256,7 @@ export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport
     "✅ Best Current Action",
     ...(confidenceLabel(briefing) == null ? [] : [`Confidence: ${confidenceLabel(briefing)}`]),
     managerDecisionLine(briefing, lineupMoves, actions),
+    ...bestAvailableLine(briefing),
   ];
 
   if ((briefing.bestActionSteps?.length ?? 0) > 0) {
@@ -191,10 +269,6 @@ export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport
 
   if (hasUrgentLineup) {
     lines.push(...actionSection);
-  }
-
-  if ((briefing.decisionEvidence?.length ?? 0) > 0) {
-    lines.push("", "🔎 Why", ...briefing.decisionEvidence!.slice(0, 5).map((line) => `• ${line}`));
   }
 
   if (briefing.managerTakeaways.length > 0) {
@@ -210,13 +284,15 @@ export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport
     if (lineupProblems.length > 0) {
       lines.push("Problems", ...lineupProblems.slice(0, 5).map((line) => `• ${line}`));
     }
-    if (lineupMoves.length > 0) {
+    if (lineupMoves.length > 0 && !hasOptimalLineup) {
       lines.push("Moves", ...lineupMoves.slice(0, 6).map((line) => `• ${line}`));
     }
     if (otherLineupAlerts.length > 0) {
       lines.push("Notes", ...otherLineupAlerts.slice(0, 3).map((line) => `• ${line}`));
     }
   }
+
+  lines.push(...buildOptimalLineupBlock(briefing));
 
   if (lineupMoves.length > 0) {
     lines.push("", "📲 Yahoo Steps", ...yahooLineupSteps(lineupMoves));
@@ -227,14 +303,6 @@ export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport
       "",
       "🔐 Yahoo Writes",
       ...briefing.writeAlerts!.slice(0, 2).map((line) => `• ${line}`),
-    );
-  }
-
-  if ((briefing.decisionBlockers?.length ?? 0) > 0) {
-    lines.push(
-      "",
-      "🧱 Blockers",
-      ...briefing.decisionBlockers!.slice(0, 4).map((line) => `• ${line}`),
     );
   }
 
@@ -267,13 +335,19 @@ export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport
   }
 
   if (briefing.rejectedTransactions.length > 0) {
-    lines.push(
-      "",
-      "⛔ Skipped",
-      ...briefing.rejectedTransactions
-        .slice(0, 3)
-        .map((move) => `• ${move.addPlayerName}: ${move.reason}`),
+    const best = briefing.bestAvailableAdd;
+    const bestShown = best != null && !best.clearsBar;
+    const skipped = briefing.rejectedTransactions.filter(
+      (move) =>
+        !(bestShown && move.addPlayerName === best!.playerName && move.reason === best!.reason),
     );
+    if (skipped.length > 0) {
+      lines.push(
+        "",
+        "⛔ Skipped",
+        ...skipped.slice(0, 3).map((move) => `• ${move.addPlayerName}: ${move.reason}`),
+      );
+    }
   }
 
   if (briefing.warnings.length > 0) {

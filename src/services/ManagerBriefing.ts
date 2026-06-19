@@ -71,6 +71,16 @@ export class ManagerBriefingReport extends Schema.Class<ManagerBriefingReport>(
   bestActionSteps: Schema.optional(Schema.Array(Schema.String)),
   decisionEvidence: Schema.optional(Schema.Array(Schema.String)),
   decisionBlockers: Schema.optional(Schema.Array(Schema.String)),
+  bestAvailableAdd: Schema.optional(
+    Schema.Struct({
+      playerName: Schema.String,
+      dropPlayerName: Schema.optional(Schema.String),
+      score: Schema.Finite,
+      categories: Schema.Array(Schema.String),
+      reason: Schema.String,
+      clearsBar: Schema.Boolean,
+    }),
+  ),
   addsRemaining: Schema.Finite,
   reservedAdds: Schema.Finite,
   projectedWeeklyIp: Schema.Finite,
@@ -100,6 +110,24 @@ export class ManagerBriefingReport extends Schema.Class<ManagerBriefingReport>(
   categoryPlan: Schema.Array(Schema.String),
   addTriggers: Schema.Array(Schema.String),
   lineupAlerts: Schema.Array(Schema.String),
+  optimalLineup: Schema.Array(
+    Schema.Struct({
+      slot: Schema.String,
+      kind: Schema.Union([Schema.Literal("batter"), Schema.Literal("pitcher")]),
+      playerKey: Schema.String,
+      playerName: Schema.String,
+      score: Schema.Finite,
+      isCurrentStarter: Schema.Boolean,
+    }),
+  ),
+  optimalBench: Schema.Array(
+    Schema.Struct({
+      kind: Schema.Union([Schema.Literal("batter"), Schema.Literal("pitcher")]),
+      playerKey: Schema.String,
+      playerName: Schema.String,
+      score: Schema.Finite,
+    }),
+  ),
   pitcherStarts: Schema.optional(Schema.Array(Schema.String)),
   writeAlerts: Schema.optional(Schema.Array(Schema.String)),
   rejectedTransactions: Schema.Array(
@@ -474,8 +502,15 @@ const buildLineupAlerts = (plan: TransactionPlan, report: DailyLineupReport | un
   const fullSlateUnlocked =
     plan.todayGameWindow != null &&
     plan.todayGameWindow.remainingGames === plan.todayGameWindow.games;
-  const canApplyProjectionLineupMoves =
-    (report?.activeUnavailable.length ?? 0) === 0 && fullSlateUnlocked;
+  const unavailableActiveKeys = new Set(
+    report?.activeUnavailable.map((player) => player.playerKey) ?? [],
+  );
+  const isProjectionMoveApplicable = (
+    recommendation: TransactionPlan["lineupRecommendations"][number],
+  ) =>
+    fullSlateUnlocked &&
+    !unavailableActiveKeys.has(recommendation.startPlayerKey) &&
+    !unavailableActiveKeys.has(recommendation.sitPlayerKey);
   const pairedIlSwapAlerts =
     report?.ilActivationMoves.flatMap((activation) => {
       if (activation.to === "BN") return [];
@@ -535,15 +570,13 @@ const buildLineupAlerts = (plan: TransactionPlan, report: DailyLineupReport | un
       return `Move ${move.playerName} from BN to ${move.slot}.`;
     }) ?? []),
     ...residualOpenSlotAlerts,
-    ...(canApplyProjectionLineupMoves
-      ? plan.lineupRecommendations.map((recommendation) => {
-          const categories =
-            recommendation.affectedCategories.length > 0
-              ? ` for ${recommendation.affectedCategories.slice(0, 3).join(", ")}`
-              : "";
-          return `Start ${recommendation.startPlayerName} over ${recommendation.sitPlayerName}${categories}.`;
-        })
-      : []),
+    ...plan.lineupRecommendations.filter(isProjectionMoveApplicable).map((recommendation) => {
+      const categories =
+        recommendation.affectedCategories.length > 0
+          ? ` for ${recommendation.affectedCategories.slice(0, 3).join(", ")}`
+          : "";
+      return `Start ${recommendation.startPlayerName} over ${recommendation.sitPlayerName}${categories}.`;
+    }),
     ...benchScheduledStarts,
   ].filter((alert): alert is string => alert != null);
   if ((report?.blockedIlMoves ?? 0) > 0) {
@@ -616,7 +649,8 @@ const buildSummary = (
     .join(", ");
   if ((lineup?.activeUnavailable.length ?? 0) > 0) {
     const unavailable = lineup?.activeUnavailable.length ?? 0;
-    const moveCount = lineupMoveCount(lineup);
+    const projectionMoveCount = lineupAlerts.filter((alert) => alert.startsWith("Start ")).length;
+    const moveCount = lineupMoveCount(lineup) + projectionMoveCount;
     const moveText =
       moveCount > 0
         ? `${moveCount} internal lineup move(s) are available without dropping anyone`
@@ -703,6 +737,44 @@ const buildBestDecision = (
     decisionEvidence,
     decisionBlockers,
   } as const;
+};
+
+type BestAvailableAdd = NonNullable<ManagerBriefingReport["bestAvailableAdd"]>;
+
+const buildBestAvailableAdd = (
+  plan: TransactionPlan,
+  hasUrgentLineupFix: boolean,
+): BestAvailableAdd | undefined => {
+  if (hasUrgentLineupFix) return undefined;
+  const topStep = plan.steps[0];
+  if (topStep != null) {
+    return {
+      playerName: topStep.addPlayerName,
+      dropPlayerName: topStep.dropPlayerName,
+      score: topStep.score,
+      categories: [...topStep.affectedCategories],
+      reason: "clears the add bar",
+      clearsBar: true,
+    };
+  }
+  const topRejected = [...plan.rejectedTransactions].sort((a, b) => b.score - a.score)[0];
+  if (topRejected != null) {
+    return {
+      playerName: topRejected.addPlayerName,
+      dropPlayerName: topRejected.dropPlayerName,
+      score: topRejected.score,
+      categories: [...topRejected.affectedCategories],
+      reason: topRejected.reason,
+      clearsBar: false,
+    };
+  }
+  return {
+    playerName: "—",
+    score: 0,
+    categories: [],
+    reason: "no upgrade available in the FA pool",
+    clearsBar: false,
+  };
 };
 
 export const buildManagerBriefing = (
@@ -808,6 +880,7 @@ export const buildManagerBriefing = (
     bestActionSteps: bestDecision.bestActionSteps,
     decisionEvidence: bestDecision.decisionEvidence,
     decisionBlockers: bestDecision.decisionBlockers,
+    bestAvailableAdd: buildBestAvailableAdd(plan, hasUrgentLineupFix),
     addsRemaining: plan.addsRemaining,
     reservedAdds: plan.reservedAdds,
     projectedWeeklyIp: plan.projectedWeeklyIp,
@@ -818,6 +891,20 @@ export const buildManagerBriefing = (
     categoryPlan: buildCategoryPlan(plan),
     addTriggers,
     lineupAlerts,
+    optimalLineup: plan.optimalLineup.map((slot) => ({
+      slot: slot.slot,
+      kind: slot.kind,
+      playerKey: slot.playerKey,
+      playerName: slot.playerName,
+      score: slot.score,
+      isCurrentStarter: slot.isCurrentStarter,
+    })),
+    optimalBench: plan.optimalBench.map((player) => ({
+      kind: player.kind,
+      playerKey: player.playerKey,
+      playerName: player.playerName,
+      score: player.score,
+    })),
     pitcherStarts: buildPitcherStarts(plan),
     writeAlerts,
     rejectedTransactions: hasUrgentLineupFix ? [] : plan.rejectedTransactions,

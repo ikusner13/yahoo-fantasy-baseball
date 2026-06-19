@@ -449,7 +449,7 @@ describe("DecisionEngine Phase 3", () => {
       },
     });
 
-    const [move] = optimizeLineup(set, baseline, snapshot);
+    const [move] = optimizeLineup(set, baseline, snapshot).recommendations;
 
     expect(move).toMatchObject({
       type: "lineup",
@@ -457,6 +457,65 @@ describe("DecisionEngine Phase 3", () => {
       sitPlayerKey: "low-power-active",
     });
     expect(move?.affectedCategories.map((delta) => delta.category)).toContain("HR");
+  });
+
+  it("exposes the full optimal lineup assignment with bench sits", () => {
+    const set = new WeeklyProjectionSet({
+      myRoster: [
+        batter({ playerKey: "low-power-active", name: "Low Power Active", hr: 0.2, r: 7, rbi: 2 }),
+        batter({ playerKey: "power-bench", name: "Power Bench", hr: 5, r: 3, rbi: 6, tb: 20 }),
+      ],
+      opponentRoster: [batter({ playerKey: "opp", hr: 5, r: 4, rbi: 5 })],
+      freeAgents: [],
+    });
+    const baseline = simulateMatchup(set.myRoster.slice(0, 1), set.opponentRoster, 1000, 7);
+    const snapshot = new LeagueStateSnapshot({
+      leagueId: "62744",
+      teamId: "12",
+      scoringFormat: "cumulative-category-h2h",
+      scoringCategories: ["R", "HR", "RBI", "TB"],
+      weeklyAddLimit: 6,
+      addsUsed: 0,
+      roster: [
+        new LeagueStatePlayer({
+          playerKey: "low-power-active",
+          name: "Low Power Active",
+          team: "NYY",
+          eligiblePositions: ["Util"],
+          selectedPosition: "Util",
+        }),
+        new LeagueStatePlayer({
+          playerKey: "power-bench",
+          name: "Power Bench",
+          team: "LAD",
+          eligiblePositions: ["Util"],
+          selectedPosition: "BN",
+        }),
+      ],
+      rosterSlots: [new RosterSlotCount({ position: "Util", count: 1 })],
+      emptySlots: [],
+      ilUsed: 0,
+      ilSlots: 0,
+      matchup: {
+        week: 11,
+        weekStart: "2026-06-01",
+        weekEnd: "2026-06-07",
+        opponentTeamKey: "mlb.l.62744.t.3",
+        opponentTeamName: "Opponent",
+        categories: [],
+      },
+    });
+
+    const { optimalLineup, optimalBench } = optimizeLineup(set, baseline, snapshot);
+
+    expect(optimalLineup).toHaveLength(1);
+    expect(optimalLineup[0]).toMatchObject({
+      slot: "Util",
+      kind: "batter",
+      playerKey: "power-bench",
+      isCurrentStarter: false,
+    });
+    expect(optimalBench.map((player) => player.playerKey)).toEqual(["low-power-active"]);
   });
 
   it("does not recommend multiple bench players over the same active starter", () => {
@@ -544,7 +603,7 @@ describe("DecisionEngine Phase 3", () => {
       },
     });
 
-    const moves = optimizeLineup(set, baseline, snapshot);
+    const moves = optimizeLineup(set, baseline, snapshot).recommendations;
 
     expect(moves).toHaveLength(2);
     expect(new Set(moves.map((move) => move.sitPlayerKey)).size).toBe(moves.length);
@@ -622,7 +681,7 @@ describe("DecisionEngine Phase 3", () => {
       },
     });
 
-    const moves = optimizeLineup(set, baseline, snapshot);
+    const moves = optimizeLineup(set, baseline, snapshot).recommendations;
 
     expect(moves).toHaveLength(1);
     expect(moves[0]).toMatchObject({
@@ -738,7 +797,7 @@ describe("DecisionEngine Phase 3", () => {
       },
     });
 
-    const moves = optimizeLineup(set, baseline, snapshot);
+    const moves = optimizeLineup(set, baseline, snapshot).recommendations;
 
     expect(moves.map((move) => [move.startPlayerKey, move.sitPlayerKey])).toEqual(
       expect.arrayContaining([
@@ -810,7 +869,7 @@ describe("DecisionEngine Phase 3", () => {
       },
     });
 
-    const moves = optimizeLineup(set, baseline, snapshot);
+    const moves = optimizeLineup(set, baseline, snapshot).recommendations;
 
     expect(moves).toHaveLength(0);
   });

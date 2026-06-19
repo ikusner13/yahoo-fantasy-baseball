@@ -31,6 +31,8 @@ const briefing = (generatedAt: string) =>
     addTriggers: [],
     lineupAlerts: [],
     rejectedTransactions: [],
+    optimalLineup: [],
+    optimalBench: [],
     doNow: [],
     holdForLater: [],
     warnings: [],

@@ -236,6 +236,8 @@ describe("TransactionPlanner Phase 4", () => {
           affectedCategories: [],
         }),
       ],
+      optimalLineup: [],
+      optimalBench: [],
       lineupRecommendations: [],
     });
 
@@ -453,6 +455,8 @@ describe("TransactionPlanner Phase 4", () => {
           ],
         }),
       ],
+      optimalLineup: [],
+      optimalBench: [],
       lineupRecommendations: [],
     });
 
@@ -657,6 +661,8 @@ describe("TransactionPlanner Phase 4", () => {
           ],
         }),
       ],
+      optimalLineup: [],
+      optimalBench: [],
       lineupRecommendations: [],
     });
 
@@ -720,6 +726,8 @@ describe("TransactionPlanner Phase 4", () => {
           ],
         }),
       ],
+      optimalLineup: [],
+      optimalBench: [],
       lineupRecommendations: [],
     });
 
@@ -917,6 +925,8 @@ describe("TransactionPlanner Phase 4", () => {
           ],
         }),
       ],
+      optimalLineup: [],
+      optimalBench: [],
       lineupRecommendations: [],
     });
 
@@ -1043,6 +1053,8 @@ describe("TransactionPlanner Phase 4", () => {
           ],
         }),
       ],
+      optimalLineup: [],
+      optimalBench: [],
       lineupRecommendations: [],
     });
 
@@ -1421,6 +1433,8 @@ describe("TransactionPlanner Phase 4", () => {
           ],
         }),
       ],
+      optimalLineup: [],
+      optimalBench: [],
       lineupRecommendations: [],
     });
 

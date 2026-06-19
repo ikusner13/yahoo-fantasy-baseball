@@ -117,6 +117,22 @@ export class LineupRecommendation extends Schema.Class<LineupRecommendation>(
   affectedCategories: Schema.Array(CategoryDelta),
 }) {}
 
+export class OptimalLineupSlot extends Schema.Class<OptimalLineupSlot>("OptimalLineupSlot")({
+  slot: Schema.String,
+  kind: Schema.Union([Schema.Literal("batter"), Schema.Literal("pitcher")]),
+  playerKey: Schema.String,
+  playerName: Schema.String,
+  score: Schema.Finite,
+  isCurrentStarter: Schema.Boolean,
+}) {}
+
+export class OptimalLineupBench extends Schema.Class<OptimalLineupBench>("OptimalLineupBench")({
+  kind: Schema.Union([Schema.Literal("batter"), Schema.Literal("pitcher")]),
+  playerKey: Schema.String,
+  playerName: Schema.String,
+  score: Schema.Finite,
+}) {}
+
 export class OpponentScout extends Schema.Class<OpponentScout>("OpponentScout")({
   locks: Schema.Array(Schema.String),
   coinFlips: Schema.Array(Schema.String),
@@ -137,6 +153,8 @@ export class DecisionReport extends Schema.Class<DecisionReport>("DecisionReport
   ),
   recommendations: Schema.Array(AddRecommendation),
   lineupRecommendations: Schema.Array(LineupRecommendation),
+  optimalLineup: Schema.Array(OptimalLineupSlot),
+  optimalBench: Schema.Array(OptimalLineupBench),
 }) {}
 
 type Totals = {
@@ -597,7 +615,12 @@ export const optimizeLineup = (
             const position = rosterByKey.get(line.playerKey)?.selectedPosition;
             return position == null ? [] : [position];
           });
-    if (activeSlots.length <= 0) return [];
+    if (activeSlots.length <= 0)
+      return {
+        recommendations: [] as Array<LineupRecommendation>,
+        optimalLineup: [] as Array<OptimalLineupSlot>,
+        optimalBench: [] as Array<OptimalLineupBench>,
+      };
     const ranked = lines
       .map((line) => ({ line, score: lineScore(line, denominators, weights) }))
       .sort((a, b) => b.score - a.score);
@@ -609,12 +632,32 @@ export const optimizeLineup = (
           }))
         : optimalAssignments(ranked, activeSlots, rosterByKey, kind);
     const shouldStart = new Set(assignments.map((entry) => entry.line.playerKey));
+    const optimalLineup = assignments.map(
+      (entry) =>
+        new OptimalLineupSlot({
+          slot: entry.slot,
+          kind,
+          playerKey: entry.line.playerKey,
+          playerName: entry.line.name,
+          score: entry.score,
+          isCurrentStarter: currentActive.has(entry.line.playerKey),
+        }),
+    );
     const sitCandidates = ranked
       .filter(
         (entry) =>
           currentActive.has(entry.line.playerKey) && !shouldStart.has(entry.line.playerKey),
       )
       .sort((a, b) => a.score - b.score);
+    const optimalBench = sitCandidates.map(
+      (entry) =>
+        new OptimalLineupBench({
+          kind,
+          playerKey: entry.line.playerKey,
+          playerName: entry.line.name,
+          score: entry.score,
+        }),
+    );
     const startCandidates = ranked.filter(
       (entry) =>
         !currentActive.has(entry.line.playerKey) &&
@@ -622,7 +665,7 @@ export const optimizeLineup = (
         (snapshot == null || isStartableReserve(rosterByKey.get(entry.line.playerKey))),
     );
     const usedSitKeys = new Set<string>();
-    return startCandidates.flatMap((bench) => {
+    const recommendations = startCandidates.flatMap((bench) => {
       const benchPlayer = rosterByKey.get(bench.line.playerKey);
       const sit = sitCandidates.find((candidate) => {
         if (usedSitKeys.has(candidate.line.playerKey)) return false;
@@ -652,10 +695,17 @@ export const optimizeLineup = (
         }),
       ];
     });
+    return { recommendations, optimalLineup, optimalBench };
   };
-  return [...buildRecommendations("batter"), ...buildRecommendations("pitcher")].sort(
-    (a, b) => b.scoreDelta - a.scoreDelta,
-  );
+  const batter = buildRecommendations("batter");
+  const pitcher = buildRecommendations("pitcher");
+  return {
+    recommendations: [...batter.recommendations, ...pitcher.recommendations].sort(
+      (a, b) => b.scoreDelta - a.scoreDelta,
+    ),
+    optimalLineup: [...batter.optimalLineup, ...pitcher.optimalLineup],
+    optimalBench: [...batter.optimalBench, ...pitcher.optimalBench],
+  };
 };
 
 const categoryLineDeltas = (
@@ -748,12 +798,16 @@ export const rankAddCandidates = (
     })
     .sort((a, b) => b.score - a.score);
 
+  const lineup = optimizeLineup(set, baseline, snapshot, denominators);
+
   return new DecisionReport({
     baseline,
     scout,
     sgpDenominatorSource: hasUsableSgpHistory(standingsHistory) ? "standings-history" : "fallback",
     recommendations,
-    lineupRecommendations: optimizeLineup(set, baseline, snapshot, denominators),
+    lineupRecommendations: lineup.recommendations,
+    optimalLineup: lineup.optimalLineup,
+    optimalBench: lineup.optimalBench,
   });
 };
 

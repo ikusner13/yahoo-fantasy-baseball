@@ -96,6 +96,8 @@ describe("ManagerBriefing Phase 4", () => {
         projectedWeeklyIp: 24,
         closestCategories: ["SB"],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [],
         steps: [],
@@ -111,6 +113,53 @@ describe("ManagerBriefing Phase 4", () => {
     ]);
   });
 
+  it("propagates the full optimal lineup into the manager briefing report", () => {
+    const briefing = buildManagerBriefing(
+      new TransactionPlan({
+        addsRemaining: 3,
+        reservedAdds: 0,
+        projectedWeeklyIp: 24,
+        closestCategories: ["HR"],
+        categorySituations: [],
+        optimalLineup: [
+          {
+            slot: "Util",
+            kind: "batter",
+            playerKey: "power-bench",
+            playerName: "Power Bench",
+            score: 4.2,
+            isCurrentStarter: false,
+          },
+          {
+            slot: "C",
+            kind: "batter",
+            playerKey: "catcher",
+            playerName: "Sánchez",
+            score: 2.1,
+            isCurrentStarter: true,
+          },
+        ],
+        optimalBench: [
+          {
+            kind: "batter",
+            playerKey: "low-power-active",
+            playerName: "Low Power Active",
+            score: 1.1,
+          },
+        ],
+        lineupRecommendations: [],
+        rejectedTransactions: [],
+        steps: [],
+      }),
+    );
+
+    expect(briefing.optimalLineup.map((slot) => [slot.slot, slot.playerName])).toEqual([
+      ["Util", "Power Bench"],
+      ["C", "Sánchez"],
+    ]);
+    expect(briefing.optimalBench.map((player) => player.playerName)).toEqual(["Low Power Active"]);
+  });
+
   it("summarizes expected pitcher starts for the current roster", () => {
     const briefing = buildManagerBriefing(
       new TransactionPlan({
@@ -119,6 +168,8 @@ describe("ManagerBriefing Phase 4", () => {
         projectedWeeklyIp: 24,
         closestCategories: ["OUT", "K", "QS"],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         pitcherStarts: [
           new TransactionPitcherStart({
@@ -163,6 +214,8 @@ describe("ManagerBriefing Phase 4", () => {
         projectedWeeklyIp: 24,
         closestCategories: [],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [
           {
@@ -197,6 +250,8 @@ describe("ManagerBriefing Phase 4", () => {
         projectedWeeklyIp: 24,
         closestCategories: [],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [],
         steps: [],
@@ -227,6 +282,8 @@ describe("ManagerBriefing Phase 4", () => {
           { category: "HR", myValue: "4", opponentValue: "5", status: "losing" },
           { category: "ERA", myValue: "3.65", opponentValue: "6.27", status: "winning" },
         ],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [
           new TransactionLineupRecommendation({
             startPlayerKey: "bench",
@@ -287,6 +344,8 @@ describe("ManagerBriefing Phase 4", () => {
           lastGameTime: "2026-06-08T00:30:00.000Z",
         }),
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [
           new TransactionLineupRecommendation({
             startPlayerKey: "bench",
@@ -306,6 +365,120 @@ describe("ManagerBriefing Phase 4", () => {
     expect(briefing.summary).not.toContain("Lineup improvement found");
   });
 
+  it("surfaces an unrelated start/sit move even when a different active player is unavailable", () => {
+    const briefing = buildManagerBriefing(
+      new TransactionPlan({
+        addsRemaining: 6,
+        reservedAdds: 0,
+        projectedWeeklyIp: 32.1,
+        closestCategories: ["HR"],
+        todayGameWindow: new TransactionDailyGameWindow({
+          date: "2026-06-19",
+          games: 15,
+          remainingGames: 15,
+        }),
+        categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
+        lineupRecommendations: [
+          new TransactionLineupRecommendation({
+            startPlayerKey: "sanchez",
+            startPlayerName: "Gary Sanchez",
+            sitPlayerKey: "rutschman",
+            sitPlayerName: "Adley Rutschman",
+            scoreDelta: 0.89,
+            affectedCategories: ["HR", "RBI", "TB"],
+          }),
+        ],
+        rejectedTransactions: [],
+        steps: [],
+      }),
+      new DailyLineupReport({
+        date: "2026-06-19",
+        posture: "lineup-only; no drop recommendations",
+        emptySlots: [],
+        activeUnavailable: [
+          new DailyLineupPlayer({
+            playerKey: "rooker",
+            playerId: "1",
+            name: "Brent Rooker",
+            team: "OAK",
+            eligiblePositions: ["OF", "Util"],
+            selectedPosition: "Util",
+            status: "IL10",
+          }),
+        ],
+        activeStatusRisks: [],
+        ilActivationMoves: [],
+        activeToIlMoves: [],
+        blockedIlMoves: 0,
+        replacementOptions: [],
+        fillableOpenSlots: [],
+        guardrails: [],
+      }),
+    );
+
+    expect(briefing.lineupAlerts.join(" ")).toContain("Start Gary Sanchez over Adley Rutschman");
+    expect(briefing.summary).not.toContain("no complete internal lineup fix is available");
+    expect(briefing.summary).toContain("internal lineup move(s) are available");
+  });
+
+  it("still suppresses a projection move that involves the unavailable active player", () => {
+    const briefing = buildManagerBriefing(
+      new TransactionPlan({
+        addsRemaining: 6,
+        reservedAdds: 0,
+        projectedWeeklyIp: 32.1,
+        closestCategories: ["HR"],
+        todayGameWindow: new TransactionDailyGameWindow({
+          date: "2026-06-19",
+          games: 15,
+          remainingGames: 15,
+        }),
+        categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
+        lineupRecommendations: [
+          new TransactionLineupRecommendation({
+            startPlayerKey: "bench",
+            startPlayerName: "Bench Bat",
+            sitPlayerKey: "rooker",
+            sitPlayerName: "Brent Rooker",
+            scoreDelta: 1.1,
+            affectedCategories: ["HR"],
+          }),
+        ],
+        rejectedTransactions: [],
+        steps: [],
+      }),
+      new DailyLineupReport({
+        date: "2026-06-19",
+        posture: "lineup-only; no drop recommendations",
+        emptySlots: [],
+        activeUnavailable: [
+          new DailyLineupPlayer({
+            playerKey: "rooker",
+            playerId: "1",
+            name: "Brent Rooker",
+            team: "OAK",
+            eligiblePositions: ["OF", "Util"],
+            selectedPosition: "Util",
+            status: "IL10",
+          }),
+        ],
+        activeStatusRisks: [],
+        ilActivationMoves: [],
+        activeToIlMoves: [],
+        blockedIlMoves: 0,
+        replacementOptions: [],
+        fillableOpenSlots: [],
+        guardrails: [],
+      }),
+    );
+
+    expect(briefing.lineupAlerts.join(" ")).not.toContain("Start Bench Bat over Brent Rooker");
+  });
+
   it("uses current category margins for possible-flip buckets", () => {
     const briefing = buildManagerBriefing(
       new TransactionPlan({
@@ -319,6 +492,8 @@ describe("ManagerBriefing Phase 4", () => {
           { category: "SB", myValue: "3", opponentValue: "5", status: "losing" },
           { category: "ERA", myValue: "3.65", opponentValue: "6.27", status: "winning" },
         ],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [],
         steps: [],
@@ -337,6 +512,8 @@ describe("ManagerBriefing Phase 4", () => {
         projectedWeeklyIp: 32.1,
         closestCategories: ["HR"],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [],
         steps: [
@@ -373,6 +550,8 @@ describe("ManagerBriefing Phase 4", () => {
           lastGameTime: "2026-06-08T00:30:00.000Z",
         }),
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [],
         steps: [],
@@ -392,6 +571,8 @@ describe("ManagerBriefing Phase 4", () => {
         projectedWeeklyIp: 32.1,
         closestCategories: ["SB"],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [],
         steps: [],
@@ -430,6 +611,8 @@ describe("ManagerBriefing Phase 4", () => {
         sgpDenominatorSource: "fallback",
         closestCategories: ["HR"],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [],
         steps: [],
@@ -449,6 +632,8 @@ describe("ManagerBriefing Phase 4", () => {
         sgpDenominatorSource: "standings-history",
         closestCategories: ["HR"],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [],
         steps: [],
@@ -466,6 +651,8 @@ describe("ManagerBriefing Phase 4", () => {
         projectedWeeklyIp: 32.1,
         closestCategories: ["QS"],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [],
         steps: [],
@@ -525,6 +712,8 @@ describe("ManagerBriefing Phase 4", () => {
         projectedWeeklyIp: 32.1,
         closestCategories: ["OBP"],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [],
         steps: [],
@@ -597,6 +786,8 @@ describe("ManagerBriefing Phase 4", () => {
         projectedWeeklyIp: 32.1,
         closestCategories: ["OUT"],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [],
         steps: [],
@@ -666,6 +857,8 @@ describe("ManagerBriefing Phase 4", () => {
         projectedWeeklyIp: 32.1,
         closestCategories: ["OUT"],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [],
         steps: [
@@ -745,6 +938,8 @@ describe("ManagerBriefing Phase 4", () => {
         projectedWeeklyIp: 32.1,
         closestCategories: ["RBI"],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [],
         steps: [
@@ -858,6 +1053,8 @@ describe("ManagerBriefing Phase 4", () => {
         projectedWeeklyIp: 32.1,
         closestCategories: ["SB", "QS"],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [],
         steps: [],
@@ -908,6 +1105,8 @@ describe("ManagerBriefing Phase 4", () => {
         projectedWeeklyIp: 32.1,
         closestCategories: ["OUT", "K"],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [],
         steps: [],
@@ -941,6 +1140,8 @@ describe("ManagerBriefing Phase 4", () => {
         projectedWeeklyIp: 32.1,
         closestCategories: ["OUT", "K", "QS"],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         pitcherStarts: [
           new TransactionPitcherStart({
@@ -991,6 +1192,8 @@ describe("ManagerBriefing Phase 4", () => {
         projectedWeeklyIp: 32.1,
         closestCategories: ["SB"],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [
           {
@@ -1055,6 +1258,8 @@ describe("ManagerBriefing Phase 4", () => {
         projectedWeeklyIp: 32.1,
         closestCategories: ["SB"],
         categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
         lineupRecommendations: [],
         rejectedTransactions: [],
         steps: ["One", "Two", "Three"].map(
@@ -1157,5 +1362,93 @@ describe("ManagerBriefing Phase 4", () => {
     expect(briefing.summary).toContain("replacement/drop threshold");
     expect(briefing.generatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(briefing.warnings.join(" ")).not.toContain("Treat listed add/drop actions");
+  });
+
+  it("marks the best available add as clearing the bar when a step exists", () => {
+    const briefing = buildManagerBriefing(
+      new TransactionPlan({
+        addsRemaining: 6,
+        reservedAdds: 0,
+        projectedWeeklyIp: 32.1,
+        closestCategories: ["RBI"],
+        categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
+        lineupRecommendations: [],
+        rejectedTransactions: [],
+        steps: [
+          new TransactionStep({
+            type: "free-agent-add",
+            timing: "now",
+            addPlayerKey: "add",
+            addPlayerName: "Useful Add",
+            score: 2.2,
+            affectedCategories: ["RBI"],
+            guardrails: ["empty-slot-urgency"],
+            rationale: "Add Useful Add.",
+          }),
+        ],
+      }),
+    );
+
+    expect(briefing.bestAvailableAdd?.clearsBar).toBe(true);
+    expect(briefing.bestAvailableAdd?.playerName).toBe("Useful Add");
+    expect(briefing.bestAvailableAdd?.score).toBe(2.2);
+  });
+
+  it("surfaces the top rejected candidate when nothing clears the bar", () => {
+    const briefing = buildManagerBriefing(
+      new TransactionPlan({
+        addsRemaining: 6,
+        reservedAdds: 0,
+        projectedWeeklyIp: 32.1,
+        closestCategories: ["HR"],
+        categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
+        lineupRecommendations: [],
+        rejectedTransactions: [
+          {
+            addPlayerName: "Weak Bat",
+            score: 0.05,
+            affectedCategories: ["HR"],
+            reason: "open bench slot alone is not enough",
+          },
+          {
+            addPlayerName: "Power Bat",
+            dropPlayerName: "Useful Bat",
+            score: 0.4,
+            affectedCategories: ["HR", "TB"],
+            reason: "replacement edge below threshold",
+          },
+        ],
+        steps: [],
+      }),
+    );
+
+    expect(briefing.bestAvailableAdd?.clearsBar).toBe(false);
+    expect(briefing.bestAvailableAdd?.playerName).toBe("Power Bat");
+    expect(briefing.bestAvailableAdd?.dropPlayerName).toBe("Useful Bat");
+    expect(briefing.bestAvailableAdd?.reason).toContain("replacement edge");
+  });
+
+  it("reports no upgrade available when no candidate cleared or was rejected", () => {
+    const briefing = buildManagerBriefing(
+      new TransactionPlan({
+        addsRemaining: 6,
+        reservedAdds: 0,
+        projectedWeeklyIp: 32.1,
+        closestCategories: ["HR"],
+        categorySituations: [],
+        optimalLineup: [],
+        optimalBench: [],
+        lineupRecommendations: [],
+        rejectedTransactions: [],
+        steps: [],
+      }),
+    );
+
+    expect(briefing.bestAvailableAdd?.clearsBar).toBe(false);
+    expect(briefing.bestAvailableAdd?.reason).toBe("no upgrade available in the FA pool");
   });
 });

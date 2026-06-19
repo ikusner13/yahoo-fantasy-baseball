@@ -133,6 +133,26 @@ export class TransactionLineupRecommendation extends Schema.Class<TransactionLin
   affectedCategories: Schema.Array(Schema.String),
 }) {}
 
+export class TransactionOptimalLineupSlot extends Schema.Class<TransactionOptimalLineupSlot>(
+  "TransactionOptimalLineupSlot",
+)({
+  slot: Schema.String,
+  kind: Schema.Union([Schema.Literal("batter"), Schema.Literal("pitcher")]),
+  playerKey: Schema.String,
+  playerName: Schema.String,
+  score: Schema.Finite,
+  isCurrentStarter: Schema.Boolean,
+}) {}
+
+export class TransactionOptimalLineupBench extends Schema.Class<TransactionOptimalLineupBench>(
+  "TransactionOptimalLineupBench",
+)({
+  kind: Schema.Union([Schema.Literal("batter"), Schema.Literal("pitcher")]),
+  playerKey: Schema.String,
+  playerName: Schema.String,
+  score: Schema.Finite,
+}) {}
+
 export class TransactionPitcherStart extends Schema.Class<TransactionPitcherStart>(
   "TransactionPitcherStart",
 )({
@@ -173,6 +193,8 @@ export class TransactionPlan extends Schema.Class<TransactionPlan>("TransactionP
   categorySituations: Schema.Array(TransactionCategorySituation),
   todayGameWindow: Schema.optional(TransactionDailyGameWindow),
   lineupRecommendations: Schema.Array(TransactionLineupRecommendation),
+  optimalLineup: Schema.Array(TransactionOptimalLineupSlot),
+  optimalBench: Schema.Array(TransactionOptimalLineupBench),
   pitcherStarts: Schema.optional(Schema.Array(TransactionPitcherStart)),
   rejectedTransactions: Schema.Array(RejectedTransaction),
   steps: Schema.Array(TransactionStep),
@@ -833,6 +855,26 @@ export const planTransactions = (
           sitPlayerName: recommendation.sitPlayerName,
           scoreDelta: recommendation.scoreDelta,
           affectedCategories: recommendation.affectedCategories.map((delta) => delta.category),
+        }),
+    ),
+    optimalLineup: report.optimalLineup.map(
+      (slot) =>
+        new TransactionOptimalLineupSlot({
+          slot: slot.slot,
+          kind: slot.kind,
+          playerKey: slot.playerKey,
+          playerName: slot.playerName,
+          score: slot.score,
+          isCurrentStarter: slot.isCurrentStarter,
+        }),
+    ),
+    optimalBench: report.optimalBench.map(
+      (player) =>
+        new TransactionOptimalLineupBench({
+          kind: player.kind,
+          playerKey: player.playerKey,
+          playerName: player.playerName,
+          score: player.score,
         }),
     ),
     pitcherStarts: pitcherStarts(set, snapshot),

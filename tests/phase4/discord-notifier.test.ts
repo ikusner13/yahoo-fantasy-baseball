@@ -26,6 +26,8 @@ describe("DiscordNotifier", () => {
         ],
         lineupAlerts: [],
         rejectedTransactions: [],
+        optimalLineup: [],
+        optimalBench: [],
         doNow: [],
         holdForLater: [],
         warnings: [],
@@ -82,6 +84,8 @@ describe("DiscordNotifier", () => {
             reason: "K/OUT gain did not justify ERA/WHIP downside",
           },
         ],
+        optimalLineup: [],
+        optimalBench: [],
         doNow: [
           new ManualAction({
             priority: 1,
@@ -147,6 +151,8 @@ describe("DiscordNotifier", () => {
         addTriggers: [],
         lineupAlerts: [],
         rejectedTransactions: [],
+        optimalLineup: [],
+        optimalBench: [],
         doNow: [],
         holdForLater: [],
         warnings: [
@@ -176,6 +182,8 @@ describe("DiscordNotifier", () => {
         addTriggers: [],
         lineupAlerts: [],
         rejectedTransactions: [],
+        optimalLineup: [],
+        optimalBench: [],
         doNow: [],
         holdForLater: [
           new ManualAction({
