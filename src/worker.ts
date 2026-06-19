@@ -220,6 +220,9 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
       USE_STANDINGS_HISTORY: Config.boolean("USE_STANDINGS_HISTORY").pipe(
         Config.withDefault(FREE_TIER_MODE.defaults.useStandingsHistory),
       ),
+      DAILY_MORNING_BRIEFING_HOUR_EASTERN: Config.number(
+        "DAILY_MORNING_BRIEFING_HOUR_EASTERN",
+      ).pipe(Config.withDefault(FREE_TIER_MODE.defaults.dailyMorningBriefingHourEastern)),
       DAILY_BRIEFING_HOUR_UTC: Config.number("DAILY_BRIEFING_HOUR_UTC").pipe(
         Config.withDefault(FREE_TIER_MODE.defaults.dailyBriefingHourUtcFallback),
       ),

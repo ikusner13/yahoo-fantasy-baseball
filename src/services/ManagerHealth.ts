@@ -114,7 +114,8 @@ export const evaluateManagerHealth = (
       );
     }
   }
-  const deliverySucceeded = delivery?.channels.some((channel) => channel.ok) ?? false;
+  const deliverySucceeded =
+    delivery?.channels.some((channel) => channel.channel === "telegram" && channel.ok) ?? false;
   if (options.requireDelivery && delivery == null) {
     failures.push("delivery report is missing");
   }
@@ -127,10 +128,13 @@ export const evaluateManagerHealth = (
         failures.push(`latest delivery completed on ${deliveredDate}, not ${scheduler.date}`);
       }
       const successfulToday = delivery.channels.some(
-        (channel) => channel.ok && easternDateKey(new Date(channel.completedAt)) === scheduler.date,
+        (channel) =>
+          channel.channel === "telegram" &&
+          channel.ok &&
+          easternDateKey(new Date(channel.completedAt)) === scheduler.date,
       );
       if (!successfulToday) {
-        failures.push(`latest delivery has no successful channel on ${scheduler.date}`);
+        failures.push(`latest delivery has no successful Telegram channel on ${scheduler.date}`);
       }
     }
   }
@@ -138,7 +142,7 @@ export const evaluateManagerHealth = (
     failures.push("latest delivery report does not match the cached briefing generation time");
   }
   if (delivery != null && !deliverySucceeded) {
-    failures.push("latest delivery report has no successful channel");
+    failures.push("latest delivery report has no successful Telegram channel");
   }
   if (options.requireYahooWrites === true) {
     if (writeStatus == null) {

@@ -29,6 +29,7 @@ describe("Phase 0 health payload", () => {
       defaults: {
         maxConfirmedLineupBoxscores: 0,
         useStandingsHistory: true,
+        dailyMorningBriefingHourEastern: 10,
         dailyBriefingHourUtcFallback: 22,
       },
     });

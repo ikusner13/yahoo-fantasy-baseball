@@ -142,10 +142,12 @@ describe("ManagerHealth", () => {
 
     expect(health.ok).toBe(false);
     expect(health.failures).toContain("latest delivery completed on 2026-06-06, not 2026-06-07");
-    expect(health.failures).toContain("latest delivery has no successful channel on 2026-06-07");
+    expect(health.failures).toContain(
+      "latest delivery has no successful Telegram channel on 2026-06-07",
+    );
   });
 
-  it("passes same-day delivery health when at least one channel succeeded today", () => {
+  it("passes same-day delivery health when Telegram succeeded today", () => {
     const health = evaluateManagerHealth(
       schedulerStatus("2026-06-07T18:00:00.000Z"),
       briefing("2026-06-07T18:00:00.000Z"),
@@ -171,7 +173,7 @@ describe("ManagerHealth", () => {
     expect(health.deliverySucceeded).toBe(true);
   });
 
-  it("fails when the latest delivery had no successful channel", () => {
+  it("fails when the latest delivery had no successful Telegram channel", () => {
     const health = evaluateManagerHealth(
       schedulerStatus("2026-06-07T18:00:00.000Z"),
       briefing("2026-06-07T18:00:00.000Z"),
@@ -194,8 +196,43 @@ describe("ManagerHealth", () => {
     );
 
     expect(health.ok).toBe(false);
-    expect(health.failures).toContain("latest delivery report has no successful channel");
+    expect(health.failures).toContain("latest delivery report has no successful Telegram channel");
     expect(health.deliverySucceeded).toBe(false);
+  });
+
+  it("fails when only Discord succeeded", () => {
+    const health = evaluateManagerHealth(
+      schedulerStatus("2026-06-07T18:00:00.000Z"),
+      briefing("2026-06-07T18:00:00.000Z"),
+      {
+        generatedAt: "2026-06-07T18:00:00.000Z",
+        deliveredAt: "2026-06-07T18:00:05.000Z",
+        channels: [
+          {
+            channel: "telegram",
+            ok: false,
+            completedAt: "2026-06-07T18:00:04.000Z",
+            error: "timeout",
+          },
+          {
+            channel: "discord",
+            ok: true,
+            completedAt: "2026-06-07T18:00:05.000Z",
+          },
+        ],
+      },
+      {
+        ...managerHealthDefaults,
+        requireDeliveredToday: true,
+        now: new Date("2026-06-07T18:30:00.000Z"),
+      },
+    );
+
+    expect(health.ok).toBe(false);
+    expect(health.deliverySucceeded).toBe(false);
+    expect(health.failures).toContain(
+      "latest delivery has no successful Telegram channel on 2026-06-07",
+    );
   });
 
   it("fails strict manager health when Yahoo write status is missing", () => {

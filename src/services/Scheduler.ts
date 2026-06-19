@@ -23,7 +23,7 @@ import { deliverManagerBriefing } from "../routines/delivery.ts";
 
 const MINUTE = 60 * 1000;
 const HOUR = 60 * MINUTE;
-const PRE_FIRST_PITCH_LEAD_MS = 90 * MINUTE;
+const PRE_FIRST_PITCH_LEAD_MS = 2 * HOUR;
 const MIN_BRIEFING_REFRESH_GAP_MS = 2 * HOUR;
 
 type SchedulerTask = "refresh-projections" | "refresh-context" | "apply-lineup" | "send-briefing";
@@ -123,6 +123,16 @@ const easternDateKey = (date: Date) => {
   return `${part("year")}-${part("month")}-${part("day")}`;
 };
 
+const easternHour = (date: Date) => {
+  const hour = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "2-digit",
+    hourCycle: "h23",
+  }).format(date);
+  const parsed = Number.parseInt(hour, 10);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
 type SchedulerCompletionState = {
   readonly projectionAt?: number;
   readonly contextAt?: number;
@@ -135,6 +145,8 @@ export const selectDueTask = (
   state: SchedulerCompletionState,
   canRun: Record<SchedulerTask, boolean>,
   briefingDue: boolean,
+  refreshBriefingDue = briefingDue,
+  lineupBeforeBriefingDue = briefingDue,
 ) => {
   const nowMs = now.getTime();
   if (
@@ -159,7 +171,7 @@ export const selectDueTask = (
   ) {
     return "refresh-context" as const;
   }
-  if (!appliedLineupToday && canRun["apply-lineup"] && briefingDue) {
+  if (!appliedLineupToday && canRun["apply-lineup"] && lineupBeforeBriefingDue) {
     return "apply-lineup" as const;
   }
   if (!sentToday && canRun["send-briefing"] && briefingDue) {
@@ -167,7 +179,7 @@ export const selectDueTask = (
   }
   if (
     sentToday &&
-    briefingDue &&
+    refreshBriefingDue &&
     canRun["send-briefing"] &&
     contextRefreshedAfterSend &&
     enoughTimeSinceSend
@@ -190,6 +202,41 @@ export const shouldEvaluateBriefingDue = (canRunSendBriefing: boolean) => canRun
 
 export const shouldAttemptAutomaticLineupWrite = (writeStatus: ManagerWriteStatus | undefined) =>
   writeStatus?.capability !== "unauthorized";
+
+export const isMorningBriefingDue = (
+  now: Date,
+  options: {
+    readonly morningHourEastern: number;
+  },
+) => easternHour(now) >= options.morningHourEastern;
+
+export const isPregameBriefingDue = (
+  now: Date,
+  options: {
+    readonly firstGameTime?: string;
+    readonly sendHourUtc: number;
+  },
+) => {
+  const firstGameMs = options.firstGameTime == null ? undefined : Date.parse(options.firstGameTime);
+  if (firstGameMs != null && Number.isFinite(firstGameMs)) {
+    return now.getTime() >= firstGameMs - PRE_FIRST_PITCH_LEAD_MS;
+  }
+  return now.getUTCHours() >= options.sendHourUtc;
+};
+
+export const isBriefingDue = (
+  now: Date,
+  options: {
+    readonly firstGameTime?: string;
+    readonly sendHourUtc: number;
+    readonly morningHourEastern: number;
+  },
+) =>
+  isMorningBriefingDue(now, options) ||
+  isPregameBriefingDue(now, {
+    firstGameTime: options.firstGameTime,
+    sendHourUtc: options.sendHourUtc,
+  });
 
 export class Scheduler extends Context.Service<
   Scheduler,
@@ -214,6 +261,9 @@ export class Scheduler extends Context.Service<
       const lineupExecutor = yield* YahooLineupExecutor;
       const sendHourUtc = yield* Config.number("DAILY_BRIEFING_HOUR_UTC").pipe(
         Config.withDefault(FREE_TIER_MODE.defaults.dailyBriefingHourUtcFallback),
+      );
+      const morningHourEastern = yield* Config.number("DAILY_MORNING_BRIEFING_HOUR_EASTERN").pipe(
+        Config.withDefault(FREE_TIER_MODE.defaults.dailyMorningBriefingHourEastern),
       );
 
       const markComplete = (task: SchedulerTask) =>
@@ -305,12 +355,10 @@ export class Scheduler extends Context.Service<
               .put(LAST_MANAGER_DELIVERY_CACHE_KEY, delivery)
               .pipe(Effect.mapError((error) => toSchedulerError(task, error)));
             if (!shouldMarkSendBriefingComplete(delivery)) {
-              return yield* Effect.fail(
-                new SchedulerError({
-                  task,
-                  message: "send-briefing delivery had no successful channel",
-                }),
-              );
+              return yield* new SchedulerError({
+                task,
+                message: "send-briefing delivery had no successful channel",
+              });
             }
           }
           if (shouldCountTaskRun(options)) {
@@ -322,7 +370,6 @@ export class Scheduler extends Context.Service<
 
       const dueTask = Effect.gen(function* () {
         const now = new Date();
-        const nowMs = now.getTime();
         const [projectionAt, contextAt, applyLineupAt, sendAt] = yield* Effect.all([
           lastCompletedAt("refresh-projections"),
           lastCompletedAt("refresh-context"),
@@ -342,6 +389,7 @@ export class Scheduler extends Context.Service<
           "send-briefing": yield* canRunToday("send-briefing", today),
         };
         let briefingDue = false;
+        let refreshBriefingDue = false;
         if (shouldEvaluateBriefingDue(canRun["send-briefing"])) {
           const snapshot = yield* leagueState.snapshot.pipe(
             Effect.mapError((error) => toSchedulerError("send-briefing", error)),
@@ -352,24 +400,23 @@ export class Scheduler extends Context.Service<
           const todayWindow = context.dailyGameWindows?.find(
             (window) => window.date === easternDateKey(now),
           );
-          const firstGameMs =
-            todayWindow?.firstGameTime == null ? undefined : Date.parse(todayWindow.firstGameTime);
-          if (
-            firstGameMs != null &&
-            Number.isFinite(firstGameMs) &&
-            nowMs >= firstGameMs - PRE_FIRST_PITCH_LEAD_MS
-          ) {
-            briefingDue = true;
-          }
-          if (firstGameMs == null && now.getUTCHours() >= sendHourUtc) {
-            briefingDue = true;
-          }
+          refreshBriefingDue = isPregameBriefingDue(now, {
+            firstGameTime: todayWindow?.firstGameTime,
+            sendHourUtc,
+          });
+          briefingDue = isBriefingDue(now, {
+            firstGameTime: todayWindow?.firstGameTime,
+            sendHourUtc,
+            morningHourEastern,
+          });
         }
         return selectDueTask(
           now,
           { projectionAt, contextAt, applyLineupAt, sendAt },
           canRun,
           briefingDue,
+          refreshBriefingDue,
+          refreshBriefingDue,
         );
       });
 

@@ -12,6 +12,7 @@ export const FREE_TIER_MODE = {
   defaults: {
     maxConfirmedLineupBoxscores: 0,
     useStandingsHistory: true,
+    dailyMorningBriefingHourEastern: 10,
     dailyBriefingHourUtcFallback: 22,
   },
 };

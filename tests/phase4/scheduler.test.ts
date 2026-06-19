@@ -5,6 +5,8 @@ import {
   ManagerDeliveryReport,
 } from "../../src/services/ManagerDelivery";
 import {
+  isBriefingDue,
+  isPregameBriefingDue,
   selectDueTask,
   shouldCountTaskRun,
   shouldEvaluateBriefingDue,
@@ -159,6 +161,43 @@ describe("Scheduler", () => {
     ).toBe("idle");
   });
 
+  it("does not use the morning briefing window for same-day refresh sends", () => {
+    const now = new Date("2026-06-07T16:30:00.000Z");
+
+    expect(
+      selectDueTask(
+        now,
+        {
+          projectionAt: Date.parse("2026-06-07T12:00:00.000Z"),
+          contextAt: Date.parse("2026-06-07T16:00:00.000Z"),
+          applyLineupAt: Date.parse("2026-06-07T14:05:00.000Z"),
+          sendAt: Date.parse("2026-06-07T14:00:00.000Z"),
+        },
+        canRunAll,
+        true,
+        false,
+      ),
+    ).toBe("idle");
+  });
+
+  it("sends a morning-only briefing instead of delaying it for lineup application", () => {
+    const now = new Date("2026-06-07T14:00:00.000Z");
+
+    expect(
+      selectDueTask(
+        now,
+        {
+          projectionAt: Date.parse("2026-06-07T12:00:00.000Z"),
+          contextAt: Date.parse("2026-06-07T13:30:00.000Z"),
+        },
+        canRunAll,
+        true,
+        false,
+        false,
+      ),
+    ).toBe("send-briefing");
+  });
+
   it("does not count forced manual task runs against automatic scheduler caps", () => {
     expect(shouldCountTaskRun()).toBe(true);
     expect(shouldCountTaskRun({ force: false })).toBe(true);
@@ -168,6 +207,54 @@ describe("Scheduler", () => {
   it("evaluates briefing due whenever the automatic send budget is available", () => {
     expect(shouldEvaluateBriefingDue(true)).toBe(true);
     expect(shouldEvaluateBriefingDue(false)).toBe(false);
+  });
+
+  it("marks the briefing due at the hourly tick before first pitch", () => {
+    expect(
+      isPregameBriefingDue(new Date("2026-06-09T21:00:00.000Z"), {
+        firstGameTime: "2026-06-09T22:35:00.000Z",
+        sendHourUtc: 22,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not mark the briefing due more than two hours before first pitch", () => {
+    expect(
+      isPregameBriefingDue(new Date("2026-06-09T20:34:59.000Z"), {
+        firstGameTime: "2026-06-09T22:35:00.000Z",
+        sendHourUtc: 22,
+      }),
+    ).toBe(false);
+  });
+
+  it("marks the morning briefing due at 10am eastern", () => {
+    expect(
+      isBriefingDue(new Date("2026-06-09T13:59:59.000Z"), {
+        sendHourUtc: 22,
+        morningHourEastern: 10,
+      }),
+    ).toBe(false);
+    expect(
+      isBriefingDue(new Date("2026-06-09T14:00:00.000Z"), {
+        sendHourUtc: 22,
+        morningHourEastern: 10,
+      }),
+    ).toBe(true);
+  });
+
+  it("falls back to the configured send hour when game schedule is unavailable", () => {
+    expect(
+      isBriefingDue(new Date("2026-06-09T21:59:59.000Z"), {
+        sendHourUtc: 22,
+        morningHourEastern: 23,
+      }),
+    ).toBe(false);
+    expect(
+      isBriefingDue(new Date("2026-06-09T22:00:00.000Z"), {
+        sendHourUtc: 22,
+        morningHourEastern: 23,
+      }),
+    ).toBe(true);
   });
 
   it("blocks automatic lineup writes after Yahoo write auth is known unauthorized", () => {
@@ -197,8 +284,25 @@ describe("Scheduler", () => {
     ).toBe(true);
   });
 
-  it("marks send-briefing complete only after at least one successful delivery channel", () => {
+  it("marks send-briefing complete only after Telegram succeeds", () => {
     const delivered = new ManagerDeliveryReport({
+      generatedAt: "2026-06-07T17:29:00.000Z",
+      deliveredAt: "2026-06-07T17:29:07.000Z",
+      channels: [
+        new ManagerDeliveryChannelResult({
+          channel: "telegram",
+          ok: true,
+          completedAt: "2026-06-07T17:29:06.000Z",
+        }),
+        new ManagerDeliveryChannelResult({
+          channel: "discord",
+          ok: false,
+          completedAt: "2026-06-07T17:29:07.000Z",
+          error: "unauthorized",
+        }),
+      ],
+    });
+    const discordOnly = new ManagerDeliveryReport({
       generatedAt: "2026-06-07T17:29:00.000Z",
       deliveredAt: "2026-06-07T17:29:07.000Z",
       channels: [
@@ -235,6 +339,7 @@ describe("Scheduler", () => {
     });
 
     expect(shouldMarkSendBriefingComplete(delivered)).toBe(true);
+    expect(shouldMarkSendBriefingComplete(discordOnly)).toBe(false);
     expect(shouldMarkSendBriefingComplete(failed)).toBe(false);
   });
 });

@@ -277,8 +277,11 @@ export class DiscordNotifier extends Context.Service<
       if (Option.isNone(tokenOption) || Option.isNone(channelIdOption)) {
         return DiscordNotifier.of({
           postManagerBriefing: () =>
-            Effect.log(
-              "Discord delivery disabled; missing DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID",
+            Effect.fail(
+              new DiscordNotifierError({
+                message:
+                  "Discord delivery disabled; missing DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID",
+              }),
             ),
         });
       }

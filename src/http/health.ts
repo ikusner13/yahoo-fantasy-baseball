@@ -21,6 +21,7 @@ export class HealthResponse extends Schema.Class<HealthResponse>("HealthResponse
     defaults: Schema.Struct({
       maxConfirmedLineupBoxscores: Schema.Finite,
       useStandingsHistory: Schema.Boolean,
+      dailyMorningBriefingHourEastern: Schema.Finite,
       dailyBriefingHourUtcFallback: Schema.Finite,
     }),
   }),

@@ -308,8 +308,11 @@ export class TelegramNotifier extends Context.Service<
       if (Option.isNone(tokenOption) || Option.isNone(chatIdOption)) {
         return TelegramNotifier.of({
           postManagerBriefing: () =>
-            Effect.log(
-              "Telegram delivery disabled; missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID",
+            Effect.fail(
+              new TelegramNotifierError({
+                message:
+                  "Telegram delivery disabled; missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID",
+              }),
             ),
         });
       }

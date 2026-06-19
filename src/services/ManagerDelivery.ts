@@ -20,4 +20,4 @@ export class ManagerDeliveryReport extends Schema.Class<ManagerDeliveryReport>(
 }) {}
 
 export const deliverySucceeded = (report: ManagerDeliveryReport | undefined) =>
-  report != null && report.channels.some((channel) => channel.ok);
+  report != null && report.channels.some((channel) => channel.channel === "telegram" && channel.ok);
