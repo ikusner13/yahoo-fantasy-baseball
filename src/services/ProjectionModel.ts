@@ -106,6 +106,9 @@ export class BatterProjectionSource extends Schema.Class<BatterProjectionSource>
   bb: Schema.optional(Schema.Finite),
   hbp: Schema.optional(Schema.Finite),
   sf: Schema.optional(Schema.Finite),
+  // Yahoo player status (e.g. "", "DTD", "IL10", "O", "NA", "SUSP"); drives the F4
+  // playing-time/injury volume discount. Absent ⇒ healthy ⇒ neutral.
+  status: Schema.optional(Schema.String),
   eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
 }) {}
 
@@ -125,6 +128,8 @@ export class PitcherProjectionSource extends Schema.Class<PitcherProjectionSourc
   qs: Schema.Finite,
   svh: Schema.Finite,
   appearances: Schema.optional(Schema.Finite),
+  // See BatterProjectionSource.status (F4 playing-time/injury discount).
+  status: Schema.optional(Schema.String),
   eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
 }) {}
 
@@ -148,6 +153,8 @@ export class BlendedBatterProjection extends Schema.Class<BlendedBatterProjectio
   bb: Schema.Finite,
   hbp: Schema.Finite,
   sf: Schema.Finite,
+  // See BatterProjectionSource.status (F4 playing-time/injury discount).
+  status: Schema.optional(Schema.String),
   eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
 }) {}
 
@@ -167,6 +174,8 @@ export class BlendedPitcherProjection extends Schema.Class<BlendedPitcherProject
   qs: Schema.Finite,
   svh: Schema.Finite,
   appearances: Schema.Finite,
+  // See BatterProjectionSource.status (F4 playing-time/injury discount).
+  status: Schema.optional(Schema.String),
   eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
 }) {}
 
@@ -294,6 +303,38 @@ const vegasMultiplier = (impliedRuns: number | undefined) => {
 
 const boundedMultiplier = (value: number, min: number, max: number) =>
   Math.max(min, Math.min(max, value));
+
+// --- F4: playing-time / injury volume discount (docs §3.2) ---
+//
+// Maps a Yahoo player status string to a weekly playing-time multiplier applied to PA (batters)
+// and IP/appearances (pitchers). Injury is the single largest projection-accuracy error source;
+// every system over-projects PA (~47-79) and IP (~20) because none model availability. This is a
+// volume-only haircut: counting stats scale down, but per-PA/per-IP rates (OBP, ERA, WHIP) are
+// untouched.
+//
+// These tiers are research-informed PRIORS to refine via the F8 backtest. NOTE: the systematic
+// ~8-13% PA over-projection for *healthy* players is real, but a universal haircut is deliberately
+// NOT applied here — healthy/active/unknown stays exactly 1.0 (true no-op). The healthy-player
+// correction belongs in F8 calibration.
+const PT_DISCOUNT_HEALTHY = 1.0; // "", undefined, or unrecognized ⇒ neutral
+const PT_DISCOUNT_DTD = 0.9; // day-to-day: minor reduction in expected volume
+const PT_DISCOUNT_OUT = 0.3; // out for the listed game
+const PT_DISCOUNT_ABSENT = 0.05; // IL*/NA/SUSP: effectively absent for the week (near-zero)
+
+const PT_DISCOUNT_TABLE: Record<string, number> = {
+  DTD: PT_DISCOUNT_DTD,
+  O: PT_DISCOUNT_OUT,
+  NA: PT_DISCOUNT_ABSENT,
+  SUSP: PT_DISCOUNT_ABSENT,
+};
+
+const playingTimeDiscount = (status: string | undefined): number => {
+  if (status == null) return PT_DISCOUNT_HEALTHY;
+  const code = status.trim().toUpperCase();
+  if (code === "") return PT_DISCOUNT_HEALTHY;
+  if (code.startsWith("IL")) return PT_DISCOUNT_ABSENT;
+  return PT_DISCOUNT_TABLE[code] ?? PT_DISCOUNT_HEALTHY;
+};
 
 // --- F3: sample-size-aware Bayesian shrinkage of in-season Statcast (docs §3.3) ---
 //
@@ -465,6 +506,7 @@ export const blendBatterProjections = (
       bb: weightedMean(componentRows, weightIndex, (row) => row.bb),
       hbp: weightedMean(componentRows, weightIndex, (row) => row.hbp),
       sf: weightedMean(componentRows, weightIndex, (row) => row.sf),
+      status: first.status,
       eligiblePositions: first.eligiblePositions == null ? undefined : [...first.eligiblePositions],
     });
   });
@@ -491,6 +533,7 @@ export const blendPitcherProjections = (
       qs: weightedMean(group, weightIndex, (row) => row.qs),
       svh: weightedMean(group, weightIndex, (row) => row.svh),
       appearances: weightedMean(group, weightIndex, (row) => row.appearances ?? row.gs),
+      status: first.status,
       eligiblePositions: first.eligiblePositions == null ? undefined : [...first.eligiblePositions],
     });
   });
@@ -500,9 +543,13 @@ export const prorateBatterProjection = (
   projection: BlendedBatterProjection,
   context: WeeklyContext,
 ) => {
+  // F4: playing-time/injury discount on weekly volume (source: Yahoo player status). Applied to
+  // pa so it flows through `scale` into every counting stat; obp (a rate) is unaffected.
+  const ptDiscount = playingTimeDiscount(projection.status);
   const pa =
     expectedBatterPa(projection, context) *
-    vegasMultiplier(context.impliedRunsByTeam[projection.team]);
+    vegasMultiplier(context.impliedRunsByTeam[projection.team]) *
+    ptDiscount;
   const scale = safeDivide(pa, projection.pa);
   const statcast = context.statcastByPlayerKey?.[contextKey(projection)];
   const park = context.parkFactorsByTeam?.[projection.team];
@@ -538,16 +585,20 @@ export const proratePitcherProjection = (
   context: WeeklyContext,
 ) => {
   const starts = context.probableStartsByPlayerKey[projection.playerKey] ?? 0;
-  const startScale = safeDivide(starts, projection.gs);
+  // F4: playing-time/injury discount on weekly volume (source: Yahoo player status). Applied to
+  // the volume scalers so ip/k/qs/svh/out/er/baserunners drop; era/whip (ratios of er*9/ip and
+  // baserunners/ip) are unaffected because numerator and ip scale together.
+  const ptDiscount = playingTimeDiscount(projection.status);
+  const startScale = safeDivide(starts, projection.gs) * ptDiscount;
   const reliefAppearances =
     safeDivide(projection.appearances, DEFAULT_ROS_TEAM_GAMES) *
     remainingGames(projection.team, context);
-  const reliefScale = safeDivide(reliefAppearances, projection.appearances);
+  const reliefScale = safeDivide(reliefAppearances, projection.appearances) * ptDiscount;
   const scale = projection.gs > 0 ? startScale : reliefScale;
   const openerIp =
-    starts > 0 && projection.gs <= 0
+    (starts > 0 && projection.gs <= 0
       ? Math.max(MIN_OPENER_IP, safeDivide(projection.ip, projection.appearances)) * starts
-      : 0;
+      : 0) * ptDiscount;
   const ip = Math.max(projection.ip * scale, openerIp);
   const statcast = context.statcastByPlayerKey?.[contextKey(projection)];
   const park = context.parkFactorsByTeam?.[projection.team];

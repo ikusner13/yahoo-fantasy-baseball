@@ -21,6 +21,7 @@ const makeBatter = (overrides: {
   readonly playerKey?: string;
   readonly name?: string;
   readonly team?: string;
+  readonly status?: string;
 }) =>
   new BatterProjectionSource({
     source: "rthebatx",
@@ -40,6 +41,7 @@ const makeBatter = (overrides: {
     bb: 15,
     hbp: 2,
     sf: 3,
+    status: overrides.status,
   });
 
 const batterRows = [
@@ -278,7 +280,7 @@ describe("ProjectionModel Phase 2 math", () => {
       statcastByPlayerKey: { "mlb:456": statcast },
     });
 
-  const makePitcherProjection = () =>
+  const makePitcherProjection = (status?: string) =>
     new BlendedPitcherProjection({
       kind: "pitcher",
       playerKey: "mlb.p.pitcher",
@@ -293,6 +295,7 @@ describe("ProjectionModel Phase 2 math", () => {
       qs: 12,
       svh: 0,
       appearances: 20,
+      status,
     });
 
   it("F3: zero / absent sample size leaves the projection unchanged (multiplier 1.0)", () => {
@@ -428,6 +431,131 @@ describe("ProjectionModel Phase 2 math", () => {
     );
     expect(small.hr).toBeGreaterThan(baseline.hr);
     expect(large.hr).toBeGreaterThan(small.hr);
+  });
+
+  // --- F4: playing-time / injury volume discount ---
+
+  // Blend a single-source batter line carrying a Yahoo status (no class-instance spread).
+  const makeBlendedBatter = (status?: string) =>
+    blendBatterProjections(
+      [makeBatter({ status })],
+      [new ProjectionSourceWeight({ source: "rthebatx", weight: 1 })],
+    )[0]!;
+
+  const makeBlendedReliever = (status?: string) =>
+    new BlendedPitcherProjection({
+      kind: "pitcher",
+      playerKey: "mlb.p.reliever",
+      name: "Leverage Reliever",
+      team: "BOS",
+      ip: 65,
+      gs: 0,
+      k: 78,
+      era: 3,
+      whip: 1.1,
+      qs: 0,
+      svh: 24,
+      appearances: 65,
+      status,
+    });
+
+  it("F4: batter status discounts weekly volume (counting) but not obp", () => {
+    const ctx = new WeeklyContext({
+      schedules: [new WeeklySchedule({ team: "NYY", gamesThisWeek: 6, gamesRemaining: 6 })],
+      probableStartsByPlayerKey: {},
+      impliedRunsByTeam: {},
+    });
+
+    const healthyLine = prorateBatterProjection(makeBlendedBatter(), ctx);
+    const dtdLine = prorateBatterProjection(makeBlendedBatter("DTD"), ctx);
+    const ilLine = prorateBatterProjection(makeBlendedBatter("IL10"), ctx);
+
+    // DTD = 0.90× volume on every counting stat.
+    expect(dtdLine.pa / healthyLine.pa).toBeCloseTo(0.9, 6);
+    expect(dtdLine.r / healthyLine.r).toBeCloseTo(0.9, 6);
+    expect(dtdLine.h / healthyLine.h).toBeCloseTo(0.9, 6);
+    expect(dtdLine.hr / healthyLine.hr).toBeCloseTo(0.9, 6);
+    expect(dtdLine.rbi / healthyLine.rbi).toBeCloseTo(0.9, 6);
+    expect(dtdLine.sb / healthyLine.sb).toBeCloseTo(0.9, 6);
+    expect(dtdLine.tb / healthyLine.tb).toBeCloseTo(0.9, 6);
+    // obp (a rate) is invariant under the volume discount.
+    expect(dtdLine.obp).toBeCloseTo(healthyLine.obp, 10);
+
+    // IL10 ⇒ near-zero (× 0.05).
+    expect(ilLine.pa / healthyLine.pa).toBeCloseTo(0.05, 6);
+    expect(ilLine.hr / healthyLine.hr).toBeCloseTo(0.05, 6);
+    expect(ilLine.obp).toBeCloseTo(healthyLine.obp, 10);
+  });
+
+  it("F4: pitcher status discounts ip/k/qs/svh/out but not era/whip", () => {
+    const ctx = new WeeklyContext({
+      schedules: [new WeeklySchedule({ team: "SEA", gamesThisWeek: 6, gamesRemaining: 6 })],
+      probableStartsByPlayerKey: { "mlb.p.pitcher": 2 },
+      impliedRunsByTeam: {},
+    });
+
+    const healthyLine = proratePitcherProjection(makePitcherProjection(), ctx);
+    const ilLine = proratePitcherProjection(makePitcherProjection("IL15"), ctx);
+
+    const f = 0.05;
+    expect(ilLine.ip / healthyLine.ip).toBeCloseTo(f, 6);
+    expect(ilLine.out / healthyLine.out).toBeCloseTo(f, 6);
+    expect(ilLine.k / healthyLine.k).toBeCloseTo(f, 6);
+    expect(ilLine.qs / healthyLine.qs).toBeCloseTo(f, 6);
+    expect(ilLine.er / healthyLine.er).toBeCloseTo(f, 6);
+    expect(ilLine.baserunners / healthyLine.baserunners).toBeCloseTo(f, 6);
+    // era/whip are ratios with numerator and ip both scaled ⇒ invariant.
+    expect(ilLine.era).toBeCloseTo(healthyLine.era, 10);
+    expect(ilLine.whip).toBeCloseTo(healthyLine.whip, 10);
+
+    // Reliever svh path (scales by reliefScale) also drops.
+    const relieverCtx = new WeeklyContext({
+      schedules: [new WeeklySchedule({ team: "BOS", gamesThisWeek: 6, gamesRemaining: 6 })],
+      probableStartsByPlayerKey: {},
+      impliedRunsByTeam: {},
+    });
+    const healthyRel = proratePitcherProjection(makeBlendedReliever(), relieverCtx);
+    const dtdRel = proratePitcherProjection(makeBlendedReliever("DTD"), relieverCtx);
+    expect(dtdRel.svh / healthyRel.svh).toBeCloseTo(0.9, 6);
+    expect(dtdRel.ip / healthyRel.ip).toBeCloseTo(0.9, 6);
+    expect(dtdRel.era).toBeCloseTo(healthyRel.era, 10);
+    expect(dtdRel.whip).toBeCloseTo(healthyRel.whip, 10);
+  });
+
+  it("F4: healthy / absent status is exactly neutral (no-op)", () => {
+    const ctx = new WeeklyContext({
+      schedules: [new WeeklySchedule({ team: "NYY", gamesThisWeek: 6, gamesRemaining: 6 })],
+      probableStartsByPlayerKey: {},
+      impliedRunsByTeam: {},
+    });
+    const noStatus = prorateBatterProjection(makeBlendedBatter(), ctx);
+    const emptyStatus = prorateBatterProjection(makeBlendedBatter(""), ctx);
+    const unknownStatus = prorateBatterProjection(makeBlendedBatter("PROBABLE"), ctx);
+    expect(emptyStatus.pa).toBe(noStatus.pa);
+    expect(emptyStatus.hr).toBe(noStatus.hr);
+    expect(unknownStatus.pa).toBe(noStatus.pa);
+    expect(unknownStatus.hr).toBe(noStatus.hr);
+  });
+
+  it("F4: aggregate weekly PA with a flagged player is strictly below all-healthy", () => {
+    const ctx = new WeeklyContext({
+      schedules: [new WeeklySchedule({ team: "NYY", gamesThisWeek: 6, gamesRemaining: 6 })],
+      probableStartsByPlayerKey: {},
+      impliedRunsByTeam: {},
+    });
+    const sumPa = (status?: string) =>
+      blendBatterProjections(
+        [
+          makeBatter({ playerKey: "mlb.p.a", name: "A" }),
+          makeBatter({ playerKey: "mlb.p.b", name: "B", status }),
+        ],
+        [new ProjectionSourceWeight({ source: "rthebatx", weight: 1 })],
+      )
+        .map((p) => prorateBatterProjection(p, ctx).pa)
+        .reduce((a, b) => a + b, 0);
+
+    expect(sumPa("DTD")).toBeLessThan(sumPa());
+    expect(sumPa("IL60")).toBeLessThan(sumPa("DTD"));
   });
 
   it("prorates reliever ROS innings by expected weekly appearances", () => {

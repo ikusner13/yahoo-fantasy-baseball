@@ -128,6 +128,7 @@ const canonicalizeBatters = (
         bb: row.bb,
         hbp: row.hbp,
         sf: row.sf,
+        status: player.status,
         eligiblePositions: player.positions == null ? undefined : [...player.positions],
       }),
     ];
@@ -173,6 +174,7 @@ const canonicalizePitchers = (
         qs: row.qs,
         svh: row.svh,
         appearances: row.appearances,
+        status: player.status,
         eligiblePositions: player.positions == null ? undefined : [...player.positions],
       }),
     ];
