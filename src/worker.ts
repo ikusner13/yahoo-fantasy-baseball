@@ -14,6 +14,7 @@ import { DecisionLogDb, LeagueStateCache } from "./infra/resources.ts";
 import { deliverManagerBriefing } from "./routines/delivery.ts";
 import { dispatchRoutine } from "./routines/dispatch.ts";
 import { ApiCache } from "./services/ApiCache.ts";
+import { CalibrationHarness } from "./services/CalibrationHarness.ts";
 import { Db } from "./services/Db.ts";
 import { DecisionEngine } from "./services/DecisionEngine.ts";
 import { DiscordNotifier } from "./services/DiscordNotifier.ts";
@@ -49,7 +50,15 @@ import { kvYahooTokenStore, YahooOAuth } from "./services/YahooOAuth.ts";
 const registerCron = (
   cron: (typeof CRON_ROUTINES)[number],
   runtimeLayer: Layer.Layer<
-    LeagueState | ManagerBriefing | TelegramNotifier | DiscordNotifier | Scheduler,
+    | LeagueState
+    | ManagerBriefing
+    | TelegramNotifier
+    | DiscordNotifier
+    | Scheduler
+    | WeeklyProjections
+    | StandingsHistory
+    | YahooClient
+    | CalibrationHarness,
     unknown,
     unknown
   >,
@@ -297,12 +306,17 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
         ),
       ),
     );
+    const CalibrationHarnessLayer = CalibrationHarness.layerLive.pipe(Layer.provide(DbLayer));
     const RoutineLayer = Layer.mergeAll(
       RuntimeLayer,
       ManagerBriefingLayer,
       TelegramNotifierLayer,
       DiscordNotifierLayer,
       SchedulerLayer,
+      WeeklyProjectionLayer,
+      StandingsHistoryLayer,
+      YahooLayer,
+      CalibrationHarnessLayer,
     );
 
     yield* Effect.all(CRON_ROUTINES.map((cron) => registerCron(cron, RoutineLayer)));
@@ -318,6 +332,24 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
 
         if (request.method === "GET" && url.pathname === "/") {
           return HttpServerResponse.text("Fantasy GM scaffold is running.");
+        }
+
+        if (request.method === "GET" && url.pathname === "/admin/calibration") {
+          const adminToken = yield* Config.string("ADMIN_TRIGGER_TOKEN");
+          if (url.searchParams.get("token") !== adminToken) {
+            return HttpServerResponse.text("Unauthorized", { status: 401 });
+          }
+          const sweepParam = url.searchParams.get("sweep");
+          const report = yield* Effect.gen(function* () {
+            const harness = yield* CalibrationHarness;
+            const calibration = yield* harness.report();
+            const sweep =
+              sweepParam === "volatility"
+                ? yield* harness.sweep("volatility", [0.5, 0.75, 1, 1.25, 1.5, 2])
+                : undefined;
+            return { calibration, sweep };
+          }).pipe(Effect.provide(CalibrationHarnessLayer));
+          return yield* HttpServerResponse.json({ ok: true, ...report });
         }
 
         if (request.method === "GET" && url.pathname === "/admin/yahoo/auth-url") {

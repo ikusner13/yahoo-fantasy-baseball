@@ -6,6 +6,7 @@ import { LeagueState } from "../services/LeagueState.ts";
 import { ManagerBriefing } from "../services/ManagerBriefing.ts";
 import { Scheduler } from "../services/Scheduler.ts";
 import { TelegramNotifier } from "../services/TelegramNotifier.ts";
+import { closeOutPreviousWeek, recordCurrentWeekPrediction } from "./calibration.ts";
 import { deliverManagerBriefing } from "./delivery.ts";
 
 const briefingRoutines = new Set<string>([
@@ -30,6 +31,21 @@ export const dispatchRoutine = (routine: RoutineName) =>
       const scheduler = yield* Scheduler;
       const task = yield* scheduler.tick;
       yield* Effect.log("scheduler tick completed", { task });
+      // F8 calibration loop. Best-effort: a failure here must never break the scheduler tick.
+      yield* recordCurrentWeekPrediction.pipe(
+        Effect.tap((week) => Effect.log("calibration prediction recorded", { week })),
+        Effect.catch((error) =>
+          Effect.logWarning("calibration record skipped", { error: String(error) }),
+        ),
+      );
+      yield* closeOutPreviousWeek.pipe(
+        Effect.tap((week) =>
+          week == null ? Effect.void : Effect.log("calibration week closed out", { week }),
+        ),
+        Effect.catch((error) =>
+          Effect.logWarning("calibration close-out skipped", { error: String(error) }),
+        ),
+      );
       return;
     }
 

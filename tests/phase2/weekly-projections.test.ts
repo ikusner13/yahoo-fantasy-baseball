@@ -117,6 +117,7 @@ const testLayer = WeeklyProjections.layerLive.pipe(
           getRoster: Effect.die("unused"),
           getRosterForDate: () => Effect.die("unused"),
           getCurrentMatchup: Effect.die("unused"),
+          getMatchupForWeek: () => Effect.die("unused"),
           getLeagueStandings: Effect.die("unused"),
           getRosterForTeam: () =>
             Effect.succeed(rosterPayload([yahooPlayer("mlb.p.2", "Grace Starter", "SEA")])),

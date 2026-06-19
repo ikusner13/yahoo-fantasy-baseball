@@ -141,6 +141,29 @@ Priority = leverage × confidence. Each task: what, where, why, acceptance.
 - **Acceptance:** harness reports a calibration metric (e.g. Brier score on category-win predictions)
   over historical weeks and supports a single-coefficient sweep. Note: needs enough history — may be
   thin early-season.
+- **Status: DONE (core + recording loop wired live).** `src/services/CalibrationHarness.ts`:
+  `WeeklyRetrospective` schema (predictions + re-simulatable roster `inputs`, closed out with
+  per-category `outcomes`); pure metrics `brierScore` / `logLoss` / `brierByCategory` /
+  `reliabilityBins` / `calibrationReport` (return `null`/empty when history is thin, never throw);
+  `sweepCoefficient("volatility", retros, values)` re-simulates stored weeks under a global σ
+  multiplier and returns the Brier-minimizing value. Effect service `CalibrationHarness`
+  (`layerLive` over `Db` using the existing `retrospectives` table; `makeCalibrationHarnessTest`)
+  exposes `record` / `closeOut` / `load` / `report` / `sweep`. Bridge helpers `buildRetrospective`
+  (baseline + the exact simulated rosters → open retrospective) and `outcomesFromTotals`
+  (weekly totals → outcomes, lower-is-better aware).
+- **Live loop:** `src/routines/calibration.ts` — `recordCurrentWeekPrediction` (upserts the current
+  week's prediction + the exact `activeWeeklyLines` roster `rankAddCandidates` simulated) and
+  `closeOutPreviousWeek` (pulls the just-finished week's final totals via the new
+  `YahooClient.getMatchupForWeek(week)` → `weeks=N`, maps stat-ids to categories, closes out). Both
+  run best-effort from the `scheduler-tick` dispatch (`src/routines/dispatch.ts`) so a failure never
+  breaks the tick. `CalibrationHarness.layerLive` is wired into the worker `RoutineLayer`
+  (`src/worker.ts`), and `GET /admin/calibration?token=…[&sweep=volatility]` returns the live
+  report (+ optional sweep). Tests: `tests/phase8/calibration-harness.test.ts`,
+  `tests/phase8/calibration-routine.test.ts`.
+- **Notes for next:** the `volatility` sweep is the first fitted coefficient — extend
+  `SweepCoefficient` as blend weights / shrinkage priors / `WEEKLY_WEIGHT_ALPHA` become
+  re-simulatable. History accrues one week at a time from now; metrics stay `null` until the first
+  week is closed out. AI offline-tuner (F9) consumes `report()` / `sweep()`.
 
 ### F9 — Activate the AI layer (after F8)
 

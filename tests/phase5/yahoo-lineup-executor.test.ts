@@ -145,6 +145,7 @@ describe("YahooLineupExecutor Phase 5", () => {
                     getAvailablePlayers: () => Effect.die("unused"),
                     getLeagueTransactions: () => Effect.die("unused"),
                     getCurrentMatchup: Effect.die("unused"),
+                    getMatchupForWeek: () => Effect.die("unused"),
                     getLeagueStandings: Effect.die("unused"),
                     putRosterPositions: (_date, moves) =>
                       Effect.sync(() => {

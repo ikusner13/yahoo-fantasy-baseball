@@ -742,6 +742,7 @@ export class YahooClient extends Context.Service<
       count: number,
     ) => Effect.Effect<YahooLeagueTransactionsPayload, YahooApiError>;
     readonly getCurrentMatchup: Effect.Effect<YahooMatchupPayload, YahooApiError>;
+    readonly getMatchupForWeek: (week: number) => Effect.Effect<YahooMatchupPayload, YahooApiError>;
     readonly getLeagueStandings: Effect.Effect<YahooStandingsPayload, YahooApiError>;
     readonly putRosterPositions: (
       date: string,
@@ -791,6 +792,8 @@ const makeYahooClientShape = (
         YahooLeagueTransactionsPayload,
       ),
     getCurrentMatchup: request(`/team/${teamKey}/matchups;weeks=current`, YahooMatchupPayload),
+    getMatchupForWeek: (week) =>
+      request(`/team/${teamKey}/matchups;weeks=${week}`, YahooMatchupPayload),
     getLeagueStandings: request(`/league/${leagueKey}/standings`, YahooStandingsPayload),
     putRosterPositions: (date, moves) =>
       writeRosterPositions(`/team/${teamKey}/roster/players`, date, moves),
