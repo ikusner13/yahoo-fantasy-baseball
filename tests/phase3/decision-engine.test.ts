@@ -258,6 +258,64 @@ describe("DecisionEngine Phase 3", () => {
     expect(coinFlipHelper!.weeklyDelta).toBeGreaterThan(0.1);
   });
 
+  it("prefers the ceiling candidate for a losing category and the floor candidate for a winning one (F2)", () => {
+    // Two free agents with IDENTICAL mean lines but different `volatility`. Only `volatility`
+    // differs, so any ranking gap is purely the variance-aware effect: F1's Δ(win-prob) re-sim
+    // sees a higher-σ candidate raise team σ, which helps an underdog category and hurts a
+    // favorite category (P(win) = Φ(μ/σ)).
+    const floorVol = 0.3;
+    const ceilingVol = 2.5;
+    const candidate = (overrides: Partial<ConstructorParameters<typeof WeeklyBatterLine>[0]>) =>
+      batter({
+        // single-category contribution: SB only, everything else zero so σ moves visibly
+        r: 0,
+        h: 0,
+        hr: 0,
+        rbi: 0,
+        tb: 0,
+        obpNumerator: 0,
+        obpDenominator: 0,
+        obp: 0,
+        ...overrides,
+      });
+
+    // Losing category: my SB mean (3) < opponent SB mean (8) → underdog, baseline win-prob < 0.5.
+    const losing = rankAddCandidates(
+      new WeeklyProjectionSet({
+        myRoster: [candidate({ playerKey: "me", sb: 3 })],
+        opponentRoster: [candidate({ playerKey: "opp", sb: 8 })],
+        freeAgents: [
+          candidate({ playerKey: "floor", name: "Floor", sb: 4, volatility: floorVol }),
+          candidate({ playerKey: "ceiling", name: "Ceiling", sb: 4, volatility: ceilingVol }),
+        ],
+      }),
+    );
+    const losingBaselineSb = losing.baseline.categories.find((c) => c.category === "SB");
+    const losingFloor = losing.recommendations.find((r) => r.playerKey === "floor")!;
+    const losingCeiling = losing.recommendations.find((r) => r.playerKey === "ceiling")!;
+    expect(losingBaselineSb!.winProbability).toBeLessThan(0.5);
+    expect(losingCeiling.weeklyDelta).toBeGreaterThan(losingFloor.weeklyDelta);
+    expect(losing.recommendations[0]?.playerKey).toBe("ceiling");
+
+    // Winning category: my SB mean (8) > opponent SB mean (3) → favorite, baseline win-prob > 0.5.
+    const winning = rankAddCandidates(
+      new WeeklyProjectionSet({
+        myRoster: [candidate({ playerKey: "me", sb: 8 })],
+        opponentRoster: [candidate({ playerKey: "opp", sb: 3 })],
+        freeAgents: [
+          candidate({ playerKey: "floor", name: "Floor", sb: 4, volatility: floorVol }),
+          candidate({ playerKey: "ceiling", name: "Ceiling", sb: 4, volatility: ceilingVol }),
+        ],
+      }),
+    );
+    const winningBaselineSb = winning.baseline.categories.find((c) => c.category === "SB");
+    const winningFloor = winning.recommendations.find((r) => r.playerKey === "floor")!;
+    const winningCeiling = winning.recommendations.find((r) => r.playerKey === "ceiling")!;
+    expect(winningBaselineSb!.winProbability).toBeGreaterThan(0.5);
+    expect(winningFloor.weeklyDelta).toBeGreaterThan(winningCeiling.weeklyDelta);
+    expect(winning.recommendations[0]?.playerKey).toBe("floor");
+  });
+
   it("does not attribute pitching category impact to hitter adds", () => {
     const report = rankAddCandidates(
       new WeeklyProjectionSet({

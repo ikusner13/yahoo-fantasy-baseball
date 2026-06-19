@@ -181,6 +181,10 @@ export class WeeklyBatterLine extends Schema.Class<WeeklyBatterLine>("WeeklyBatt
   obpDenominator: Schema.Finite,
   obp: Schema.Finite,
   eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
+  // σ multiplier on this line's Monte Carlo sampling (1.0 = neutral/default). Lets the F1
+  // Δ(win-prob) ranking become variance-aware (F2). Currently defaults to neutral; a real
+  // per-player boom/bust / role-uncertainty source is future work (ties into F3).
+  volatility: Schema.optional(Schema.Finite),
 }) {}
 
 export class WeeklyPitcherLine extends Schema.Class<WeeklyPitcherLine>("WeeklyPitcherLine")({
@@ -199,6 +203,8 @@ export class WeeklyPitcherLine extends Schema.Class<WeeklyPitcherLine>("WeeklyPi
   svh: Schema.Finite,
   expectedStarts: Schema.optional(Schema.Finite),
   eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
+  // σ multiplier on this line's Monte Carlo sampling (1.0 = neutral/default). See WeeklyBatterLine.
+  volatility: Schema.optional(Schema.Finite),
 }) {}
 
 export class ProjectionPool extends Schema.Class<ProjectionPool>("ProjectionPool")({

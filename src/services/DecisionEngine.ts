@@ -81,6 +81,10 @@ export class CategoryProbability extends Schema.Class<CategoryProbability>("Cate
   winProbability: Schema.Finite,
   tieProbability: Schema.Finite,
   expectedPoints: Schema.Finite,
+  // F2 diagnostics: per-sim margin (my value − opponent value) distribution. Documents the
+  // variance the win-prob ranking now reflects. Optional so existing constructions are unchanged.
+  marginMean: Schema.optional(Schema.Finite),
+  marginStdDev: Schema.optional(Schema.Finite),
   tag: Schema.Union([
     Schema.Literal("lock"),
     Schema.Literal("coin-flip"),
@@ -261,29 +265,33 @@ const sampleNormal = (mean: number, sd: number, random: () => number) => {
   return Math.max(0, mean + z * sd);
 };
 
-const sampleCounting = (mean: number, random: () => number) =>
-  sampleNormal(mean, Math.sqrt(Math.max(mean, 0.05)), random);
+// `volatility` scales the sampling sd (1 = neutral). F2: a higher-σ line raises team σ, which
+// raises P(win) for underdog categories and lowers it for favorites — so F1's Δ(win-prob)
+// ranking is automatically variance-aware. A volatility ≤ 0 yields sd 0 (deterministic floor).
+const sampleCounting = (mean: number, random: () => number, volatility = 1) =>
+  sampleNormal(mean, Math.sqrt(Math.max(mean, 0.05)) * volatility, random);
 
 const sampleTeam = (lines: ReadonlyArray<WeeklyLine>, random: () => number) => {
   const totals = emptyTotals();
   for (const line of lines) {
+    const vol = line.volatility ?? 1;
     if (line.kind === "batter") {
-      totals.R += sampleCounting(line.r, random);
-      totals.H += sampleCounting(line.h, random);
-      totals.HR += sampleCounting(line.hr, random);
-      totals.RBI += sampleCounting(line.rbi, random);
-      totals.SB += sampleCounting(line.sb, random);
-      totals.TB += sampleCounting(line.tb, random);
-      totals.obpDenominator += sampleCounting(line.obpDenominator, random);
-      totals.obpNumerator += sampleCounting(line.obpNumerator, random);
+      totals.R += sampleCounting(line.r, random, vol);
+      totals.H += sampleCounting(line.h, random, vol);
+      totals.HR += sampleCounting(line.hr, random, vol);
+      totals.RBI += sampleCounting(line.rbi, random, vol);
+      totals.SB += sampleCounting(line.sb, random, vol);
+      totals.TB += sampleCounting(line.tb, random, vol);
+      totals.obpDenominator += sampleCounting(line.obpDenominator, random, vol);
+      totals.obpNumerator += sampleCounting(line.obpNumerator, random, vol);
     } else {
-      totals.OUT += sampleCounting(line.out, random);
-      totals.K += sampleCounting(line.k, random);
-      totals.er += sampleCounting(line.er, random);
-      totals.baserunners += sampleCounting(line.baserunners, random);
-      totals.ip += sampleNormal(line.ip, Math.max(0.1, line.ip * 0.12), random);
-      totals.QS += sampleCounting(line.qs, random);
-      totals["SV+H"] += sampleCounting(line.svh, random);
+      totals.OUT += sampleCounting(line.out, random, vol);
+      totals.K += sampleCounting(line.k, random, vol);
+      totals.er += sampleCounting(line.er, random, vol);
+      totals.baserunners += sampleCounting(line.baserunners, random, vol);
+      totals.ip += sampleNormal(line.ip, Math.max(0.1, line.ip * 0.12) * vol, random);
+      totals.QS += sampleCounting(line.qs, random, vol);
+      totals["SV+H"] += sampleCounting(line.svh, random, vol);
     }
   }
   return toCategoryValues(totals);
@@ -336,8 +344,14 @@ export const simulateMatchup = (
   scoringCategories: ReadonlyArray<Category> = CATEGORIES,
 ) => {
   const random = createRandom(seed);
-  const results = new Map<Category, { wins: number; ties: number }>(
-    scoringCategories.map((category) => [category, { wins: 0, ties: 0 }]),
+  const results = new Map<
+    Category,
+    { wins: number; ties: number; marginSum: number; marginSqSum: number }
+  >(
+    scoringCategories.map((category) => [
+      category,
+      { wins: 0, ties: 0, marginSum: 0, marginSqSum: 0 },
+    ]),
   );
 
   for (let index = 0; index < iterations; index += 1) {
@@ -348,6 +362,13 @@ export const simulateMatchup = (
       const opponentValue = opponent[category];
       const result = results.get(category);
       if (result == null) continue;
+      // Orient the margin so positive always means "winning" (categories where lower is better
+      // flip the sign), so marginMean/marginStdDev read consistently across all categories.
+      const margin = LOWER_IS_BETTER.has(category)
+        ? opponentValue - myValue
+        : myValue - opponentValue;
+      result.marginSum += margin;
+      result.marginSqSum += margin * margin;
       if (Math.abs(myValue - opponentValue) < 0.0001) {
         result.ties += 1;
       } else if (
@@ -359,14 +380,19 @@ export const simulateMatchup = (
   }
 
   const categories = scoringCategories.map((category) => {
-    const result = results.get(category) ?? { wins: 0, ties: 0 };
+    const result = results.get(category) ?? { wins: 0, ties: 0, marginSum: 0, marginSqSum: 0 };
     const winProbability = result.wins / iterations;
     const tieProbability = result.ties / iterations;
+    const marginMean = iterations > 0 ? result.marginSum / iterations : 0;
+    const marginVariance =
+      iterations > 0 ? Math.max(0, result.marginSqSum / iterations - marginMean * marginMean) : 0;
     return new CategoryProbability({
       category,
       winProbability,
       tieProbability,
       expectedPoints: winProbability + 0.5 * tieProbability,
+      marginMean,
+      marginStdDev: Math.sqrt(marginVariance),
       tag: tagCategory(winProbability),
     });
   });
