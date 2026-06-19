@@ -36,7 +36,9 @@ const MIN_ACTIVE_DROP_REPLACEMENT_EDGE = 3;
 const MIN_SCARCE_POSITION_DROP_EDGE = 6;
 const TOP_WAIVER_PRIORITY_CUTOFF = 3;
 const TOP_WAIVER_MIN_SEASON_SGP = 1;
-const TOP_WAIVER_MIN_WEEKLY_DELTA = 2;
+// F1: weeklyDelta is now Δ(expected-category-wins) units (≈ percentage points of category wins),
+// not the old weighted-EV scale. 0.05 ≈ a 5-point swing in expected category wins.
+const TOP_WAIVER_MIN_WEEKLY_DELTA = 0.05;
 const LEAGUE_AVG_OBP = 0.32;
 const LEAGUE_AVG_ERA = 4.1;
 const LEAGUE_AVG_WHIP = 1.28;

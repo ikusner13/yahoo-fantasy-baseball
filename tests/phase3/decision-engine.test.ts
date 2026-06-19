@@ -199,6 +199,65 @@ describe("DecisionEngine Phase 3", () => {
     expect(report.recommendations[0]?.affectedCategories.length).toBeGreaterThan(0);
   });
 
+  it("ranks a coin-flip helper above a lock-padding add (Δ win-prob objective)", () => {
+    // Synthetic matchup: HR/TB are locks, H/RBI/SB/OBP are coin-flips, R + all pitching are
+    // lost causes. A pure-SB bat helps a coin-flip category; a pure-power bat only pads the
+    // already-won HR/TB locks. Under the Δ(expected-category-wins) objective the coin-flip helper
+    // must outrank the lock padder, and the lock padder's weeklyDelta should be ≈0 (saturated).
+    const myRoster = [batter({ playerKey: "me", hr: 12, sb: 5, r: 2, h: 6, rbi: 4, tb: 20 })];
+    const opponentRoster = [batter({ playerKey: "opp", hr: 1, sb: 5, r: 14, h: 6, rbi: 4, tb: 8 })];
+    const baseline = simulateMatchup(myRoster, opponentRoster, 5000, 62744);
+    const tagFor = (category: string) =>
+      baseline.categories.find((entry) => entry.category === category)?.tag;
+    expect(tagFor("HR")).toBe("lock");
+    expect(tagFor("SB")).toBe("coin-flip");
+    expect(tagFor("R")).toBe("lost-cause");
+
+    const report = rankAddCandidates(
+      new WeeklyProjectionSet({
+        myRoster,
+        opponentRoster,
+        freeAgents: [
+          batter({
+            playerKey: "lock-padder",
+            name: "Lock Padder",
+            hr: 10,
+            r: 0,
+            h: 0,
+            rbi: 0,
+            sb: 0,
+            tb: 18,
+          }),
+          batter({
+            playerKey: "coin-flip-helper",
+            name: "Coin Flip Helper",
+            hr: 0,
+            r: 0,
+            h: 0,
+            rbi: 0,
+            sb: 8,
+            tb: 0,
+          }),
+        ],
+      }),
+    );
+
+    const lockPadder = report.recommendations.find((entry) => entry.playerKey === "lock-padder");
+    const coinFlipHelper = report.recommendations.find(
+      (entry) => entry.playerKey === "coin-flip-helper",
+    );
+    expect(lockPadder).toBeDefined();
+    expect(coinFlipHelper).toBeDefined();
+
+    // Coin-flip helper outranks the lock padder.
+    expect(report.recommendations[0]?.playerKey).toBe("coin-flip-helper");
+    expect(coinFlipHelper!.weeklyDelta).toBeGreaterThan(lockPadder!.weeklyDelta);
+
+    // Lock-padding move barely moves the objective; coin-flip move clearly does.
+    expect(Math.abs(lockPadder!.weeklyDelta)).toBeLessThan(0.1);
+    expect(coinFlipHelper!.weeklyDelta).toBeGreaterThan(0.1);
+  });
+
   it("does not attribute pitching category impact to hitter adds", () => {
     const report = rankAddCandidates(
       new WeeklyProjectionSet({

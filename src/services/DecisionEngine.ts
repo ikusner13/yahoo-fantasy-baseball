@@ -776,7 +776,10 @@ export const rankAddCandidates = (
           candidate.kind === "batter" ? BATTER_CATEGORIES : PITCHER_CATEGORIES;
         if (!applicableCategories.has(name) || !scoringCategorySet.has(name)) return sum;
         const before = baseline.categories.find((entry) => entry.category === category.category);
-        return sum + (category.expectedPoints - (before?.expectedPoints ?? 0)) * weights[name];
+        // F1: pure Σ_c Δ(expected category wins+ties). The win-prob gradient already encodes
+        // marginal value (§1.3) — a locked/lost category's Δ is ≈0 by saturation — so the bucket
+        // weight is intentionally NOT applied here; it would double-count and distort the objective.
+        return sum + (category.expectedPoints - (before?.expectedPoints ?? 0));
       }, 0);
       const score = WEEKLY_WEIGHT_ALPHA * weeklyDelta + (1 - WEEKLY_WEIGHT_ALPHA) * seasonSgpDelta;
       return new AddRecommendation({

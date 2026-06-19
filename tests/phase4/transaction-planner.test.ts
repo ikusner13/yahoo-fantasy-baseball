@@ -653,11 +653,13 @@ describe("TransactionPlanner Phase 4", () => {
           type: "add",
           playerKey: "thin-claim",
           playerName: "Thin Claim",
-          score: 1,
-          weeklyDelta: 0.7,
+          score: 0.03,
+          // win-prob units: a thin claim barely moves expected category wins and is below both the
+          // season-SGP (1) and weekly Δ-win (0.05) waiver-spend thresholds.
+          weeklyDelta: 0.02,
           seasonSgpDelta: 0.3,
           affectedCategories: [
-            new CategoryDelta({ category: "RBI", weeklyDelta: 0.4, seasonSgpDelta: 0.2 }),
+            new CategoryDelta({ category: "RBI", weeklyDelta: 0.02, seasonSgpDelta: 0.2 }),
           ],
         }),
       ],
