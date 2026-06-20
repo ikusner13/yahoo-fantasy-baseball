@@ -16,6 +16,13 @@ import {
   type WeeklyPitcherLine,
 } from "./ProjectionModel.ts";
 import {
+  SimJobCandidate,
+  SimJobSpec,
+  StoredSimJobSpec,
+  UnitPartial,
+  UnitPartialCounter,
+} from "./SimJob.ts";
+import {
   StandingsHistory,
   StandingsHistoryError,
   type StandingCategoryTotal,
@@ -389,22 +396,27 @@ const hasUsableSgpHistory = (standingsHistory: ReadonlyArray<StandingCategoryTot
     return pointCount >= 2;
   });
 
-export const simulateMatchup = (
+// Single source of truth for the Monte Carlo loop: runs `iterations` sims of myRoster vs
+// opponentRoster and returns the RAW per-category counters (wins/ties/marginSum/marginSqSum) as a
+// serializable UnitPartial. `simulateMatchup` and `simulateUnit` are both thin wrappers over this so
+// there is exactly one RNG/draw implementation.
+//
+// Decoupled mine/opp RNG streams (was a single shared `createRandom(62744)` stream). The opp stream
+// is seeded distinctly + deterministically so it is identical for the baseline and every candidate
+// (candidates only append to myRoster) → Common Random Numbers: candidate Δ is low-variance and
+// chunks are independent/summable. This deliberately changes sim outputs vs. the old single-stream
+// scheme; calibrated against F8 as of 2026-06-20.
+const simulateRawCounters = (
   myRoster: ReadonlyArray<WeeklyLine>,
   opponentRoster: ReadonlyArray<WeeklyLine>,
-  iterations = PRODUCTION_SIMULATION_COUNT,
-  seed = 62744,
-  scoringCategories: ReadonlyArray<Category> = CATEGORIES,
-) => {
-  // Decoupled mine/opp RNG streams (was a single shared `createRandom(62744)` stream). The opp
-  // stream is seeded distinctly + deterministically so it is identical for the baseline and every
-  // candidate call (candidates only append to myRoster) → Common Random Numbers: candidate Δ is
-  // low-variance and chunks are independent/summable. This deliberately changes sim outputs vs. the
-  // old single-stream scheme; calibrated against F8 as of 2026-06-20.
+  seed: number,
+  iterations: number,
+  scoringCategories: ReadonlyArray<Category>,
+): UnitPartial => {
   const randomMine = createRandom(seed);
   const randomOpp = createRandom((seed ^ 0x9e3779b9) >>> 0);
   const results = new Map<
-    Category,
+    string,
     { wins: number; ties: number; marginSum: number; marginSqSum: number }
   >(
     scoringCategories.map((category) => [
@@ -438,8 +450,56 @@ export const simulateMatchup = (
     }
   }
 
+  return new UnitPartial({
+    iters: iterations,
+    categories: scoringCategories.map((category) => {
+      const result = results.get(category) ?? { wins: 0, ties: 0, marginSum: 0, marginSqSum: 0 };
+      return new UnitPartialCounter({ category, ...result });
+    }),
+  });
+};
+
+// Sum a set of UnitPartials with matching category sets into one (used by reduce to add chunk
+// partials, and baseline-from-spec scenarios). Counters are additive so summing partials is
+// identical to a single run over the union of their iterations.
+export const sumUnitPartials = (partials: ReadonlyArray<UnitPartial>): UnitPartial => {
+  const totals = new Map<
+    string,
+    { wins: number; ties: number; marginSum: number; marginSqSum: number }
+  >();
+  let iters = 0;
+  for (const partial of partials) {
+    iters += partial.iters;
+    for (const counter of partial.categories) {
+      const acc = totals.get(counter.category) ?? {
+        wins: 0,
+        ties: 0,
+        marginSum: 0,
+        marginSqSum: 0,
+      };
+      acc.wins += counter.wins;
+      acc.ties += counter.ties;
+      acc.marginSum += counter.marginSum;
+      acc.marginSqSum += counter.marginSqSum;
+      totals.set(counter.category, acc);
+    }
+  }
+  return new UnitPartial({
+    iters,
+    categories: [...totals].map(([category, acc]) => new UnitPartialCounter({ category, ...acc })),
+  });
+};
+
+// Convert a unit's raw counters → the existing MatchupSimulation/CategoryProbability aggregation.
+// `scoringCategories` fixes the output order to match the old simulateMatchup exactly.
+const aggregateMatchup = (
+  partial: UnitPartial,
+  scoringCategories: ReadonlyArray<Category>,
+): MatchupSimulation => {
+  const byCategory = new Map(partial.categories.map((counter) => [counter.category, counter]));
+  const iterations = partial.iters;
   const categories = scoringCategories.map((category) => {
-    const result = results.get(category) ?? { wins: 0, ties: 0, marginSum: 0, marginSqSum: 0 };
+    const result = byCategory.get(category) ?? { wins: 0, ties: 0, marginSum: 0, marginSqSum: 0 };
     const winProbability = result.wins / iterations;
     const tieProbability = result.ties / iterations;
     const marginMean = iterations > 0 ? result.marginSum / iterations : 0;
@@ -461,6 +521,18 @@ export const simulateMatchup = (
     categories,
   });
 };
+
+export const simulateMatchup = (
+  myRoster: ReadonlyArray<WeeklyLine>,
+  opponentRoster: ReadonlyArray<WeeklyLine>,
+  iterations = PRODUCTION_SIMULATION_COUNT,
+  seed = 62744,
+  scoringCategories: ReadonlyArray<Category> = CATEGORIES,
+) =>
+  aggregateMatchup(
+    simulateRawCounters(myRoster, opponentRoster, seed, iterations, scoringCategories),
+    scoringCategories,
+  );
 
 const categoryWeightsFromScout = (baseline: MatchupSimulation) =>
   Object.fromEntries(
@@ -821,21 +893,77 @@ const categoryLineDeltas = (
     .slice(0, 5);
 };
 
-export const rankAddCandidates = (
+// The optimal-lineup pieces optimizeLineup produces. Precomputed in prepareSimJob (which has
+// set+snapshot+baseline+denominators) and carried in the stored payload so reduceSimJob — which
+// only receives the stored spec + candidate partials — can attach them without re-reading
+// set/snapshot (approach (a) for the optimizeLineup data dependency).
+export class StoredLineup extends Schema.Class<StoredLineup>("StoredLineup")({
+  recommendations: Schema.Array(LineupRecommendation),
+  optimalLineup: Schema.Array(OptimalLineupSlot),
+  optimalBench: Schema.Array(OptimalLineupBench),
+}) {}
+
+// Everything stage 1 persists: the serializable SimJobSpec + baseline UnitPartial + unitCount
+// (from SimJob.ts), plus the precomputed lineup and the sgpDenominatorSource flag (both derived in
+// prepareSimJob and needed by reduce). Composed in DecisionEngine.ts so it can reference the lineup
+// Schema.Classes without SimJob.ts importing DecisionEngine (avoids an import cycle).
+export class StoredSimJob extends Schema.Class<StoredSimJob>("StoredSimJob")({
+  stored: StoredSimJobSpec,
+  lineup: StoredLineup,
+  sgpDenominatorSource: Schema.Union([
+    Schema.Literal("standings-history"),
+    Schema.Literal("fallback"),
+  ]),
+}) {}
+
+// CRN: the seed is unit-INDEPENDENT — every unit (baseline + each candidate) shares it so the
+// opponent stream (and the shared-roster part of mine's stream) draws identically across units,
+// making Δ = candidate − baseline low-variance. The ONLY seed perturbation is chunkIndex, used when
+// a unit's iterations are split across chunks (simChunksPerUnit > 1). This corrects the outline's
+// `seed = baseSeed + unitIndex*STRIDE + chunkIndex`: the `unitIndex*STRIDE` term would give each
+// unit a different opponent stream and destroy CRN. Per-unit distinctness comes from the differing
+// roster (and the D1 partial key), not the seed. With the default chunkCount=1 every unit uses
+// `baseSeed` (= 62744), exactly reproducing today's rankAddCandidates.
+const unitSeed = (baseSeed: number, chunkIndex: number) => (baseSeed + chunkIndex) >>> 0;
+
+// Partition `total` iterations across `chunkCount` chunks: each chunk gets floor(total/chunkCount),
+// and the first `total % chunkCount` chunks get one extra (deterministic remainder handling). Summed
+// across chunks this is exactly `total`.
+const chunkIterations = (total: number, chunkIndex: number, chunkCount: number) => {
+  const base = Math.floor(total / chunkCount);
+  const remainder = total % chunkCount;
+  return base + (chunkIndex < remainder ? 1 : 0);
+};
+
+const rosterForUnit = (spec: SimJobSpec, unitIndex: number): ReadonlyArray<WeeklyLine> =>
+  unitIndex === 0
+    ? (spec.scoringRoster as ReadonlyArray<WeeklyLine>)
+    : [
+        ...(spec.scoringRoster as ReadonlyArray<WeeklyLine>),
+        spec.candidates[unitIndex - 1]!.line as WeeklyLine,
+      ];
+
+// STAGE 1 (cheap except 1 baseline sim). Builds the fan-out-able job spec: runs the baseline sim
+// INLINE (approach (A)) to derive scout weights, which drive candidate selection (the "weights
+// ordering gotcha"), selects the top MAX_SIMULATED_ADD_CANDIDATES candidates exactly as today, and
+// precomputes the optimal lineup. unitCount = number of CANDIDATE units (candidates.length); the
+// heavy fan-out is over candidate units only, not the baseline.
+export const prepareSimJob = (
   set: WeeklyProjectionSet,
   snapshot?: LeagueStateSnapshot,
   standingsHistory: ReadonlyArray<StandingCategoryTotal> = [],
-) => {
+  contextAt?: string,
+): StoredSimJob => {
   const scoringCategories = scoringCategoriesForSnapshot(snapshot);
-  const scoringCategorySet = new Set(scoringCategories);
   const scoringRoster = activeWeeklyLines(set.myRoster, snapshot);
-  const baseline = simulateMatchup(
+  const baselinePartial = simulateRawCounters(
     scoringRoster,
     set.opponentRoster,
-    undefined,
     62744,
+    PRODUCTION_SIMULATION_COUNT,
     scoringCategories,
   );
+  const baseline = aggregateMatchup(baselinePartial, scoringCategories);
   const scout = scoutOpponent(baseline);
   const weights = scout.categoryWeights as Record<Category, number>;
   const denominators = computeSgpDenominators(standingsHistory);
@@ -845,16 +973,84 @@ export const rankAddCandidates = (
       seasonSgpDelta: seasonSgp(candidate, denominators, weights),
     }))
     .sort((a, b) => b.seasonSgpDelta - a.seasonSgpDelta)
-    .slice(0, MAX_SIMULATED_ADD_CANDIDATES);
-  const recommendations = candidates
-    .map(({ candidate, seasonSgpDelta }) => {
-      const after = simulateMatchup(
-        [...scoringRoster, candidate],
-        set.opponentRoster,
-        undefined,
-        62744,
-        scoringCategories,
-      );
+    .slice(0, MAX_SIMULATED_ADD_CANDIDATES)
+    .map(
+      ({ candidate, seasonSgpDelta }) => new SimJobCandidate({ line: candidate, seasonSgpDelta }),
+    );
+
+  const spec = new SimJobSpec({
+    scoringCategories,
+    scoringRoster,
+    opponentRoster: set.opponentRoster,
+    candidates,
+    denominators,
+    baseSeed: 62744,
+  });
+
+  const lineup = optimizeLineup(set, baseline, snapshot, denominators);
+
+  return new StoredSimJob({
+    stored: new StoredSimJobSpec({
+      spec,
+      baseline: baselinePartial,
+      unitCount: candidates.length,
+      contextAt,
+    }),
+    lineup: new StoredLineup({
+      recommendations: lineup.recommendations,
+      optimalLineup: lineup.optimalLineup,
+      optimalBench: lineup.optimalBench,
+    }),
+    sgpDenominatorSource: hasUsableSgpHistory(standingsHistory) ? "standings-history" : "fallback",
+  });
+};
+
+// STAGE 2 (the heavy work, one invocation per unit). Runs ONE sim unit and returns its raw
+// counters. unitIndex 0 = baseline; 1..N = candidate i-1. The roster differs per unit (baseline vs
+// roster+candidate); the seed does NOT depend on unitIndex (see unitSeed — CRN). chunkIndex/chunkCount
+// slice PRODUCTION_SIMULATION_COUNT so a unit can be split across cheap invocations; the per-chunk
+// partials sum exactly to a single full run (each chunk = seed baseSeed+chunkIndex over its iteration
+// slice). chunkCount=1 ⇒ seed=baseSeed over all iterations, identical to today.
+export const simulateUnit = (
+  stored: StoredSimJob,
+  unitIndex: number,
+  chunkIndex = 0,
+  chunkCount = 1,
+): UnitPartial => {
+  const spec = stored.stored.spec;
+  const scoringCategories = spec.scoringCategories as ReadonlyArray<Category>;
+  const iterations = chunkIterations(PRODUCTION_SIMULATION_COUNT, chunkIndex, chunkCount);
+  return simulateRawCounters(
+    rosterForUnit(spec, unitIndex),
+    spec.opponentRoster as ReadonlyArray<WeeklyLine>,
+    unitSeed(spec.baseSeed, chunkIndex),
+    iterations,
+    scoringCategories,
+  );
+};
+
+// STAGE 3 (cheap). Sums the baseline partial (from the stored spec) + the candidate unit partials,
+// aggregates each to a MatchupSimulation, then runs the existing post-sim logic (weeklyDelta/score
+// per candidate + affected categories) and attaches the precomputed lineup → a DecisionReport
+// byte-identical to today's rankAddCandidates. `candidateUnitPartials[i]` is the (chunk-summed)
+// partial for candidate i (unit i+1), in candidate order.
+export const reduceSimJob = (
+  stored: StoredSimJob,
+  candidateUnitPartials: ReadonlyArray<UnitPartial>,
+): DecisionReport => {
+  const spec = stored.stored.spec;
+  const scoringCategories = spec.scoringCategories as ReadonlyArray<Category>;
+  const scoringCategorySet = new Set(scoringCategories);
+  const denominators = spec.denominators as Record<Category, number>;
+  const baseline = aggregateMatchup(stored.stored.baseline, scoringCategories);
+  const scout = scoutOpponent(baseline);
+  const weights = scout.categoryWeights as Record<Category, number>;
+
+  const recommendations = spec.candidates
+    .map((entry, index) => {
+      const candidate = entry.line as WeeklyLine;
+      const seasonSgpDelta = entry.seasonSgpDelta;
+      const after = aggregateMatchup(candidateUnitPartials[index]!, scoringCategories);
       const weeklyDelta = after.categories.reduce((sum, category) => {
         const name = category.category as Category;
         const applicableCategories =
@@ -886,17 +1082,29 @@ export const rankAddCandidates = (
     })
     .sort((a, b) => b.score - a.score);
 
-  const lineup = optimizeLineup(set, baseline, snapshot, denominators);
-
   return new DecisionReport({
     baseline,
     scout,
-    sgpDenominatorSource: hasUsableSgpHistory(standingsHistory) ? "standings-history" : "fallback",
+    sgpDenominatorSource: stored.sgpDenominatorSource,
     recommendations,
-    lineupRecommendations: lineup.recommendations,
-    optimalLineup: lineup.optimalLineup,
-    optimalBench: lineup.optimalBench,
+    lineupRecommendations: stored.lineup.recommendations,
+    optimalLineup: stored.lineup.optimalLineup,
+    optimalBench: stored.lineup.optimalBench,
   });
+};
+
+// Thin wrapper: in-process composition of the three stages. Keeps every existing caller
+// (currentBriefing live path, /admin/preview/briefing?live=1, /debug/*) working unchanged, and is
+// byte-identical to the old monolithic implementation. With chunkCount defaulting to 1, the seed is
+// baseSeed (62744) for every unit — exactly the old per-call seed.
+export const rankAddCandidates = (
+  set: WeeklyProjectionSet,
+  snapshot?: LeagueStateSnapshot,
+  standingsHistory: ReadonlyArray<StandingCategoryTotal> = [],
+): DecisionReport => {
+  const stored = prepareSimJob(set, snapshot, standingsHistory);
+  const partials = stored.stored.spec.candidates.map((_, index) => simulateUnit(stored, index + 1));
+  return reduceSimJob(stored, partials);
 };
 
 const mapError = (error: WeeklyProjectionsError | YahooApiError | StandingsHistoryError) =>
