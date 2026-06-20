@@ -1,10 +1,12 @@
 # Implementation outline: briefing CPU fix via self-fetch fan-out
 
-Status: **implemented; live gates pending** (branch `fix/briefing-cpu-fanout`).
-Phases 0–4 are shipped and committed; Phase 5 = local verification DONE, two live gates
-OPEN. This is the executable plan for the rearchitecture investigated in
-`docs/engine-followups-briefing-cpu.md` (read that first for root-cause evidence). This
-doc is self-contained: an implementer should not need to re-derive the architecture.
+Status: **SHIPPED + verified in prod 2026-06-20** (merged to `main`, commit `7a4df438`).
+NOTE: the "self-fetch" approach in this doc's title was PROVEN unworkable in prod — a Worker
+cannot offload CPU to itself (self HTTP loopback is blocked; a self service binding is killed
+`exceededCpu`). The shipped fix runs the per-unit sim in a **SEPARATE `SimChunkWorker`**
+(`src/sim-chunk-worker.ts`) called via a cross-worker service binding, with the dispatcher
+advancing one heavy stage per tick. See `docs/engine-followups-briefing-cpu.md` for the
+verified architecture + root-cause evidence; the per-stage design below still applies.
 
 Phase status:
 

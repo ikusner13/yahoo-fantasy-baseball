@@ -1,6 +1,14 @@
 # Follow-up: morning briefing misses its slot (Worker CPU limit)
 
-Status: **re-architected; pending live verification.** The original self-fetch fan-out
+Status: **FIXED — verified in prod 2026-06-20 (commit `7a4df438`).** The chronic ~19%
+`exceededCpu` briefing miss is resolved: CF Workers Observability confirms a full autonomous
+cycle with ZERO `exceededCpu` — the spec-build precompute tick ran `ok` (~1038ms, one stage),
+5 `/internal/sim-chunk` invocations ran `ok` (~343ms each) on the SEPARATE `SimChunkWorker`
+(`fantasygm-simchunkworker-prod-ebe6qc7pl3lpssad`), and the reduce tick ran `ok` (cross-worker
+D1 read-after-write → prepared briefing persisted → delivered). Only F8 win-prob recalibration
+remains open (inherently ongoing — needs weeks of new recorded outcomes under the CRN scheme).
+
+The original self-fetch fan-out
 (Phases 0–5) was PROVEN non-functional in prod: a Worker cannot offload CPU to itself —
 a self HTTP fetch to its own workers.dev host is loopback-BLOCKED (zero sub-invocations),
 and a self service binding kills the parent with `exceededCpu` (same-worker
@@ -35,24 +43,22 @@ full design):
   outputs** vs. the old single-`62744`-stream design.
 
 Local verification is DONE and green (`vp check` + `vp test`, including the new
-`tests/briefing-cpu/full-cycle.test.ts` end-to-end cycle + guarantee test). TWO gates
-require live infra and remain **OPEN** (cannot be run from this environment — no live
-Yahoo OAuth, no prod D1, no deploy):
+`tests/briefing-cpu/full-cycle.test.ts` end-to-end cycle + guarantee test). Live gates:
 
+- [x] **Prod CPU confirmation — DONE 2026-06-20.** Drove a full cycle via
+      `POST /admin/run/task/{refresh-context,precompute}` (×2). CF Observability: main-worker
+      precompute ticks `ok` (max ~1038ms, no `exceededCpu`); 5 `GET /internal/sim-chunk` `ok`
+      (~343ms each) on `fantasygm-simchunkworker-prod-ebe6qc7pl3lpssad`; reduce produced the
+      prepared briefing (`ran:true`); manual `send-briefing` delivered (~1s, read-only).
+      Residual optimization: the ~1038ms spec-build tick is close-ish to the probabilistic
+      free-tier kill zone — lighten it later (reuse refresh-context's cached set vs. re-parse).
 - [ ] **F8 win-prob calibration re-run** — the RNG/CRN change shifts `simulateMatchup`
       predictions, so the recorded-outcome backtest (`src/services/CalibrationHarness.ts`,
-      Brier/log-loss over closed-out weeks) MUST be re-run on prod data and accepted as
-      the new baseline. Run: `GET /admin/calibration?token=<ADMIN_TRIGGER_TOKEN>` (add
-      `&sweep=volatility` for the coefficient sweep) against the prod worker. The local
-      `nr gm:calibration` only validates SGP denominators (deterministic standings input,
-      RNG-independent) — it does NOT cover the win-prob backtest.
-- [ ] **Prod CPU confirmation** — observe per-invocation `cpuTimeMs` stays low for the
-      new `precompute` (cron) and `/internal/sim-chunk` (fetch) invocations in CF Workers
-      Observability for worker `fantasygm-fantasygmworker-prod-cbbdqptg2afhvv5l` (filter
-      `$metadata.service`=worker, `$metadata.origin`=`cron`/`fetch`; inspect
-      `$workers.outcome`/`$workers.cpuTimeMs`). Drive a real day-cycle via repeated
-      `POST /admin/run/scheduler-tick` and confirm spec → partials → reduced → delivered
-      with no `exceededCpu`.
+      Brier/log-loss over closed-out weeks) must be re-run on prod data and accepted as the
+      new baseline once enough weeks have closed out under the new scheme. Run:
+      `GET /admin/calibration?token=<ADMIN_TRIGGER_TOKEN>` (add `&sweep=volatility`) against
+      the prod worker. Inherently ONGOING (needs new recorded outcomes); the local
+      `nr gm:calibration` only validates RNG-independent SGP denominators.
 
 Original investigation (root-cause evidence) follows.
 
