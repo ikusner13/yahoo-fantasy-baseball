@@ -1,9 +1,19 @@
 # Follow-up: morning briefing misses its slot (Worker CPU limit)
 
-Status: **implemented; pending live verification.** Implementation is COMPLETE on
-branch `fix/briefing-cpu-fanout` (Phases 0–5). The chosen rearchitecture spreads the
-briefing compute across many cheap invocations (100k req/day budget) instead of
-shrinking the sim in a single invocation.
+Status: **re-architected; pending live verification.** The original self-fetch fan-out
+(Phases 0–5) was PROVEN non-functional in prod: a Worker cannot offload CPU to itself —
+a self HTTP fetch to its own workers.dev host is loopback-BLOCKED (zero sub-invocations),
+and a self service binding kills the parent with `exceededCpu` (same-worker
+loop-protection), even at 20ms parent CPU. ALSO, a single dispatcher tick that did
+spec-build (~874ms) + fan-out + reduce (~632ms) ≈ 1037ms → `exceededCpu`.
+
+Fix (current): the per-unit sim runs in a **SEPARATE Worker** (`SimChunkWorker`,
+`src/sim-chunk-worker.ts`) sharing the SAME D1, invoked by the main worker via a
+**cross-worker service binding** (`env.SIM_CHUNK_WORKER`) — its own independent CPU
+budget, no loop-protection. The dispatcher now advances **one heavy stage per tick**:
+spec-build persists the spec and RETURNS immediately; a later tick (spec present, not
+stale) does fan-out + reduce. Spec-build and reduce NEVER co-occur. The rest of the
+design below (D1 partials, gated stages, cross-tick retry, CRN) is unchanged.
 
 Shipped architecture (see `docs/briefing-cpu-fanout-implementation-outline.md` for the
 full design):

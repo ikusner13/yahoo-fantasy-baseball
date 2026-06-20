@@ -12,9 +12,13 @@ import {
   SIM_JOB_MAX_AGE_MS,
   simPartialKey,
   simSpecKey,
+  specGeneration,
   UnitPartial,
 } from "../../src/services/SimJob";
-import { runSimChunk } from "../../src/worker";
+import { runSimChunk } from "../../src/services/SimChunk";
+
+// The fixtures build specs with contextAt=undefined, so runSimChunk writes partials under this gen.
+const GEN = specGeneration(undefined);
 
 const batter = (o: Partial<ConstructorParameters<typeof WeeklyBatterLine>[0]> = {}) =>
   new WeeklyBatterLine({
@@ -107,7 +111,9 @@ describe("/internal/sim-chunk handler core (runSimChunk)", () => {
     );
     expect(result).toEqual({ ok: true, unit, chunk });
 
-    const persisted = await Effect.runPromise(readPartial(store, simPartialKey(DATE, unit, chunk)));
+    const persisted = await Effect.runPromise(
+      readPartial(store, simPartialKey(DATE, unit, chunk, GEN)),
+    );
     expect(persisted).not.toBeUndefined();
 
     const expected = simulateUnit(stored, unit, chunk, 1);
@@ -126,7 +132,9 @@ describe("/internal/sim-chunk handler core (runSimChunk)", () => {
     );
     expect(result).toEqual({ ok: true, unit, chunk });
 
-    const persisted = await Effect.runPromise(readPartial(store, simPartialKey(DATE, unit, chunk)));
+    const persisted = await Effect.runPromise(
+      readPartial(store, simPartialKey(DATE, unit, chunk, GEN)),
+    );
     const expected = simulateUnit(stored, unit, chunk, chunkCount);
     expect(JSON.parse(JSON.stringify(persisted))).toEqual(JSON.parse(JSON.stringify(expected)));
   });

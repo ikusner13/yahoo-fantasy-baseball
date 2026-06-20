@@ -30,8 +30,11 @@ import { prepareSimJob, reduceSimJob, StoredSimJob, sumUnitPartials } from "./De
 import {
   SIM_JOB_MAX_AGE_MS,
   simPartialKey,
+  simReducedGenKey,
   simReducedKey,
+  SimReducedGen,
   simSpecKey,
+  specGeneration,
   UnitPartial,
 } from "./SimJob.ts";
 import { deliverManagerBriefing } from "../routines/delivery.ts";
@@ -252,13 +255,18 @@ type PrecomputeCache = {
   readonly put: <A>(key: string, value: A) => Effect.Effect<void, unknown>;
 };
 
-// The precompute dispatcher (stage 1 spec → stage 2 fan-out → stage 3 reduce), gated entirely on
-// D1 state so a DIED dispatcher/chunk is resumable on the next tick:
+// The precompute dispatcher, gated entirely on D1 state so a DIED dispatcher/chunk is resumable on
+// the next tick. ONE-STAGE-PER-TICK is a HARD RULE: a single invocation advances roughly one heavy
+// stage, and spec-build and reduce NEVER run in the same invocation (a tick doing both was ~1037ms
+// CPU → exceededCpu; spec-build alone is ~874ms, fan-out+reduce together ~632ms — both safe).
 //   Stage 1 (spec): no StoredSimJob at simSpecKey(date) — or it is STALE (built from an older
-//     context than `contextAt`) — → build it (one baseline sim, ~230ms) and persist; DISCARD any
-//     existing partials (and the reduced artifact) so a fresh fan-out runs.
+//     context than `contextAt`) — → build it (one baseline sim) and persist, then RETURN
+//     IMMEDIATELY (`spec-built`). It does NOT fan out or reduce this tick; a later tick (spec
+//     present, not stale) does that. Any existing partials/reduced artifact are implicitly stale and
+//     get OVERWRITTEN by the later fan-out/reduce (same keys), so no delete primitive is needed.
 //   Stage 2 (fan-out): pending = {1..unitCount} minus units whose simPartialKey already exists.
-//     Self-fetch each pending unit (its OWN CPU budget); the dispatcher only awaits I/O.
+//     Fan out each pending unit to the separate SimChunkWorker (its OWN CPU budget); the dispatcher
+//     only awaits I/O. This shares a tick with stage 3 (fan-out is I/O, reduce ~632ms → safe).
 //   Stage 3 (reduce): all partials present AND no reduced artifact → reduceSimJob → assemble the
 //     ManagerBriefingReport via briefingFromReport → persist under simReducedKey(date).
 // chunkCount defaults to 1 (units×chunks ≤ ~40 cap honored by the caller's chunk knob).
@@ -280,35 +288,41 @@ export const runPrecompute = (deps: {
     const isStale =
       stored != null && contextAt != null && (stored.stored.contextAt ?? "") < contextAt;
 
-    let specRebuilt = false;
     if (stored == null || isStale) {
-      stored = yield* buildSpec;
-      yield* cache.put(simSpecKey(date), stored);
-      specRebuilt = true;
+      // Stage 1: build + persist the spec (one baseline sim, the heavy ~874ms CPU of this stage),
+      // then RETURN IMMEDIATELY. One-stage-per-tick HARD RULE: this tick must NOT also fan out or
+      // reduce (spec-build + reduce in one tick is the ~1037ms exceededCpu failure). A later tick
+      // (spec now present, not stale) does the fan-out + reduce. The fresh spec's unitCount is the
+      // count to fan out; any stale partials/reduced artifact from a prior spec get overwritten by
+      // the later fan-out/reduce on the same keys.
+      const rebuilt = yield* buildSpec;
+      yield* cache.put(simSpecKey(date), rebuilt);
+      return { stage: "spec-built", unitCount: rebuilt.stored.unitCount, reduced: false } as const;
     }
 
     const unitCount = stored.stored.unitCount;
-    // On a fresh-spec tick, treat ALL units as pending so the fan-out re-runs and OVERWRITES any
-    // stale partials (same keys) with values for the new spec; the stale reduced artifact is
-    // ignored here (specRebuilt) and overwritten by stage 3. No delete primitive is needed.
-    const reducedExisting = specRebuilt
-      ? undefined
-      : yield* cache.get(simReducedKey(date), ManagerBriefingReport, SIM_JOB_MAX_AGE_MS);
-    if (reducedExisting != null) {
+    // Generation of THIS spec; partials are keyed by it so a newer-context rebuild's fan-out never
+    // reads the previous spec's partials, and a STALE reduced artifact (built from an older
+    // generation) is not mistaken for this job's. The reduced artifact itself stays at a
+    // generation-free key (the delivery source); a sibling marker records its generation.
+    const gen = specGeneration(stored.stored.contextAt);
+    const reducedExisting = yield* cache.get(
+      simReducedKey(date),
+      ManagerBriefingReport,
+      SIM_JOB_MAX_AGE_MS,
+    );
+    const reducedGen = yield* cache.get(simReducedGenKey(date), SimReducedGen, SIM_JOB_MAX_AGE_MS);
+    if (reducedExisting != null && reducedGen?.gen === gen) {
       return { stage: "already-reduced" } as const;
     }
 
     // Stage 2: find pending units (a unit is "done" only if ALL its chunks exist).
     const pending: Array<number> = [];
     for (let unit = 1; unit <= unitCount; unit += 1) {
-      if (specRebuilt) {
-        pending.push(unit);
-        continue;
-      }
       let complete = true;
       for (let chunk = 0; chunk < chunkCount; chunk += 1) {
         const partial = yield* cache.get(
-          simPartialKey(date, unit, chunk),
+          simPartialKey(date, unit, chunk, gen),
           UnitPartial,
           SIM_JOB_MAX_AGE_MS,
         );
@@ -338,7 +352,7 @@ export const runPrecompute = (deps: {
       for (let unit = 1; unit <= unitCount; unit += 1) {
         for (let chunk = 0; chunk < chunkCount; chunk += 1) {
           const partial = yield* cache.get(
-            simPartialKey(date, unit, chunk),
+            simPartialKey(date, unit, chunk, gen),
             UnitPartial,
             SIM_JOB_MAX_AGE_MS,
           );
@@ -349,22 +363,21 @@ export const runPrecompute = (deps: {
         }
       }
       if (stillPending.length > 0) {
-        if (specRebuilt) {
-          return { stage: "spec-built", unitCount, reduced: false } as const;
-        }
         return { stage: "fan-out", pending: stillPending, reduced: false } as const;
       }
     }
 
-    // Stage 3: all partials present, no reduced artifact yet → reduce + assemble + persist.
+    // Stage 3: all partials present, reduced absent or from an older generation → reduce + assemble
+    // + persist (overwriting any stale reduced in place) and record this generation as the reduced's.
     const candidatePartials: Array<UnitPartial> = [];
     for (let unit = 1; unit <= unitCount; unit += 1) {
-      const summed = yield* sumStoredChunks(cache, date, unit, chunkCount);
+      const summed = yield* sumStoredChunks(cache, date, unit, chunkCount, gen);
       candidatePartials.push(summed);
     }
     const report = reduceSimJob(stored, candidatePartials);
     const briefing = yield* briefingFromReport(report);
     yield* cache.put(simReducedKey(date), briefing);
+    yield* cache.put(simReducedGenKey(date), new SimReducedGen({ gen }));
     return { stage: "reduced" } as const;
   });
 
@@ -375,12 +388,13 @@ const sumStoredChunks = (
   date: string,
   unit: number,
   chunkCount: number,
+  gen: string,
 ): Effect.Effect<UnitPartial, unknown> =>
   Effect.gen(function* () {
     const partials: Array<UnitPartial> = [];
     for (let chunk = 0; chunk < chunkCount; chunk += 1) {
       const partial = yield* cache.get(
-        simPartialKey(date, unit, chunk),
+        simPartialKey(date, unit, chunk, gen),
         UnitPartial,
         SIM_JOB_MAX_AGE_MS,
       );
@@ -469,19 +483,23 @@ export const isBriefingDue = (
     sendHourUtc: options.sendHourUtc,
   });
 
-// The self service binding used to fan out sim-chunk sub-invocations. A Cloudflare Worker CANNOT
-// fetch its OWN public workers.dev hostname (self-loopback is blocked), so the dispatcher must
-// invoke itself through a service binding pointing at the same worker (declared in worker.ts via
-// `Cloudflare.bindWorker(FantasyGMWorker)`). `fetch(new Request(url))` on this binding routes
-// directly to the same worker regardless of the URL host. Provided only in the deployed/dev worker
-// runtime (where the binding exists); ABSENT in tests and any context without a real binding, in
-// which case the dispatcher falls back to the public-URL fetch (see fetchChunk).
-export class SchedulerSelfFetch extends Context.Service<
-  SchedulerSelfFetch,
+// The CROSS-worker service binding used to fan out sim-chunk sub-invocations to the SEPARATE
+// SimChunkWorker script. A Cloudflare Worker cannot offload CPU to ITSELF: a self HTTP fetch to its
+// own workers.dev host is loopback-BLOCKED (zero sub-invocations), and a self service binding kills
+// the parent with exceededCpu (same-worker loop-protection). So the heavy per-unit sim runs in a
+// DIFFERENT worker, invoked via a cross-worker service binding (declared in worker.ts via
+// `env: { SIM_CHUNK_WORKER: simChunkWorker }`), which has its OWN independent CPU budget and no
+// loop-protection. `fetch(new Request(url))` on this binding routes to that worker regardless of
+// URL host. Provided only in the deployed/dev runtime (where the binding exists); resolved
+// OPTIONALLY so the Scheduler layer never fails to construct where the binding is absent (tests,
+// plain `vp dev` without the bound worker). When absent, fetchChunk fails the unit (it stays
+// pending) — there is no public-URL fallback, because there is no functional self-fetch path.
+export class SimChunkBinding extends Context.Service<
+  SimChunkBinding,
   {
     readonly fetch: (request: Request) => Effect.Effect<Response, unknown>;
   }
->()("fantasy-gm/SchedulerSelfFetch") {}
+>()("fantasy-gm/SimChunkBinding") {}
 
 export class Scheduler extends Context.Service<
   Scheduler,
@@ -515,22 +533,18 @@ export class Scheduler extends Context.Service<
       const useStandingsHistory = yield* Config.boolean("USE_STANDINGS_HISTORY").pipe(
         Config.withDefault(FREE_TIER_MODE.defaults.useStandingsHistory),
       );
-      // Self-fetch fan-out config. The token authenticates the internal sim-chunk route; the base
-      // URL is where the dispatcher sends sub-invocations. Cron invocations have NO inbound request
-      // so the origin can't be derived — default to the prod workers.dev URL (same hardcoded
-      // fallback as worker.ts publicOriginFor), overridable via SELF_FETCH_BASE_URL for non-prod.
+      // Fan-out config. The token authenticates the internal sim-chunk route on the SEPARATE
+      // SimChunkWorker. A cross-worker service binding routes to that worker regardless of URL host,
+      // so any in-binding URL host works — the path+query are all that matter.
       const adminToken = yield* Config.string("ADMIN_TRIGGER_TOKEN");
-      const selfFetchBaseUrl = yield* Config.string("SELF_FETCH_BASE_URL").pipe(
-        Config.withDefault(
-          "https://fantasygm-fantasygmworker-prod-cbbdqptg2afhvv5l.ikusner13.workers.dev",
-        ),
-      );
-      // PRIMARY fan-out transport: a service binding pointing at THIS same worker. Resolved
-      // optionally so the layer never fails to construct where the binding is absent (tests, plain
-      // `vp dev`). When present, fetchChunk routes through it; when absent it falls back to a public
-      // global fetch (which is what failed in prod — self-loopback is blocked — so the binding MUST
-      // be present in prod for the fan-out to actually run; see SchedulerSelfFetch / worker.ts).
-      const selfFetch = yield* Effect.serviceOption(SchedulerSelfFetch);
+      // PRIMARY (and only) fan-out transport: the cross-worker service binding to SimChunkWorker.
+      // Resolved optionally so the layer never fails to construct where the binding is absent
+      // (tests, plain `vp dev` without the bound worker). When present, fetchChunk routes through it;
+      // when absent, fetchChunk fails the unit so it stays pending (no public-URL self-fetch
+      // fallback exists — self-loopback is blocked and a self binding kills the parent, so the
+      // cross-worker binding MUST be present in prod for the fan-out to run; see SimChunkBinding /
+      // worker.ts).
+      const simChunkBinding = yield* Effect.serviceOption(SimChunkBinding);
 
       const markComplete = (task: SchedulerTask) =>
         cache
@@ -579,26 +593,32 @@ export class Scheduler extends Context.Service<
           return prepareSimJob(set, snapshot, categoryTotals, contextAt);
         });
 
-      // Stage 2 self-fetch: one Worker sub-invocation per (unit,chunk) with its OWN CPU budget.
+      // Stage 2 fan-out: one SimChunkWorker sub-invocation per (unit,chunk) with its OWN CPU budget.
       // The dispatcher only awaits I/O. Non-2xx is surfaced so the unit stays pending for retry.
       //
-      // The request is dispatched through the SchedulerSelfFetch service binding when available
-      // (the prod/dev worker). A service binding routes to THIS same worker irrespective of the URL
-      // host, so the host portion of `selfFetchBaseUrl` is irrelevant on that path — only the
-      // path+query matter. When the binding is absent (tests, plain `vp dev`) it falls back to a
-      // public global `fetch`. NOTE: the public-fetch fallback to the worker's OWN workers.dev host
-      // is BLOCKED by Cloudflare (self-loopback), which is the very bug this binding fixes — so in
-      // prod the binding MUST be present, otherwise zero sim-chunk sub-invocations are produced.
+      // The request is dispatched through the SimChunkBinding cross-worker service binding. A
+      // service binding routes to the bound (separate) worker irrespective of the URL host, so the
+      // host portion of the URL below is irrelevant — only the path+query matter. When the binding
+      // is ABSENT (tests, plain `vp dev` without the bound worker) the unit is failed so it stays
+      // pending; there is no public-URL fallback (self-loopback is blocked and a self binding kills
+      // the parent — the bugs this cross-worker binding fixes), so the binding MUST be present in
+      // prod for any sim-chunk sub-invocation to be produced.
       const fetchChunk = (date: string, unit: number, chunk: number, chunkCount: number) => {
-        const url = new URL("/internal/sim-chunk", selfFetchBaseUrl);
+        const url = new URL("/internal/sim-chunk", "https://sim-chunk-worker.internal");
         url.searchParams.set("token", adminToken);
         url.searchParams.set("date", date);
         url.searchParams.set("unit", String(unit));
         url.searchParams.set("chunk", String(chunk));
         url.searchParams.set("chunkCount", String(chunkCount));
-        const send = Option.match(selfFetch, {
+        const send: Effect.Effect<Response, unknown> = Option.match(simChunkBinding, {
           onSome: (binding) => binding.fetch(new Request(url.toString())),
-          onNone: () => Effect.promise(() => fetch(url.toString())),
+          onNone: () =>
+            Effect.fail(
+              new SchedulerError({
+                task: "precompute",
+                message: "sim-chunk binding unavailable",
+              }),
+            ),
         });
         return send.pipe(
           Effect.flatMap((response) =>

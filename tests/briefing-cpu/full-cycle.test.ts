@@ -40,7 +40,7 @@ import {
   type SchedulerTask,
 } from "../../src/services/Scheduler";
 import { simReducedKey, simSpecKey } from "../../src/services/SimJob";
-import { runSimChunk } from "../../src/worker";
+import { runSimChunk } from "../../src/services/SimChunk";
 
 const batter = (o: Partial<ConstructorParameters<typeof WeeklyBatterLine>[0]> = {}) =>
   new WeeklyBatterLine({
@@ -188,7 +188,12 @@ describe("full day-cycle (precompute → real send → idle)", () => {
   it("one healthy precompute tick then deliverPreparedBriefing delivers; next tick is idle (sent-today)", async () => {
     const store: Store = new Map();
 
-    // STAGE 1-3: a single healthy dispatcher tick builds spec, fans out, reduces.
+    // ONE-STAGE-PER-TICK: tick 1 builds the spec and returns (spec-build and reduce never co-occur).
+    const specTick = await runPrecomputeTick(store);
+    expect(specTick.stage).toBe("spec-built");
+    expect(store.has(simReducedKey(DATE))).toBe(false);
+
+    // Tick 2 (spec present): fans out + reduces.
     const precompute = await runPrecomputeTick(store);
     expect(precompute.stage).toBe("reduced");
     // A valid ManagerBriefingReport is persisted at the reduced key.

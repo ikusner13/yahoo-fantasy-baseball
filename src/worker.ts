@@ -14,10 +14,10 @@ import { FREE_TIER_MODE } from "./infra/free-tier.ts";
 import { DecisionLogDb, LeagueStateCache } from "./infra/resources.ts";
 import { deliverManagerBriefing } from "./routines/delivery.ts";
 import { dispatchRoutine } from "./routines/dispatch.ts";
-import { ApiCache, ApiCacheError } from "./services/ApiCache.ts";
+import { ApiCache } from "./services/ApiCache.ts";
 import { CalibrationHarness } from "./services/CalibrationHarness.ts";
 import { Db } from "./services/Db.ts";
-import { DecisionEngine, simulateUnit, StoredSimJob } from "./services/DecisionEngine.ts";
+import { DecisionEngine } from "./services/DecisionEngine.ts";
 import { DiscordNotifier } from "./services/DiscordNotifier.ts";
 import { DailyLineupAdvisor } from "./services/DailyLineupAdvisor.ts";
 import { LeagueState } from "./services/LeagueState.ts";
@@ -41,16 +41,12 @@ import { ProjectionData } from "./services/ProjectionData.ts";
 import {
   readSchedulerStatus,
   Scheduler,
-  SchedulerSelfFetch,
+  SimChunkBinding,
   type SchedulerTask,
 } from "./services/Scheduler.ts";
+import SimChunkWorker from "./sim-chunk-worker.ts";
 import { StandingsHistory } from "./services/StandingsHistory.ts";
-import {
-  SIM_JOB_MAX_AGE_MS,
-  simPartialKey,
-  simSpecKey,
-  type UnitPartial,
-} from "./services/SimJob.ts";
+import { runSimChunk } from "./services/SimChunk.ts";
 import { renderManagerBriefingForTelegram } from "./services/TelegramNotifier.ts";
 import { TelegramNotifier } from "./services/TelegramNotifier.ts";
 import { TransactionPlanner } from "./services/TransactionPlanner.ts";
@@ -108,48 +104,6 @@ const publicOriginFor = (
         : "http";
   return `${protocol}://${host}`;
 };
-
-// Result of the /internal/sim-chunk handler core, mapped to HTTP status by the route. Factored out
-// (taking ApiCache via the Effect context, not the live D1) so it can be exercised against an
-// in-memory ApiCache test layer without standing up the full Yahoo/projection stack.
-export type SimChunkResult =
-  | { readonly ok: true; readonly unit: number; readonly chunk: number }
-  | { readonly ok: false; readonly reason: "bad-params"; readonly message: string }
-  | { readonly ok: false; readonly reason: "spec-missing" };
-
-// Pure-CPU-cheap: 1 D1 read of the spec → simulateUnit (one unit) → 1 D1 write of the partial.
-// It must NOT rebuild the projection set or hit Yahoo — every input comes from the persisted spec,
-// and simulateUnit is a pure function. The only service it requires is ApiCache.
-export const runSimChunk = (params: {
-  readonly date: string;
-  readonly unit: number;
-  readonly chunk: number;
-  readonly chunkCount: number;
-}): Effect.Effect<SimChunkResult, ApiCacheError, ApiCache> =>
-  Effect.gen(function* () {
-    const { date, unit, chunk, chunkCount } = params;
-    if (!Number.isInteger(unit) || unit < 0) {
-      return { ok: false, reason: "bad-params", message: "unit must be a non-negative integer" };
-    }
-    if (!Number.isInteger(chunk) || chunk < 0) {
-      return { ok: false, reason: "bad-params", message: "chunk must be a non-negative integer" };
-    }
-    if (!Number.isInteger(chunkCount) || chunkCount < 1) {
-      return {
-        ok: false,
-        reason: "bad-params",
-        message: "chunkCount must be a positive integer",
-      };
-    }
-    const cache = yield* ApiCache;
-    const stored = yield* cache.get(simSpecKey(date), StoredSimJob, SIM_JOB_MAX_AGE_MS);
-    if (stored == null) {
-      return { ok: false, reason: "spec-missing" };
-    }
-    const partial: UnitPartial = simulateUnit(stored, unit, chunk, chunkCount);
-    yield* cache.put(simPartialKey(date, unit, chunk), partial);
-    return { ok: true, unit, chunk };
-  });
 
 const htmlEscape = (value: unknown) =>
   String(value)
@@ -277,7 +231,6 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
       DISCORD_BOT_TOKEN: Config.string("DISCORD_BOT_TOKEN").pipe(Config.option),
       DISCORD_CHANNEL_ID: Config.string("DISCORD_CHANNEL_ID").pipe(Config.option),
       ADMIN_TRIGGER_TOKEN: Config.string("ADMIN_TRIGGER_TOKEN"),
-      SELF_FETCH_BASE_URL: Config.string("SELF_FETCH_BASE_URL").pipe(Config.option),
       MAX_CONFIRMED_LINEUP_BOXSCORES: Config.number("MAX_CONFIRMED_LINEUP_BOXSCORES").pipe(
         Config.withDefault(FREE_TIER_MODE.defaults.maxConfirmedLineupBoxscores),
       ),
@@ -304,38 +257,37 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
     const leagueStateKv = yield* Cloudflare.KVNamespace.bind(LeagueStateCache);
     const runtimeContext = yield* RuntimeContext;
 
-    // Self service binding: register a `service` binding on THIS worker that targets THIS worker.
-    // We can't pass the `FantasyGMWorker` class to `Cloudflare.bindWorker` here — referencing the
-    // class inside its own definition creates a TYPE-level self-reference cycle. Instead we yield
-    // the current worker resource (`Cloudflare.Worker`, the same `yield* Worker` that `bindWorker`
-    // does under the hood) and register a `service` binding named "SELF" whose target is this very
-    // worker's own `workerName`. Cloudflare allows a worker to bind to itself; that self binding
-    // routes internally, unlike a public `fetch` to the worker's own workers.dev host (blocked by
-    // self-loopback — the bug this fixes). The raw Fetcher lands on the runtime env at env.SELF.
+    // CROSS-worker service binding to the SEPARATE SimChunkWorker script (a DIFFERENT worker, the
+    // SAME D1). A worker cannot offload CPU to itself: a self HTTP fetch to its own workers.dev host
+    // is loopback-BLOCKED, and a self service binding kills the parent with exceededCpu (same-worker
+    // loop-protection). So the heavy per-unit sim runs in SimChunkWorker, reached here via a
+    // cross-worker `service` binding (no TS self-reference cycle since it's a DIFFERENT worker), and
+    // that worker has its OWN independent CPU budget. We yield the current worker resource and bind
+    // the SimChunkWorker by its workerName under "SIM_CHUNK_WORKER"; the raw Fetcher lands at
+    // env.SIM_CHUNK_WORKER at exec.
     const self = yield* Cloudflare.Worker;
-    yield* self.bind("SELF", {
-      bindings: [{ type: "service", name: "SELF", service: self.workerName }],
+    const simChunkWorker = yield* SimChunkWorker;
+    yield* self.bind`${simChunkWorker}`({
+      bindings: [{ type: "service", name: "SIM_CHUNK_WORKER", service: simChunkWorker.workerName }],
     });
-    // Resolve the runtime env once at init. At exec the bound Fetcher lives at env.SELF; at
-    // plan/dev-without-binding `WorkerEnvironment` is absent (Option.none) or has no SELF, so
-    // `fetch` closes over `undefined` and falls back to a public global fetch. Capturing it here
-    // keeps the SchedulerSelfFetch.fetch effect requirement-free (R = never).
+    // Resolve the runtime env once at init. At exec the bound Fetcher lives at env.SIM_CHUNK_WORKER;
+    // at plan/dev-without-binding `WorkerEnvironment` is absent (Option.none) or lacks the binding,
+    // so `simChunkBinding` is undefined and the SimChunkBinding layer is NOT provided (the Scheduler
+    // resolves it optionally and fails the unit so it stays pending — no public-URL fallback).
     const workerEnv = yield* Effect.serviceOption(Cloudflare.WorkerEnvironment);
-    const selfBinding = Option.match(workerEnv, {
-      onSome: (env) => (env as Record<string, unknown>)["SELF"],
+    const simChunkFetcher = Option.match(workerEnv, {
+      onSome: (env) => (env as Record<string, unknown>)["SIM_CHUNK_WORKER"],
       onNone: () => undefined,
     }) as { readonly fetch?: (req: Request) => Promise<Response> } | undefined;
-    const SelfFetchLayer = Layer.succeed(
-      SchedulerSelfFetch,
-      SchedulerSelfFetch.of({
-        fetch: (request) =>
-          typeof selfBinding?.fetch === "function"
-            ? Effect.promise(() => selfBinding.fetch!(request))
-            : // No service binding present — fall back to a public global fetch. This is the
-              // pre-fix path and is loopback-blocked in prod, so it must not be the prod path.
-              Effect.promise(() => fetch(request)),
-      }),
-    );
+    const SimChunkBindingLayer =
+      typeof simChunkFetcher?.fetch === "function"
+        ? Layer.succeed(
+            SimChunkBinding,
+            SimChunkBinding.of({
+              fetch: (request) => Effect.promise(() => simChunkFetcher.fetch!(request)),
+            }),
+          )
+        : Layer.empty;
 
     const OAuthLayer = YahooOAuth.layer(kvYahooTokenStore(leagueStateKv, runtimeContext)).pipe(
       Layer.provide(FetchHttpClient.layer),
@@ -393,7 +345,7 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
           YahooLineupExecutorLayer,
           TelegramNotifierLayer,
           DiscordNotifierLayer,
-          SelfFetchLayer,
+          SimChunkBindingLayer,
         ),
       ),
     );

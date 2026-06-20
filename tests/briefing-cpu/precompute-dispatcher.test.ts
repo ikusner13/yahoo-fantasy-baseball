@@ -11,8 +11,17 @@ import {
   WeeklyProjectionSet,
 } from "../../src/services/ProjectionModel";
 import { deliverPreparedBriefing, runPrecompute } from "../../src/services/Scheduler";
-import { simPartialKey, simReducedKey, simSpecKey, UnitPartial } from "../../src/services/SimJob";
-import { runSimChunk } from "../../src/worker";
+import {
+  simPartialKey,
+  simReducedKey,
+  simSpecKey,
+  specGeneration,
+  UnitPartial,
+} from "../../src/services/SimJob";
+import { runSimChunk } from "../../src/services/SimChunk";
+
+// The fixtures build specs with contextAt=undefined, so every partial is keyed by this generation.
+const GEN = specGeneration(undefined);
 
 const batter = (o: Partial<ConstructorParameters<typeof WeeklyBatterLine>[0]> = {}) =>
   new WeeklyBatterLine({
@@ -148,20 +157,30 @@ const run = (store: Store, overrides: Partial<Parameters<typeof runPrecompute>[0
   );
 
 describe("precompute dispatcher (runPrecompute)", () => {
-  it("from empty D1, one healthy tick builds spec → fans out → reduces (prepared briefing persisted)", async () => {
+  it("ONE-STAGE-PER-TICK: tick 1 builds spec and RETURNS (no fan-out, no reduce); a later tick reduces", async () => {
     const store: Store = new Map();
-    const outcome = await run(store);
-    expect(outcome.stage).toBe("reduced");
-    // spec, all candidate partials, and the reduced/prepared briefing are now in D1.
+
+    // Tick 1: builds + persists the spec, then returns spec-built. It MUST NOT have fanned out or
+    // reduced — spec-build and reduce never co-occur (the ~1037ms exceededCpu failure this prevents).
+    const first = await run(store);
+    expect(first.stage).toBe("spec-built");
     expect(store.has(simSpecKey(DATE))).toBe(true);
+    expect(store.has(simPartialKey(DATE, 1, 0, GEN))).toBe(false);
+    expect(store.has(simPartialKey(DATE, 2, 0, GEN))).toBe(false);
+    expect(store.has(simReducedKey(DATE))).toBe(false);
+
+    // Tick 2 (spec present, not stale): fans out + reduces.
+    const second = await run(store);
+    expect(second.stage).toBe("reduced");
     expect(store.has(simReducedKey(DATE))).toBe(true);
-    expect(store.has(simPartialKey(DATE, 1, 0))).toBe(true);
-    expect(store.has(simPartialKey(DATE, 2, 0))).toBe(true);
+    expect(store.has(simPartialKey(DATE, 1, 0, GEN))).toBe(true);
+    expect(store.has(simPartialKey(DATE, 2, 0, GEN))).toBe(true);
   });
 
   it("the persisted prepared briefing decodes as a ManagerBriefingReport", async () => {
     const store: Store = new Map();
-    await run(store);
+    await run(store); // tick 1: spec-built
+    await run(store); // tick 2: reduced
     const row = store.get(simReducedKey(DATE))!;
     const decoded = Schema.decodeUnknownSync(ManagerBriefingReport)(JSON.parse(row.data));
     expect(decoded.summary).toBe("stub");
@@ -180,14 +199,14 @@ describe("precompute dispatcher (runPrecompute)", () => {
     const first = await run(store, { fetchChunk: flakyFetch });
     expect(first.stage).toBe("fan-out");
     if (first.stage === "fan-out") expect(first.pending).toEqual([2]);
-    expect(store.has(simPartialKey(DATE, 1, 0))).toBe(true);
-    expect(store.has(simPartialKey(DATE, 2, 0))).toBe(false);
+    expect(store.has(simPartialKey(DATE, 1, 0, GEN))).toBe(true);
+    expect(store.has(simPartialKey(DATE, 2, 0, GEN))).toBe(false);
     expect(store.has(simReducedKey(DATE))).toBe(false);
 
     // Second tick: unit 1 already done (not re-fetched), unit 2 now succeeds → reduce.
     const second = await run(store, { fetchChunk: stubFetchChunk(store) });
     expect(second.stage).toBe("reduced");
-    expect(store.has(simPartialKey(DATE, 2, 0))).toBe(true);
+    expect(store.has(simPartialKey(DATE, 2, 0, GEN))).toBe(true);
     expect(store.has(simReducedKey(DATE))).toBe(true);
   });
 
@@ -208,7 +227,8 @@ describe("precompute dispatcher (runPrecompute)", () => {
 
   it("once reduced, a subsequent tick is a no-op (already-reduced)", async () => {
     const store: Store = new Map();
-    await run(store);
+    await run(store); // spec-built
+    await run(store); // reduced
     const again = await run(store);
     expect(again.stage).toBe("already-reduced");
   });
@@ -217,7 +237,12 @@ describe("precompute dispatcher (runPrecompute)", () => {
     const store: Store = new Map();
     const specForContext = (contextAt: string) =>
       Effect.sync(() => prepareSimJob(fixtureSet(), undefined, [], contextAt));
-    // Spec built from an older context.
+    // Spec built from an older context: tick 1 builds spec (spec-built), tick 2 reduces.
+    const built = await run(store, {
+      contextAt: "2026-06-20T10:00:00.000Z",
+      buildSpec: specForContext("2026-06-20T10:00:00.000Z"),
+    });
+    expect(built.stage).toBe("spec-built");
     await run(store, {
       contextAt: "2026-06-20T10:00:00.000Z",
       buildSpec: specForContext("2026-06-20T10:00:00.000Z"),
@@ -225,7 +250,14 @@ describe("precompute dispatcher (runPrecompute)", () => {
     expect(store.has(simReducedKey(DATE))).toBe(true);
     const firstSpec = store.get(simSpecKey(DATE))!.data;
 
-    // A newer context arrives: spec must be rebuilt (and re-reduced), not treated as already-reduced.
+    // A newer context arrives: the spec must be REBUILT (spec-built), not treated as already-reduced
+    // — one-stage-per-tick means this rebuild tick returns immediately without re-reducing.
+    const rebuild = await run(store, {
+      contextAt: "2026-06-20T15:00:00.000Z",
+      buildSpec: specForContext("2026-06-20T15:00:00.000Z"),
+    });
+    expect(rebuild.stage).toBe("spec-built");
+    // A following tick (spec now fresh, not stale) re-fans-out and re-reduces.
     const outcome = await run(store, {
       contextAt: "2026-06-20T15:00:00.000Z",
       buildSpec: specForContext("2026-06-20T15:00:00.000Z"),
@@ -251,7 +283,7 @@ describe("precompute dispatcher (runPrecompute)", () => {
     expect(captured).not.toBeUndefined();
     // Independently decode the persisted partials and reduce — must equal the dispatcher's report.
     const partials = stored.stored.spec.candidates.map((_unused, index) => {
-      const row = store.get(simPartialKey(DATE, index + 1, 0))!;
+      const row = store.get(simPartialKey(DATE, index + 1, 0, GEN))!;
       return Schema.decodeUnknownSync(UnitPartial)(JSON.parse(row.data));
     });
     const expected = reduceSimJob(stored, partials);
