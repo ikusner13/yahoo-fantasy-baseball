@@ -13,10 +13,10 @@ import { FREE_TIER_MODE } from "./infra/free-tier.ts";
 import { DecisionLogDb, LeagueStateCache } from "./infra/resources.ts";
 import { deliverManagerBriefing } from "./routines/delivery.ts";
 import { dispatchRoutine } from "./routines/dispatch.ts";
-import { ApiCache } from "./services/ApiCache.ts";
+import { ApiCache, ApiCacheError } from "./services/ApiCache.ts";
 import { CalibrationHarness } from "./services/CalibrationHarness.ts";
 import { Db } from "./services/Db.ts";
-import { DecisionEngine } from "./services/DecisionEngine.ts";
+import { DecisionEngine, simulateUnit, StoredSimJob } from "./services/DecisionEngine.ts";
 import { DiscordNotifier } from "./services/DiscordNotifier.ts";
 import { DailyLineupAdvisor } from "./services/DailyLineupAdvisor.ts";
 import { LeagueState } from "./services/LeagueState.ts";
@@ -39,6 +39,12 @@ import { PlayerIdentity } from "./services/PlayerIdentity.ts";
 import { ProjectionData } from "./services/ProjectionData.ts";
 import { readSchedulerStatus, Scheduler, type SchedulerTask } from "./services/Scheduler.ts";
 import { StandingsHistory } from "./services/StandingsHistory.ts";
+import {
+  SIM_JOB_MAX_AGE_MS,
+  simPartialKey,
+  simSpecKey,
+  type UnitPartial,
+} from "./services/SimJob.ts";
 import { renderManagerBriefingForTelegram } from "./services/TelegramNotifier.ts";
 import { TelegramNotifier } from "./services/TelegramNotifier.ts";
 import { TransactionPlanner } from "./services/TransactionPlanner.ts";
@@ -96,6 +102,48 @@ const publicOriginFor = (
         : "http";
   return `${protocol}://${host}`;
 };
+
+// Result of the /internal/sim-chunk handler core, mapped to HTTP status by the route. Factored out
+// (taking ApiCache via the Effect context, not the live D1) so it can be exercised against an
+// in-memory ApiCache test layer without standing up the full Yahoo/projection stack.
+export type SimChunkResult =
+  | { readonly ok: true; readonly unit: number; readonly chunk: number }
+  | { readonly ok: false; readonly reason: "bad-params"; readonly message: string }
+  | { readonly ok: false; readonly reason: "spec-missing" };
+
+// Pure-CPU-cheap: 1 D1 read of the spec → simulateUnit (one unit) → 1 D1 write of the partial.
+// It must NOT rebuild the projection set or hit Yahoo — every input comes from the persisted spec,
+// and simulateUnit is a pure function. The only service it requires is ApiCache.
+export const runSimChunk = (params: {
+  readonly date: string;
+  readonly unit: number;
+  readonly chunk: number;
+  readonly chunkCount: number;
+}): Effect.Effect<SimChunkResult, ApiCacheError, ApiCache> =>
+  Effect.gen(function* () {
+    const { date, unit, chunk, chunkCount } = params;
+    if (!Number.isInteger(unit) || unit < 0) {
+      return { ok: false, reason: "bad-params", message: "unit must be a non-negative integer" };
+    }
+    if (!Number.isInteger(chunk) || chunk < 0) {
+      return { ok: false, reason: "bad-params", message: "chunk must be a non-negative integer" };
+    }
+    if (!Number.isInteger(chunkCount) || chunkCount < 1) {
+      return {
+        ok: false,
+        reason: "bad-params",
+        message: "chunkCount must be a positive integer",
+      };
+    }
+    const cache = yield* ApiCache;
+    const stored = yield* cache.get(simSpecKey(date), StoredSimJob, SIM_JOB_MAX_AGE_MS);
+    if (stored == null) {
+      return { ok: false, reason: "spec-missing" };
+    }
+    const partial: UnitPartial = simulateUnit(stored, unit, chunk, chunkCount);
+    yield* cache.put(simPartialKey(date, unit, chunk), partial);
+    return { ok: true, unit, chunk };
+  });
 
 const htmlEscape = (value: unknown) =>
   String(value)
@@ -350,6 +398,38 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
             return { calibration, sweep };
           }).pipe(Effect.provide(CalibrationHarnessLayer));
           return yield* HttpServerResponse.json({ ok: true, ...report });
+        }
+
+        if (request.method === "GET" && url.pathname === "/internal/sim-chunk") {
+          const adminToken = yield* Config.string("ADMIN_TRIGGER_TOKEN");
+          if (url.searchParams.get("token") !== adminToken) {
+            return HttpServerResponse.text("Unauthorized", { status: 401 });
+          }
+          const date = url.searchParams.get("date") ?? easternDateKey(new Date());
+          const unit = Number.parseInt(url.searchParams.get("unit") ?? "", 10);
+          const chunk = Number.parseInt(url.searchParams.get("chunk") ?? "0", 10);
+          const chunkCount = Number.parseInt(url.searchParams.get("chunkCount") ?? "1", 10);
+
+          // Minimal layer: ONLY ApiCache (over D1). No Yahoo/projection/DecisionEngine service
+          // layers — simulateUnit is pure and every input is read from the persisted spec, so this
+          // invocation stays tiny and never triggers a Yahoo or projection fetch.
+          const result = yield* runSimChunk({ date, unit, chunk, chunkCount }).pipe(
+            Effect.provide(ApiCacheLayer),
+          );
+
+          if (result.ok) {
+            return yield* HttpServerResponse.json(result);
+          }
+          if (result.reason === "spec-missing") {
+            return yield* HttpServerResponse.json(
+              { ok: false, reason: "spec-missing", date },
+              { status: 409 },
+            );
+          }
+          return yield* HttpServerResponse.json(
+            { ok: false, reason: "bad-params", error: result.message },
+            { status: 400 },
+          );
         }
 
         if (request.method === "GET" && url.pathname === "/admin/yahoo/auth-url") {
