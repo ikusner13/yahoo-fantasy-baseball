@@ -396,7 +396,13 @@ export const simulateMatchup = (
   seed = 62744,
   scoringCategories: ReadonlyArray<Category> = CATEGORIES,
 ) => {
-  const random = createRandom(seed);
+  // Decoupled mine/opp RNG streams (was a single shared `createRandom(62744)` stream). The opp
+  // stream is seeded distinctly + deterministically so it is identical for the baseline and every
+  // candidate call (candidates only append to myRoster) → Common Random Numbers: candidate Δ is
+  // low-variance and chunks are independent/summable. This deliberately changes sim outputs vs. the
+  // old single-stream scheme; calibrated against F8 as of 2026-06-20.
+  const randomMine = createRandom(seed);
+  const randomOpp = createRandom((seed ^ 0x9e3779b9) >>> 0);
   const results = new Map<
     Category,
     { wins: number; ties: number; marginSum: number; marginSqSum: number }
@@ -408,8 +414,8 @@ export const simulateMatchup = (
   );
 
   for (let index = 0; index < iterations; index += 1) {
-    const mine = sampleTeam(myRoster, random);
-    const opponent = sampleTeam(opponentRoster, random);
+    const mine = sampleTeam(myRoster, randomMine);
+    const opponent = sampleTeam(opponentRoster, randomOpp);
     for (const category of scoringCategories) {
       const myValue = mine[category];
       const opponentValue = opponent[category];

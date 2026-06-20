@@ -179,6 +179,29 @@ describe("DecisionEngine Phase 3", () => {
     expect(hits?.winProbability).toBeLessThan(0.1);
   });
 
+  it("draws opponent samples from a stream independent of myRoster size (CRN invariant)", () => {
+    // Decoupled mine/opp RNG: the opponent stream is seeded only from `seed`, so its draws are
+    // identical for the baseline roster and any candidate-augmented roster. To observe this through
+    // simulateMatchup's aggregate output we isolate the opponent: `mine` contributes a DETERMINISTIC
+    // SB total (volatility 0 → 0 sampled draws), so the SB win/margin distribution is decided purely
+    // by the opponent's sampled SB. Appending a candidate pitcher must therefore leave SB's win
+    // probability and margin σ byte-identical. Under the OLD single shared stream, the candidate's
+    // extra draws shifted the opponent's stream offset and these values drifted (e.g. 0.5062 vs
+    // 0.5050, σ 2.213 vs 2.250).
+    const mine = batter({ playerKey: "mine", sb: 5, volatility: 0 });
+    const opponentRoster = [batter({ playerKey: "opp", sb: 5 })];
+    const candidatePitcher = pitcher({ playerKey: "candidate", k: 12, out: 30 });
+
+    const baseline = simulateMatchup([mine], opponentRoster, 5000, 62744);
+    const augmented = simulateMatchup([mine, candidatePitcher], opponentRoster, 5000, 62744);
+
+    const baselineSb = baseline.categories.find((c) => c.category === "SB");
+    const augmentedSb = augmented.categories.find((c) => c.category === "SB");
+    expect(augmentedSb?.winProbability).toBe(baselineSb?.winProbability);
+    expect(augmentedSb?.marginMean).toBe(baselineSb?.marginMean);
+    expect(augmentedSb?.marginStdDev).toBe(baselineSb?.marginStdDev);
+  });
+
   it("ranks add candidates by marginal weekly category EV plus season SGP", () => {
     const report = rankAddCandidates(
       new WeeklyProjectionSet({
