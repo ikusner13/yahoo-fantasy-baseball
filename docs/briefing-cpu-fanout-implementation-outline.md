@@ -1,9 +1,22 @@
 # Implementation outline: briefing CPU fix via self-fetch fan-out
 
-Status: **design locked, not yet implemented.** This is the executable plan for the
-rearchitecture investigated in `docs/engine-followups-briefing-cpu.md` (read that first
-for root-cause evidence). This doc is self-contained: an implementer should not need to
-re-derive the architecture.
+Status: **implemented; live gates pending** (branch `fix/briefing-cpu-fanout`).
+Phases 0–4 are shipped and committed; Phase 5 = local verification DONE, two live gates
+OPEN. This is the executable plan for the rearchitecture investigated in
+`docs/engine-followups-briefing-cpu.md` (read that first for root-cause evidence). This
+doc is self-contained: an implementer should not need to re-derive the architecture.
+
+Phase status:
+
+- [x] Phase 0 — schemas + D1 key helpers (`src/services/SimJob.ts`)
+- [x] Phase 1 — RNG decouple + CRN (`DecisionEngine.ts`)
+- [x] Phase 2 — `prepareSimJob` / `simulateUnit` / `reduceSimJob` decomposition
+- [x] Phase 3 — `/internal/sim-chunk` route + D1 persistence (`worker.ts`, `runSimChunk`)
+- [x] Phase 4 — `precompute` task + dispatcher + read-only `send-briefing` + cross-tick retry
+- [~] Phase 5 — local end-to-end verification DONE (`tests/briefing-cpu/full-cycle.test.ts`,
+  all tests green); **live gates pending**: (1) F8 win-prob calibration re-run on prod
+  D1, (2) prod `cpuTimeMs` confirmation in CF Workers Observability. See the Validation
+  section and `docs/engine-followups-briefing-cpu.md` for exactly how to run each.
 
 ## Goal & locked decisions
 
@@ -277,9 +290,18 @@ Each phase ends with `vp check` + `vp test` green. Work on a feature branch.
 - **Phase 4 — scheduler fan-out + reduce + cross-tick retry.** New `precompute` task,
   dispatcher self-fetch, `send-briefing` reads prepared briefing, `selectDueTask` +
   `DAILY_TASK_LIMITS` updates. Unit-test `selectDueTask` transitions.
-- **Phase 5 — end-to-end verify on prod-like.** Drive a full day-cycle; confirm CPU per
-  invocation and guaranteed daily delivery. Update `docs/engine-followups-briefing-cpu.md`
-  status to "fixed".
+- **Phase 5 — end-to-end verify.** _Local verification DONE_
+  (`tests/briefing-cpu/full-cycle.test.ts`): drives build context → `runPrecompute`
+  (spec → fan-out → reduce, prepared `ManagerBriefingReport` persisted) → real read-only
+  `deliverPreparedBriefing` (stub notifiers, marks sent + copies to delivery key) → next
+  tick idle via `selectDueTask` (sent-today); plus the guarantee that a tick interrupted
+  after stage 1 (no partials) is resumed by a later tick and still delivers. Static CPU
+  sanity confirmed: the dispatcher tick does exactly 1 baseline sim + I/O + reduce; the
+  heavy per-unit sims run in offloaded `/internal/sim-chunk` invocations. _Live gates
+  PENDING_ (need prod D1 + deploy, unavailable locally): F8 win-prob calibration re-run
+  and prod `cpuTimeMs` confirmation — see Validation + `docs/engine-followups-briefing-cpu.md`.
+  `docs/engine-followups-briefing-cpu.md` status updated to "implemented; pending live
+  verification" (NOT "fixed" — the two live gates remain open).
 
 ## Open questions / watch-outs
 

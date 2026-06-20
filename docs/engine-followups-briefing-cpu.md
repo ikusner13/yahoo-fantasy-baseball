@@ -1,8 +1,50 @@
 # Follow-up: morning briefing misses its slot (Worker CPU limit)
 
-Status: **investigated, not yet fixed.** Decision: **rearchitect** to spread the
-briefing compute across many cheap invocations (we have a 100k req/day budget),
-rather than shrinking the sim numbers in a single invocation.
+Status: **implemented; pending live verification.** Implementation is COMPLETE on
+branch `fix/briefing-cpu-fanout` (Phases 0–5). The chosen rearchitecture spreads the
+briefing compute across many cheap invocations (100k req/day budget) instead of
+shrinking the sim in a single invocation.
+
+Shipped architecture (see `docs/briefing-cpu-fanout-implementation-outline.md` for the
+full design):
+
+- **Per-unit self-fetch fan-out.** The heavy Monte Carlo runs as N separate
+  `GET /internal/sim-chunk` sub-invocations (one per candidate unit, baseline sim lives
+  in the spec stage). Each sub-invocation gets its OWN CPU budget; the dispatcher tick
+  only does one baseline sim + I/O awaits + reduce/assembly.
+- **D1 partials, gated stages.** Stage 1 builds+persists the `SimJobSpec`; stage 2 fans
+  out and each chunk persists its `UnitPartial`; stage 3 sums partials → `DecisionReport`
+  → prepared `ManagerBriefingReport` at `simReducedKey(date)`. `send-briefing` is now a
+  read-only delivery of that prepared artifact.
+- **Cross-tick retry = daily-delivery guarantee.** Every stage gates on D1 state, so a
+  died dispatcher/chunk is resumed on the next of the 12 daily ticks; delivery succeeds
+  across ticks until `sentToday`.
+- **CRN / decoupled RNG streams.** `simulateMatchup` now draws `mine` and `opponent`
+  from independent streams (seed + per-unit stride + chunk), giving Common Random Numbers
+  across candidates (low-variance Δ) and exact chunk-sum equivalence. This **changes sim
+  outputs** vs. the old single-`62744`-stream design.
+
+Local verification is DONE and green (`vp check` + `vp test`, including the new
+`tests/briefing-cpu/full-cycle.test.ts` end-to-end cycle + guarantee test). TWO gates
+require live infra and remain **OPEN** (cannot be run from this environment — no live
+Yahoo OAuth, no prod D1, no deploy):
+
+- [ ] **F8 win-prob calibration re-run** — the RNG/CRN change shifts `simulateMatchup`
+      predictions, so the recorded-outcome backtest (`src/services/CalibrationHarness.ts`,
+      Brier/log-loss over closed-out weeks) MUST be re-run on prod data and accepted as
+      the new baseline. Run: `GET /admin/calibration?token=<ADMIN_TRIGGER_TOKEN>` (add
+      `&sweep=volatility` for the coefficient sweep) against the prod worker. The local
+      `nr gm:calibration` only validates SGP denominators (deterministic standings input,
+      RNG-independent) — it does NOT cover the win-prob backtest.
+- [ ] **Prod CPU confirmation** — observe per-invocation `cpuTimeMs` stays low for the
+      new `precompute` (cron) and `/internal/sim-chunk` (fetch) invocations in CF Workers
+      Observability for worker `fantasygm-fantasygmworker-prod-cbbdqptg2afhvv5l` (filter
+      `$metadata.service`=worker, `$metadata.origin`=`cron`/`fetch`; inspect
+      `$workers.outcome`/`$workers.cpuTimeMs`). Drive a real day-cycle via repeated
+      `POST /admin/run/scheduler-tick` and confirm spec → partials → reduced → delivered
+      with no `exceededCpu`.
+
+Original investigation (root-cause evidence) follows.
 
 ## Symptom
 
