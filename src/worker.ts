@@ -3,6 +3,7 @@ import * as Cloudflare from "alchemy/Cloudflare";
 import * as Config from "effect/Config";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import { FetchHttpClient } from "effect/unstable/http";
 import { HttpServerRequest } from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
@@ -37,7 +38,12 @@ import {
 } from "./services/ManagerBriefing.ts";
 import { PlayerIdentity } from "./services/PlayerIdentity.ts";
 import { ProjectionData } from "./services/ProjectionData.ts";
-import { readSchedulerStatus, Scheduler, type SchedulerTask } from "./services/Scheduler.ts";
+import {
+  readSchedulerStatus,
+  Scheduler,
+  SchedulerSelfFetch,
+  type SchedulerTask,
+} from "./services/Scheduler.ts";
 import { StandingsHistory } from "./services/StandingsHistory.ts";
 import {
   SIM_JOB_MAX_AGE_MS,
@@ -298,6 +304,39 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
     const leagueStateKv = yield* Cloudflare.KVNamespace.bind(LeagueStateCache);
     const runtimeContext = yield* RuntimeContext;
 
+    // Self service binding: register a `service` binding on THIS worker that targets THIS worker.
+    // We can't pass the `FantasyGMWorker` class to `Cloudflare.bindWorker` here — referencing the
+    // class inside its own definition creates a TYPE-level self-reference cycle. Instead we yield
+    // the current worker resource (`Cloudflare.Worker`, the same `yield* Worker` that `bindWorker`
+    // does under the hood) and register a `service` binding named "SELF" whose target is this very
+    // worker's own `workerName`. Cloudflare allows a worker to bind to itself; that self binding
+    // routes internally, unlike a public `fetch` to the worker's own workers.dev host (blocked by
+    // self-loopback — the bug this fixes). The raw Fetcher lands on the runtime env at env.SELF.
+    const self = yield* Cloudflare.Worker;
+    yield* self.bind("SELF", {
+      bindings: [{ type: "service", name: "SELF", service: self.workerName }],
+    });
+    // Resolve the runtime env once at init. At exec the bound Fetcher lives at env.SELF; at
+    // plan/dev-without-binding `WorkerEnvironment` is absent (Option.none) or has no SELF, so
+    // `fetch` closes over `undefined` and falls back to a public global fetch. Capturing it here
+    // keeps the SchedulerSelfFetch.fetch effect requirement-free (R = never).
+    const workerEnv = yield* Effect.serviceOption(Cloudflare.WorkerEnvironment);
+    const selfBinding = Option.match(workerEnv, {
+      onSome: (env) => (env as Record<string, unknown>)["SELF"],
+      onNone: () => undefined,
+    }) as { readonly fetch?: (req: Request) => Promise<Response> } | undefined;
+    const SelfFetchLayer = Layer.succeed(
+      SchedulerSelfFetch,
+      SchedulerSelfFetch.of({
+        fetch: (request) =>
+          typeof selfBinding?.fetch === "function"
+            ? Effect.promise(() => selfBinding.fetch!(request))
+            : // No service binding present — fall back to a public global fetch. This is the
+              // pre-fix path and is loopback-blocked in prod, so it must not be the prod path.
+              Effect.promise(() => fetch(request)),
+      }),
+    );
+
     const OAuthLayer = YahooOAuth.layer(kvYahooTokenStore(leagueStateKv, runtimeContext)).pipe(
       Layer.provide(FetchHttpClient.layer),
     );
@@ -354,6 +393,7 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
           YahooLineupExecutorLayer,
           TelegramNotifierLayer,
           DiscordNotifierLayer,
+          SelfFetchLayer,
         ),
       ),
     );

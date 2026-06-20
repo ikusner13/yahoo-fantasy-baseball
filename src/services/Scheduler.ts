@@ -3,6 +3,7 @@ import * as Context from "effect/Context";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import { ApiCache } from "./ApiCache.ts";
@@ -468,6 +469,20 @@ export const isBriefingDue = (
     sendHourUtc: options.sendHourUtc,
   });
 
+// The self service binding used to fan out sim-chunk sub-invocations. A Cloudflare Worker CANNOT
+// fetch its OWN public workers.dev hostname (self-loopback is blocked), so the dispatcher must
+// invoke itself through a service binding pointing at the same worker (declared in worker.ts via
+// `Cloudflare.bindWorker(FantasyGMWorker)`). `fetch(new Request(url))` on this binding routes
+// directly to the same worker regardless of the URL host. Provided only in the deployed/dev worker
+// runtime (where the binding exists); ABSENT in tests and any context without a real binding, in
+// which case the dispatcher falls back to the public-URL fetch (see fetchChunk).
+export class SchedulerSelfFetch extends Context.Service<
+  SchedulerSelfFetch,
+  {
+    readonly fetch: (request: Request) => Effect.Effect<Response, unknown>;
+  }
+>()("fantasy-gm/SchedulerSelfFetch") {}
+
 export class Scheduler extends Context.Service<
   Scheduler,
   {
@@ -510,6 +525,12 @@ export class Scheduler extends Context.Service<
           "https://fantasygm-fantasygmworker-prod-cbbdqptg2afhvv5l.ikusner13.workers.dev",
         ),
       );
+      // PRIMARY fan-out transport: a service binding pointing at THIS same worker. Resolved
+      // optionally so the layer never fails to construct where the binding is absent (tests, plain
+      // `vp dev`). When present, fetchChunk routes through it; when absent it falls back to a public
+      // global fetch (which is what failed in prod — self-loopback is blocked — so the binding MUST
+      // be present in prod for the fan-out to actually run; see SchedulerSelfFetch / worker.ts).
+      const selfFetch = yield* Effect.serviceOption(SchedulerSelfFetch);
 
       const markComplete = (task: SchedulerTask) =>
         cache
@@ -560,22 +581,41 @@ export class Scheduler extends Context.Service<
 
       // Stage 2 self-fetch: one Worker sub-invocation per (unit,chunk) with its OWN CPU budget.
       // The dispatcher only awaits I/O. Non-2xx is surfaced so the unit stays pending for retry.
-      const fetchChunk = (date: string, unit: number, chunk: number, chunkCount: number) =>
-        Effect.tryPromise({
-          try: async () => {
-            const url = new URL("/internal/sim-chunk", selfFetchBaseUrl);
-            url.searchParams.set("token", adminToken);
-            url.searchParams.set("date", date);
-            url.searchParams.set("unit", String(unit));
-            url.searchParams.set("chunk", String(chunk));
-            url.searchParams.set("chunkCount", String(chunkCount));
-            const response = await fetch(url.toString());
-            if (!response.ok) {
-              throw new Error(`sim-chunk ${unit}/${chunk} failed: ${response.status}`);
-            }
-          },
-          catch: (error) => new SchedulerError({ task: "precompute", message: String(error) }),
+      //
+      // The request is dispatched through the SchedulerSelfFetch service binding when available
+      // (the prod/dev worker). A service binding routes to THIS same worker irrespective of the URL
+      // host, so the host portion of `selfFetchBaseUrl` is irrelevant on that path — only the
+      // path+query matter. When the binding is absent (tests, plain `vp dev`) it falls back to a
+      // public global `fetch`. NOTE: the public-fetch fallback to the worker's OWN workers.dev host
+      // is BLOCKED by Cloudflare (self-loopback), which is the very bug this binding fixes — so in
+      // prod the binding MUST be present, otherwise zero sim-chunk sub-invocations are produced.
+      const fetchChunk = (date: string, unit: number, chunk: number, chunkCount: number) => {
+        const url = new URL("/internal/sim-chunk", selfFetchBaseUrl);
+        url.searchParams.set("token", adminToken);
+        url.searchParams.set("date", date);
+        url.searchParams.set("unit", String(unit));
+        url.searchParams.set("chunk", String(chunk));
+        url.searchParams.set("chunkCount", String(chunkCount));
+        const send = Option.match(selfFetch, {
+          onSome: (binding) => binding.fetch(new Request(url.toString())),
+          onNone: () => Effect.promise(() => fetch(url.toString())),
         });
+        return send.pipe(
+          Effect.flatMap((response) =>
+            response.ok
+              ? Effect.void
+              : Effect.fail(
+                  new SchedulerError({
+                    task: "precompute",
+                    message: `sim-chunk ${unit}/${chunk} failed: ${response.status}`,
+                  }),
+                ),
+          ),
+          Effect.mapError(
+            (error) => new SchedulerError({ task: "precompute", message: String(error) }),
+          ),
+        );
+      };
 
       const runTask = (task: SchedulerTask, options: { readonly force?: boolean } = {}) =>
         Effect.gen(function* () {
