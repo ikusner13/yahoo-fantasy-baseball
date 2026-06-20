@@ -271,6 +271,7 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
       DISCORD_BOT_TOKEN: Config.string("DISCORD_BOT_TOKEN").pipe(Config.option),
       DISCORD_CHANNEL_ID: Config.string("DISCORD_CHANNEL_ID").pipe(Config.option),
       ADMIN_TRIGGER_TOKEN: Config.string("ADMIN_TRIGGER_TOKEN"),
+      SELF_FETCH_BASE_URL: Config.string("SELF_FETCH_BASE_URL").pipe(Config.option),
       MAX_CONFIRMED_LINEUP_BOXSCORES: Config.number("MAX_CONFIRMED_LINEUP_BOXSCORES").pipe(
         Config.withDefault(FREE_TIER_MODE.defaults.maxConfirmedLineupBoxscores),
       ),
@@ -348,6 +349,8 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
           ProjectionDataLayer,
           RuntimeLayer,
           ManagerBriefingLayer,
+          WeeklyProjectionLayer,
+          StandingsHistoryLayer,
           YahooLineupExecutorLayer,
           TelegramNotifierLayer,
           DiscordNotifierLayer,
@@ -651,9 +654,13 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
           }
           const task = url.pathname.split("/").at(-1) as SchedulerTask;
           if (
-            !["refresh-projections", "refresh-context", "apply-lineup", "send-briefing"].includes(
-              task,
-            )
+            ![
+              "refresh-projections",
+              "refresh-context",
+              "precompute",
+              "apply-lineup",
+              "send-briefing",
+            ].includes(task)
           ) {
             return HttpServerResponse.text("Unknown task", { status: 400 });
           }

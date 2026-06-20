@@ -24,7 +24,8 @@ describe("Phase 0 health payload", () => {
         "refresh-projections": 2,
         "refresh-context": 12,
         "apply-lineup": 1,
-        "send-briefing": 2,
+        precompute: 12,
+        "send-briefing": 12,
       },
       defaults: {
         maxConfirmedLineupBoxscores: 0,

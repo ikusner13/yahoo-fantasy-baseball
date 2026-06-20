@@ -10,6 +10,7 @@ import {
   type TransactionPlan,
   type TransactionStep,
 } from "./TransactionPlanner.ts";
+import type { DecisionReport } from "./DecisionEngine.ts";
 import { ApiCache, type ApiCacheError } from "./ApiCache.ts";
 import {
   DailyLineupAdvisor,
@@ -1033,6 +1034,13 @@ export class ManagerBriefing extends Context.Service<
   ManagerBriefing,
   {
     readonly currentBriefing: Effect.Effect<ManagerBriefingReport, ManagerBriefingError>;
+    // Assemble the SAME ManagerBriefingReport from an ALREADY-COMPUTED DecisionReport (the
+    // precompute reduce output): build the plan via planFromReport (no sim) + today's lineup +
+    // write status → buildManagerBriefing. Net behavior matches the live currentBriefing path given
+    // the same DecisionReport.
+    readonly briefingFromReport: (
+      report: DecisionReport,
+    ) => Effect.Effect<ManagerBriefingReport, ManagerBriefingError>;
   }
 >()("fantasy-gm/ManagerBriefing") {
   static readonly layerLive = Layer.effect(
@@ -1041,9 +1049,10 @@ export class ManagerBriefing extends Context.Service<
       const planner = yield* TransactionPlanner;
       const lineupAdvisor = yield* DailyLineupAdvisor;
       const cache = yield* ApiCache;
-      return ManagerBriefing.of({
-        currentBriefing: Effect.gen(function* () {
-          const plan = yield* planner.currentPlan;
+      // Shared post-plan assembly: lineup + write status + buildManagerBriefing. Used by both the
+      // live path and the precompute path so they produce an identical report from the same plan.
+      const briefingFromPlan = (plan: TransactionPlan) =>
+        Effect.gen(function* () {
           const lineup = yield* lineupAdvisor.forDate(easternDateKey(new Date()));
           const writeStatus = yield* cache.get(
             LAST_MANAGER_WRITE_STATUS_CACHE_KEY,
@@ -1051,7 +1060,17 @@ export class ManagerBriefing extends Context.Service<
             30 * 24 * 60 * 60 * 1000,
           );
           return buildManagerBriefing(plan, lineup, writeStatus);
+        });
+      return ManagerBriefing.of({
+        currentBriefing: Effect.gen(function* () {
+          const plan = yield* planner.currentPlan;
+          return yield* briefingFromPlan(plan);
         }).pipe(Effect.mapError(mapError)),
+        briefingFromReport: (report) =>
+          Effect.gen(function* () {
+            const plan = yield* planner.planFromReport(report);
+            return yield* briefingFromPlan(plan);
+          }).pipe(Effect.mapError(mapError)),
       });
     }),
   );

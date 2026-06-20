@@ -893,6 +893,12 @@ export class TransactionPlanner extends Context.Service<
   TransactionPlanner,
   {
     readonly currentPlan: Effect.Effect<TransactionPlan, TransactionPlannerError>;
+    // Build a plan from an ALREADY-COMPUTED DecisionReport (the precompute reduce output) without
+    // re-running rankAddCandidates/the sim. Fetches only the cheap set+snapshot inputs that
+    // planTransactions needs, so reduce stays CPU-cheap.
+    readonly planFromReport: (
+      report: DecisionReport,
+    ) => Effect.Effect<TransactionPlan, TransactionPlannerError>;
   }
 >()("fantasy-gm/TransactionPlanner") {
   static readonly layerLive = Layer.effect(
@@ -904,6 +910,14 @@ export class TransactionPlanner extends Context.Service<
       const useStandingsHistory = yield* Config.boolean("USE_STANDINGS_HISTORY").pipe(
         Config.withDefault(true),
       );
+      const planFromReport = (report: DecisionReport) =>
+        Effect.gen(function* () {
+          const [set, snapshot] = yield* Effect.all([
+            weeklyProjections.currentMatchup,
+            leagueState.snapshot,
+          ]);
+          return planTransactions(report, set, snapshot);
+        }).pipe(Effect.mapError(mapError));
       return TransactionPlanner.of({
         currentPlan: Effect.gen(function* () {
           const [set, snapshot] = yield* Effect.all([
@@ -914,6 +928,7 @@ export class TransactionPlanner extends Context.Service<
           const report = rankAddCandidates(set, snapshot, categoryTotals);
           return planTransactions(report, set, snapshot);
         }).pipe(Effect.mapError(mapError)),
+        planFromReport,
       });
     }),
   );

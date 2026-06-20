@@ -18,6 +18,7 @@ import { ManagerWriteStatus } from "../../src/services/ManagerWriteStatus";
 const canRunAll = {
   "refresh-projections": true,
   "refresh-context": true,
+  precompute: true,
   "apply-lineup": true,
   "send-briefing": true,
 };
@@ -196,6 +197,91 @@ describe("Scheduler", () => {
         false,
       ),
     ).toBe("send-briefing");
+  });
+
+  it("runs precompute when today's prepared briefing is missing (no spec / pending / pre-reduce)", () => {
+    const now = new Date("2026-06-07T17:00:00.000Z");
+    const base = {
+      projectionAt: Date.parse("2026-06-07T12:00:00.000Z"),
+      contextAt: Date.parse("2026-06-07T16:30:00.000Z"),
+      applyLineupAt: Date.parse("2026-06-07T16:55:00.000Z"),
+    };
+    // preparedBriefingMissing=true covers all of: no spec, spec-but-pending-partials, and
+    // all-partials-but-no-reduced — in every case the reduce artifact is absent → precompute.
+    expect(selectDueTask(now, base, canRunAll, true, true, true, true)).toBe("precompute");
+  });
+
+  it("sends the briefing once the prepared briefing exists and it has not been sent today", () => {
+    const now = new Date("2026-06-07T17:00:00.000Z");
+    expect(
+      selectDueTask(
+        now,
+        {
+          projectionAt: Date.parse("2026-06-07T12:00:00.000Z"),
+          contextAt: Date.parse("2026-06-07T16:30:00.000Z"),
+          applyLineupAt: Date.parse("2026-06-07T16:55:00.000Z"),
+        },
+        canRunAll,
+        true,
+        true,
+        true,
+        false, // prepared briefing present
+      ),
+    ).toBe("send-briefing");
+  });
+
+  it("is idle once the briefing has been sent today even if the prepared artifact is gone", () => {
+    const now = new Date("2026-06-07T18:00:00.000Z");
+    expect(
+      selectDueTask(
+        now,
+        {
+          projectionAt: Date.parse("2026-06-07T12:00:00.000Z"),
+          contextAt: Date.parse("2026-06-07T17:00:00.000Z"),
+          applyLineupAt: Date.parse("2026-06-07T17:20:00.000Z"),
+          sendAt: Date.parse("2026-06-07T17:29:07.788Z"),
+        },
+        canRunAll,
+        true,
+        true,
+        true,
+        true, // prepared missing, but already sent today → no re-precompute, idle
+      ),
+    ).toBe("idle");
+  });
+
+  it("still refreshes projections/context before precompute", () => {
+    const now = new Date("2026-06-07T17:00:00.000Z");
+    // stale projections beat precompute
+    expect(
+      selectDueTask(
+        now,
+        {
+          projectionAt: Date.parse("2026-06-06T04:00:00.000Z"),
+          contextAt: Date.parse("2026-06-07T16:30:00.000Z"),
+        },
+        canRunAll,
+        true,
+        true,
+        true,
+        true,
+      ),
+    ).toBe("refresh-projections");
+    // stale context (briefing window) beats precompute
+    expect(
+      selectDueTask(
+        now,
+        {
+          projectionAt: Date.parse("2026-06-07T12:00:00.000Z"),
+          contextAt: Date.parse("2026-06-07T15:45:00.000Z"),
+        },
+        canRunAll,
+        true,
+        true,
+        true,
+        true,
+      ),
+    ).toBe("refresh-context");
   });
 
   it("does not count forced manual task runs against automatic scheduler caps", () => {

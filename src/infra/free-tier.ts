@@ -7,7 +7,11 @@ export const FREE_TIER_MODE = {
     "refresh-projections": 2,
     "refresh-context": 12,
     "apply-lineup": 1,
-    "send-briefing": 2,
+    // precompute runs many ticks/day (spec → fan-out → reduce, gated on D1 state) and must be able
+    // to retry a died dispatcher on every tick; send-briefing reads the prepared briefing and
+    // retries across all 12 daily ticks until it lands — both need generous headroom over the cap.
+    precompute: 12,
+    "send-briefing": 12,
   },
   defaults: {
     maxConfirmedLineupBoxscores: 0,
