@@ -1093,6 +1093,26 @@ export const reduceSimJob = (
   });
 };
 
+// Cheap reuse path for F8 calibration. Derives the baseline MatchupSimulation + the exact simulated
+// rosters from an ALREADY-built spec, whose baseline counters are computed ONCE during spec-build and
+// persisted. Calibration previously called rankAddCandidates on every scheduler tick, which re-ran
+// the FULL Monte Carlo (baseline + every candidate) inline — the dominant per-tick CPU cost that
+// defeated the fan-out and stalled the briefing pipeline. This is pure aggregation (no sim).
+export const calibrationInputsFromSpec = (
+  stored: StoredSimJob,
+): {
+  readonly baseline: MatchupSimulation;
+  readonly myRoster: ReadonlyArray<WeeklyLine>;
+  readonly opponentRoster: ReadonlyArray<WeeklyLine>;
+} => ({
+  baseline: aggregateMatchup(
+    stored.stored.baseline,
+    stored.stored.spec.scoringCategories as ReadonlyArray<Category>,
+  ),
+  myRoster: stored.stored.spec.scoringRoster as ReadonlyArray<WeeklyLine>,
+  opponentRoster: stored.stored.spec.opponentRoster as ReadonlyArray<WeeklyLine>,
+});
+
 // Thin wrapper: in-process composition of the three stages. Keeps every existing caller
 // (currentBriefing live path, /admin/preview/briefing?live=1, /debug/*) working unchanged, and is
 // byte-identical to the old monolithic implementation. With chunkCount defaulting to 1, the seed is

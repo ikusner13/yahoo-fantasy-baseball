@@ -33,7 +33,9 @@ export const dispatchRoutine = (routine: RoutineName) =>
       yield* Effect.log("scheduler tick completed", { task });
       // F8 calibration loop. Best-effort: a failure here must never break the scheduler tick.
       yield* recordCurrentWeekPrediction.pipe(
-        Effect.tap((week) => Effect.log("calibration prediction recorded", { week })),
+        Effect.tap((week) =>
+          week == null ? Effect.void : Effect.log("calibration prediction recorded", { week }),
+        ),
         Effect.catch((error) =>
           Effect.logWarning("calibration record skipped", { error: String(error) }),
         ),

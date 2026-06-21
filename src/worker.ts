@@ -66,7 +66,8 @@ const registerCron = (
     | WeeklyProjections
     | StandingsHistory
     | YahooClient
-    | CalibrationHarness,
+    | CalibrationHarness
+    | ApiCache,
     unknown,
     unknown
   >,
@@ -360,6 +361,7 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
       StandingsHistoryLayer,
       YahooLayer,
       CalibrationHarnessLayer,
+      ApiCacheLayer,
     );
 
     yield* Effect.all(CRON_ROUTINES.map((cron) => registerCron(cron, RoutineLayer)));

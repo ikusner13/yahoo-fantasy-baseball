@@ -1,15 +1,15 @@
 import * as Effect from "effect/Effect";
 
+import { ApiCache } from "../services/ApiCache.ts";
 import {
   buildRetrospective,
   CalibrationHarness,
   isClosedOut,
   outcomesFromTotals,
 } from "../services/CalibrationHarness.ts";
-import { activeWeeklyLines, rankAddCandidates } from "../services/DecisionEngine.ts";
+import { calibrationInputsFromSpec, StoredSimJob } from "../services/DecisionEngine.ts";
 import { LeagueState } from "../services/LeagueState.ts";
-import { StandingsHistory } from "../services/StandingsHistory.ts";
-import { WeeklyProjections } from "../services/WeeklyProjections.ts";
+import { SIM_JOB_MAX_AGE_MS, simSpecKey } from "../services/SimJob.ts";
 import { YahooClient } from "../services/YahooClient.ts";
 
 // F8 recording loop. Two idempotent steps, run from the scheduler tick:
@@ -17,31 +17,44 @@ import { YahooClient } from "../services/YahooClient.ts";
 //    exact rosters that were simulated, so the week can be re-scored/swept later.
 //  - closeOutPreviousWeek: once a week is final, attach the realized per-category totals.
 
-// Records (or refreshes) the open retrospective for the current matchup week. Upserting on every
-// tick keeps the most-informed prediction of the week — lineups/projections firm up as the week
-// progresses — which is what we want to grade. Returns the week recorded.
+const easternDateKey = (date: Date) => {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const part = (type: string) => parts.find((entry) => entry.type === type)?.value ?? "00";
+  return `${part("year")}-${part("month")}-${part("day")}`;
+};
+
+// Records (or refreshes) the open retrospective for the current matchup week. REUSES today's
+// already-built sim spec (its baseline counters + the exact simulated rosters are computed ONCE
+// during spec-build and persisted) instead of re-running the full Monte Carlo on every tick — that
+// inline re-sim was the dominant per-tick CPU cost that defeated the fan-out and stalled the briefing
+// pipeline. If today's spec is not built yet, this is a no-op (a later tick records once it lands).
+// Returns the week recorded, or undefined when there is nothing to record yet.
 export const recordCurrentWeekPrediction = Effect.gen(function* () {
-  const weeklyProjections = yield* WeeklyProjections;
+  const cache = yield* ApiCache;
   const leagueState = yield* LeagueState;
-  const standingsHistory = yield* StandingsHistory;
   const harness = yield* CalibrationHarness;
 
-  const [set, snapshot, totals] = yield* Effect.all([
-    weeklyProjections.currentMatchup,
-    leagueState.snapshot,
-    standingsHistory.categoryTotals,
-  ]);
+  const snapshot = yield* leagueState.snapshot;
+  const stored = yield* cache.get(
+    simSpecKey(easternDateKey(new Date())),
+    StoredSimJob,
+    SIM_JOB_MAX_AGE_MS,
+  );
+  if (stored == null) return undefined;
 
-  const report = rankAddCandidates(set, snapshot, totals);
-  const myRoster = activeWeeklyLines(set.myRoster, snapshot);
-
+  const { baseline, myRoster, opponentRoster } = calibrationInputsFromSpec(stored);
   yield* harness.record(
     buildRetrospective({
       week: snapshot.matchup.week,
       recordedAt: new Date().toISOString(),
-      baseline: report.baseline,
+      baseline,
       myRoster,
-      opponentRoster: set.opponentRoster,
+      opponentRoster,
     }),
   );
 
