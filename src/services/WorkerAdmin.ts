@@ -12,7 +12,7 @@ export type D1ProxyMethod = "run" | "all" | "get" | "values";
 
 export type D1ProxyQuery = {
   readonly sql: string;
-  readonly params: ReadonlyArray<unknown>;
+  readonly params: unknown[];
   readonly method: D1ProxyMethod;
 };
 
@@ -20,7 +20,7 @@ export type D1ProxySingleRequest = D1ProxyQuery;
 export type D1ProxyBatchRequest = {
   readonly queries: ReadonlyArray<D1ProxyQuery>;
 };
-export type D1ProxyResult = { readonly rows: ReadonlyArray<unknown> };
+export type D1ProxyResult = { readonly rows?: unknown };
 export type D1ProxyBatchResponse = { readonly results: ReadonlyArray<D1ProxyResult> };
 
 export class WorkerAdminError extends Data.TaggedError("WorkerAdminError")<{
@@ -83,27 +83,37 @@ export const postD1ProxyQuery = (
 
 export const sqliteProxyCallback =
   (endpoint: string) =>
-  (sql: string, params: unknown[], method: D1ProxyMethod): Promise<{ rows: unknown }> =>
+  (sql: string, params: unknown[], method: D1ProxyMethod): Promise<{ rows: unknown[] }> =>
     Effect.runPromise(
       postD1ProxyQuery(endpoint, { sql, params, method }).pipe(
         Effect.flatMap((result) =>
           "results" in result
             ? Effect.fail(new WorkerAdminError({ message: "Unexpected batch response" }))
-            : Effect.succeed({ rows: method === "get" ? result.rows[0] : [...result.rows] }),
+            : Effect.succeed({
+                rows:
+                  method === "get" && Array.isArray(result.rows) && result.rows.length === 0
+                    ? (undefined as unknown as unknown[])
+                    : (result.rows as unknown[]),
+              }),
         ),
       ),
     );
 
 export const sqliteProxyBatchCallback =
   (endpoint: string) =>
-  (queries: ReadonlyArray<D1ProxyQuery>): Promise<ReadonlyArray<{ rows: unknown }>> =>
+  (queries: D1ProxyQuery[]): Promise<Array<{ rows: unknown[] }>> =>
     Effect.runPromise(
       postD1ProxyQuery(endpoint, { queries }).pipe(
         Effect.flatMap((result) =>
           "results" in result
             ? Effect.succeed(
                 result.results.map((entry, index) => ({
-                  rows: queries[index]?.method === "get" ? entry.rows[0] : entry.rows,
+                  rows:
+                    queries[index]?.method === "get" &&
+                    Array.isArray(entry.rows) &&
+                    entry.rows.length === 0
+                      ? (undefined as unknown as unknown[])
+                      : (entry.rows as unknown[]),
                 })),
               )
             : Effect.fail(new WorkerAdminError({ message: "Unexpected single-query response" })),
@@ -117,11 +127,9 @@ export const dbNodeLayerFromEndpoint = (endpoint: string) =>
     Db.of({
       d1: undefined as never,
       drizzle: Effect.succeed(
-        drizzleSqliteProxy(
-          sqliteProxyCallback(endpoint) as never,
-          sqliteProxyBatchCallback(endpoint) as never,
-          { schema },
-        ) as unknown as AppDatabase,
+        drizzleSqliteProxy(sqliteProxyCallback(endpoint), sqliteProxyBatchCallback(endpoint), {
+          schema,
+        }) as unknown as AppDatabase,
       ),
     }),
   );
@@ -134,11 +142,9 @@ export const DbNode = Layer.effect(
     return Db.of({
       d1: undefined as never,
       drizzle: Effect.succeed(
-        drizzleSqliteProxy(
-          sqliteProxyCallback(endpoint) as never,
-          sqliteProxyBatchCallback(endpoint) as never,
-          { schema },
-        ) as unknown as AppDatabase,
+        drizzleSqliteProxy(sqliteProxyCallback(endpoint), sqliteProxyBatchCallback(endpoint), {
+          schema,
+        }) as unknown as AppDatabase,
       ),
     });
   }),

@@ -1,10 +1,12 @@
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import * as dotenv from "dotenv";
+import * as Config from "effect/Config";
 import type * as Context from "effect/Context";
 import { Console, Effect, Layer } from "effect";
 import { FetchHttpClient } from "effect/unstable/http";
 import { pathToFileURL } from "node:url";
 
+import { FREE_TIER_MODE } from "../src/infra/free-tier.ts";
 import { ApiCache } from "../src/services/ApiCache.ts";
 import { closeOutPreviousWeek, recordCurrentWeekPrediction } from "../src/routines/calibration.ts";
 import { deliverManagerBriefing } from "../src/routines/delivery.ts";
@@ -38,7 +40,12 @@ import {
   simSpecKey,
   specGeneration,
 } from "../src/services/SimJob.ts";
-import { easternDateKey, taskStateKey, TaskState } from "../src/services/Scheduler.ts";
+import {
+  easternDateKey,
+  recordSchedulerTaskSuccess,
+  taskStateKey,
+  TaskState,
+} from "../src/services/Scheduler.ts";
 
 type Flags = {
   readonly dryRun: boolean;
@@ -73,28 +80,37 @@ export const parseFlags = (argv: ReadonlyArray<string>): Flags => {
 export const sentToday = (completedAt: string | undefined, now = new Date()) =>
   completedAt != null && easternDateKey(new Date(completedAt)) === easternDateKey(now);
 
-const loadEnv = (path: string) =>
-  Effect.sync(() => {
-    dotenv.config({ path, override: true, quiet: true });
-  });
+export const loadEnvFile = (path: string) => {
+  dotenv.config({ path, override: true, quiet: true });
+};
 
 const writeTaskSuccess = (cache: ApiCacheService) =>
-  cache.put(taskStateKey("send-briefing"), { completedAt: new Date().toISOString() });
+  recordSchedulerTaskSuccess(cache, "send-briefing");
 
 const calibrationBestEffort = Effect.all(
   [
-    recordCurrentWeekPrediction.pipe(Effect.catch((error) => Effect.logWarning(error))),
-    closeOutPreviousWeek.pipe(Effect.catch((error) => Effect.logWarning(error))),
+    recordCurrentWeekPrediction.pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("record calibration prediction failed", { cause: String(cause) }),
+      ),
+    ),
+    closeOutPreviousWeek.pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("close calibration week failed", { cause: String(cause) }),
+      ),
+    ),
   ],
   { concurrency: 1 },
 );
 
 export const runDailyBriefing = (flags: Flags) =>
   Effect.gen(function* () {
-    yield* loadEnv(flags.envFile);
     const startedAt = Date.now();
     const today = easternDateKey(new Date());
     const cache = yield* ApiCache;
+    const useStandingsHistory = yield* Config.boolean("USE_STANDINGS_HISTORY").pipe(
+      Config.withDefault(FREE_TIER_MODE.defaults.useStandingsHistory),
+    );
 
     if (!flags.force && !flags.dryRun) {
       const sendState = yield* cache.get(taskStateKey("send-briefing"), TaskState, 7 * 24 * HOUR);
@@ -115,15 +131,15 @@ export const runDailyBriefing = (flags: Flags) =>
     const standingsHistory = yield* StandingsHistory;
     const managerBriefing = yield* ManagerBriefing;
 
-    const [set, snapshot, categoryTotals, contextState] = yield* Effect.all(
+    const [set, snapshot, contextState] = yield* Effect.all(
       [
         weeklyProjections.currentMatchup,
         leagueState.snapshot,
-        standingsHistory.categoryTotals,
         cache.get(taskStateKey("refresh-context"), TaskState, 7 * 24 * HOUR),
       ],
       { concurrency: 1 },
     );
+    const categoryTotals = useStandingsHistory ? yield* standingsHistory.categoryTotals : [];
 
     const stored = prepareSimJob(set, snapshot, categoryTotals, contextState?.completedAt);
     const gen = specGeneration(stored.stored.contextAt);
@@ -176,54 +192,61 @@ export const runDailyBriefing = (flags: Flags) =>
     return { status: "sent" as const, coinFlips, durationMs: Date.now() - startedAt };
   });
 
-const YahooLayer = YahooClient.layer.pipe(
-  Layer.provide(Layer.mergeAll(YahooOAuthRemote, FetchHttpClient.layer)),
-);
-const LeagueStateLayer = LeagueState.layerLive.pipe(Layer.provide(YahooLayer));
-const ApiCacheLayer = ApiCache.layerLive.pipe(Layer.provide(DbNode));
-const LiveProjectionDataLayer = ProjectionData.layerLive.pipe(Layer.provide(FetchHttpClient.layer));
-const ProjectionDataLayer = ProjectionData.layerCached.pipe(
-  Layer.provide(Layer.mergeAll(LiveProjectionDataLayer, ApiCacheLayer)),
-);
-const PlayerIdentityLayer = PlayerIdentity.layerLive.pipe(Layer.provide(DbNode));
-const WeeklyProjectionLayer = WeeklyProjections.layerLive.pipe(
-  Layer.provide(
-    Layer.mergeAll(LeagueStateLayer, YahooLayer, ProjectionDataLayer, PlayerIdentityLayer),
-  ),
-);
-const StandingsHistoryLayer = StandingsHistory.layerLive.pipe(Layer.provide(YahooLayer));
-const DailyLineupAdvisorLayer = DailyLineupAdvisor.layerLive.pipe(Layer.provide(YahooLayer));
-const TransactionPlannerLayer = TransactionPlanner.layerLive.pipe(
-  Layer.provide(Layer.mergeAll(WeeklyProjectionLayer, LeagueStateLayer, StandingsHistoryLayer)),
-);
-const ManagerBriefingLayer = ManagerBriefing.layerLive.pipe(
-  Layer.provide(Layer.mergeAll(TransactionPlannerLayer, DailyLineupAdvisorLayer, ApiCacheLayer)),
-);
-const TelegramNotifierLayer = TelegramNotifier.layerLive.pipe(Layer.provide(FetchHttpClient.layer));
-const DiscordNotifierLayer = DiscordNotifier.layerLive.pipe(Layer.provide(FetchHttpClient.layer));
-const CalibrationHarnessLayer = CalibrationHarness.layerLive.pipe(Layer.provide(DbNode));
+export const makeAppLayer = () => {
+  const YahooLayer = YahooClient.layer.pipe(
+    Layer.provide(Layer.mergeAll(YahooOAuthRemote, FetchHttpClient.layer)),
+  );
+  const LeagueStateLayer = LeagueState.layerLive.pipe(Layer.provide(YahooLayer));
+  const ApiCacheLayer = ApiCache.layerLive.pipe(Layer.provide(DbNode));
+  const LiveProjectionDataLayer = ProjectionData.layerLive.pipe(
+    Layer.provide(FetchHttpClient.layer),
+  );
+  const ProjectionDataLayer = ProjectionData.layerCached.pipe(
+    Layer.provide(Layer.mergeAll(LiveProjectionDataLayer, ApiCacheLayer)),
+  );
+  const PlayerIdentityLayer = PlayerIdentity.layerLive.pipe(Layer.provide(DbNode));
+  const WeeklyProjectionLayer = WeeklyProjections.layerLive.pipe(
+    Layer.provide(
+      Layer.mergeAll(LeagueStateLayer, YahooLayer, ProjectionDataLayer, PlayerIdentityLayer),
+    ),
+  );
+  const StandingsHistoryLayer = StandingsHistory.layerLive.pipe(Layer.provide(YahooLayer));
+  const DailyLineupAdvisorLayer = DailyLineupAdvisor.layerLive.pipe(Layer.provide(YahooLayer));
+  const TransactionPlannerLayer = TransactionPlanner.layerLive.pipe(
+    Layer.provide(Layer.mergeAll(WeeklyProjectionLayer, LeagueStateLayer, StandingsHistoryLayer)),
+  );
+  const ManagerBriefingLayer = ManagerBriefing.layerLive.pipe(
+    Layer.provide(Layer.mergeAll(TransactionPlannerLayer, DailyLineupAdvisorLayer, ApiCacheLayer)),
+  );
+  const TelegramNotifierLayer = TelegramNotifier.layerLive.pipe(
+    Layer.provide(FetchHttpClient.layer),
+  );
+  const DiscordNotifierLayer = DiscordNotifier.layerLive.pipe(Layer.provide(FetchHttpClient.layer));
+  const CalibrationHarnessLayer = CalibrationHarness.layerLive.pipe(Layer.provide(DbNode));
 
-const AppLayer = Layer.mergeAll(
-  DbNode,
-  ApiCacheLayer,
-  YahooLayer,
-  LeagueStateLayer,
-  ProjectionDataLayer,
-  WeeklyProjectionLayer,
-  StandingsHistoryLayer,
-  DailyLineupAdvisorLayer,
-  TransactionPlannerLayer,
-  ManagerBriefingLayer,
-  TelegramNotifierLayer,
-  DiscordNotifierLayer,
-  CalibrationHarnessLayer,
-);
-
-const main = runDailyBriefing(parseFlags(process.argv.slice(2))).pipe(
-  Effect.provide(AppLayer),
-  Effect.provide(NodeServices.layer),
-);
+  return Layer.mergeAll(
+    DbNode,
+    ApiCacheLayer,
+    YahooLayer,
+    LeagueStateLayer,
+    ProjectionDataLayer,
+    WeeklyProjectionLayer,
+    StandingsHistoryLayer,
+    DailyLineupAdvisorLayer,
+    TransactionPlannerLayer,
+    ManagerBriefingLayer,
+    TelegramNotifierLayer,
+    DiscordNotifierLayer,
+    CalibrationHarnessLayer,
+  );
+};
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
-  NodeRuntime.runMain(main as Effect.Effect<unknown, unknown, never>);
+  const flags = parseFlags(process.argv.slice(2));
+  loadEnvFile(flags.envFile);
+  const main = runDailyBriefing(flags).pipe(
+    Effect.provide(makeAppLayer()),
+    Effect.provide(NodeServices.layer),
+  );
+  NodeRuntime.runMain(main);
 }

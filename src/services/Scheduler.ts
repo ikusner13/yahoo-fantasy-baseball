@@ -59,14 +59,14 @@ const SCHEDULER_TASKS = [
 ] as const satisfies ReadonlyArray<SchedulerTask>;
 
 export const taskStateKey = (task: SchedulerTask) => `scheduler:task:${task}:last-success:v1`;
-const taskRunCountKey = (task: SchedulerTask, date: string) =>
+export const taskRunCountKey = (task: SchedulerTask, date: string) =>
   `scheduler:task:${task}:run-count:${date}:v2`;
 const DAILY_TASK_LIMITS = FREE_TIER_MODE.dailyTaskLimits satisfies Record<SchedulerTask, number>;
 export class TaskState extends Schema.Class<TaskState>("TaskState")({
   completedAt: Schema.String,
 }) {}
 
-class TaskRunCount extends Schema.Class<TaskRunCount>("TaskRunCount")({
+export class TaskRunCount extends Schema.Class<TaskRunCount>("TaskRunCount")({
   date: Schema.String,
   count: Schema.Finite,
 }) {}
@@ -100,7 +100,23 @@ type ApiCacheService = {
     schema: Schema.Schema<A>,
     maxAgeMs: number,
   ) => Effect.Effect<A | undefined, unknown>;
+  readonly put?: <A>(key: string, value: A) => Effect.Effect<void, unknown>;
 };
+
+export const recordSchedulerTaskSuccess = (
+  cache: ApiCacheService & {
+    readonly put: <A>(key: string, value: A) => Effect.Effect<void, unknown>;
+  },
+  task: SchedulerTask,
+  now = new Date(),
+) =>
+  Effect.gen(function* () {
+    const date = easternDateKey(now);
+    const count =
+      (yield* cache.get(taskRunCountKey(task, date), TaskRunCount, 36 * HOUR))?.count ?? 0;
+    yield* cache.put(taskRunCountKey(task, date), new TaskRunCount({ date, count: count + 1 }));
+    yield* cache.put(taskStateKey(task), new TaskState({ completedAt: now.toISOString() }));
+  });
 
 export const readSchedulerStatus = (cache: ApiCacheService, now = new Date()) =>
   Effect.gen(function* () {

@@ -392,15 +392,15 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
               query.params.length > 0
                 ? binding.prepare(query.sql).bind(...query.params)
                 : binding.prepare(query.sql);
-            if (query.method === "values") {
+            if (query.method === "values" || query.method === "all") {
               return { rows: await statement.raw() };
             }
             if (query.method === "get") {
-              const row = await statement.first();
-              return { rows: row == null ? [] : [row] };
+              const rows = await statement.raw();
+              return { rows: rows[0] ?? [] };
             }
-            const result = query.method === "run" ? await statement.run() : await statement.all();
-            return { rows: result.results ?? [] };
+            await statement.run();
+            return { rows: [] };
           }),
         ),
       );

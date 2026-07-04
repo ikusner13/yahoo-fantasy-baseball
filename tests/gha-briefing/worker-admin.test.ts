@@ -1,5 +1,8 @@
+import { drizzle as drizzleSqliteProxy } from "drizzle-orm/sqlite-proxy";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
+import { apiCache } from "../../src/db/schema";
+import * as schema from "../../src/db/schema";
 import {
   sqliteProxyBatchCallback,
   sqliteProxyCallback,
@@ -24,10 +27,10 @@ afterEach(() => {
 describe("sqlite-proxy worker admin adapter", () => {
   it.each([
     ["run", [], []],
-    ["all", [{ id: 1 }], [{ id: 1 }]],
+    ["all", [[1, "a"]], [[1, "a"]]],
     ["values", [[1, "a"]], [[1, "a"]]],
   ] satisfies ReadonlyArray<[D1ProxyMethod, ReadonlyArray<unknown>, unknown]>)(
-    "maps %s requests and rows",
+    "maps %s requests and raw rows",
     async (method, rows, expectedRows) => {
       const fetch = mockFetchJson({ rows });
       const result = await sqliteProxyCallback(endpoint)("select 1", ["x"], method);
@@ -41,17 +44,17 @@ describe("sqlite-proxy worker admin adapter", () => {
     },
   );
 
-  it("unwraps get rows for drizzle's sqlite-proxy get mapper", async () => {
-    mockFetchJson({ rows: [{ id: 1, name: "A" }] });
+  it("passes a get response through as one raw row for drizzle's get mapper", async () => {
+    mockFetchJson({ rows: [1, "A"] });
 
     const result = await sqliteProxyCallback(endpoint)("select 1", [], "get");
 
-    expect(result.rows).toEqual({ id: 1, name: "A" });
+    expect(result.rows).toEqual([1, "A"]);
   });
 
   it("maps batch requests and unwraps get responses by query method", async () => {
     const fetch = mockFetchJson({
-      results: [{ rows: [{ id: 1 }] }, { rows: [[2]] }],
+      results: [{ rows: [1, "A"] }, { rows: [[2]] }],
     });
     const queries = [
       { sql: "select 1", params: [], method: "get" as const },
@@ -60,7 +63,7 @@ describe("sqlite-proxy worker admin adapter", () => {
 
     const result = await sqliteProxyBatchCallback(endpoint)(queries);
 
-    expect(result).toEqual([{ rows: { id: 1 } }, { rows: [[2]] }]);
+    expect(result).toEqual([{ rows: [1, "A"] }, { rows: [[2]] }]);
     expect(fetch).toHaveBeenCalledWith(endpoint, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -74,5 +77,40 @@ describe("sqlite-proxy worker admin adapter", () => {
     await expect(sqliteProxyCallback(endpoint)("select bad", [], "all")).rejects.toThrow(
       "400 Bad Request",
     );
+  });
+
+  it("round-trips real column values through drizzle sqlite-proxy", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const requestBody = typeof init?.body === "string" ? init.body : "";
+      const body = JSON.parse(requestBody) as {
+        readonly sql: string;
+        readonly params: ReadonlyArray<unknown>;
+        readonly method: D1ProxyMethod;
+      };
+      expect(body.method).toBe("all");
+      expect(body.sql).toContain("api_cache");
+      return new Response(
+        JSON.stringify({
+          rows: [["cache-key", '{"ok":true}', "2026-07-04T12:00:00.000Z"]],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+    const db = drizzleSqliteProxy(
+      sqliteProxyCallback(endpoint),
+      sqliteProxyBatchCallback(endpoint),
+      { schema },
+    );
+
+    const rows = await db.select().from(apiCache).limit(1);
+
+    expect(rows).toEqual([
+      {
+        cacheKey: "cache-key",
+        data: '{"ok":true}',
+        updatedAt: "2026-07-04T12:00:00.000Z",
+      },
+    ]);
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 });
