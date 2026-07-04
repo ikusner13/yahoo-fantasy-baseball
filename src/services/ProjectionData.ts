@@ -591,7 +591,19 @@ export class ProjectionData extends Context.Service<
             ),
       });
 
-      const fetchOdds = (cacheKey: string) => Cache.get(oddsCache, cacheKey);
+      // Odds is a refinement (implied-run context), not a hard input. A failure here — most
+      // commonly the-odds-api returning 401 OUT_OF_USAGE_CREDITS once the monthly free quota is
+      // spent — must NOT take down weeklyContext (and with it refresh-context/precompute and the
+      // whole daily briefing). Degrade to no odds and warn, mirroring fetchStatcastContext /
+      // fetchConfirmedLineups. Odds resume automatically once the quota resets or the key is bumped.
+      const fetchOdds = (cacheKey: string) =>
+        Cache.get(oddsCache, cacheKey).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("odds fetch failed; continuing without implied-run context", {
+              error: String(error),
+            }).pipe(Effect.as<ReadonlyArray<OddsEvent>>([])),
+          ),
+        );
 
       const fetchSavantCustom = (
         type: "batter" | "pitcher",
