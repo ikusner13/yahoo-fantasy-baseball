@@ -54,6 +54,7 @@ import { WeeklyProjections } from "./services/WeeklyProjections.ts";
 import { YahooClient } from "./services/YahooClient.ts";
 import { YahooLineupExecutor } from "./services/YahooLineupExecutor.ts";
 import { kvYahooTokenStore, YahooOAuth } from "./services/YahooOAuth.ts";
+import type { D1ProxyMethod, D1ProxyQuery } from "./services/WorkerAdmin.ts";
 
 const registerCron = (
   cron: (typeof CRON_ROUTINES)[number],
@@ -212,6 +213,24 @@ const htmlResponse = (body: string, options?: { readonly status?: number }) =>
     contentType: "text/html; charset=utf-8",
   });
 
+const D1_PROXY_METHODS = new Set(["run", "all", "get", "values"]);
+
+const isD1ProxyMethod = (method: unknown): method is D1ProxyMethod =>
+  typeof method === "string" && D1_PROXY_METHODS.has(method);
+
+const parseD1ProxyQuery = (value: unknown): D1ProxyQuery | undefined => {
+  if (value == null || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record["sql"] !== "string") return undefined;
+  if (!Array.isArray(record["params"])) return undefined;
+  if (!isD1ProxyMethod(record["method"])) return undefined;
+  return {
+    sql: record["sql"],
+    params: record["params"],
+    method: record["method"],
+  };
+};
+
 export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>()(
   "FantasyGMWorker",
   {
@@ -364,6 +383,28 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
       ApiCacheLayer,
     );
 
+    const runD1ProxyQuery = (query: D1ProxyQuery) =>
+      d1.raw.pipe(
+        Effect.provideService(RuntimeContext, runtimeContext),
+        Effect.flatMap((binding) =>
+          Effect.promise(async () => {
+            const statement =
+              query.params.length > 0
+                ? binding.prepare(query.sql).bind(...query.params)
+                : binding.prepare(query.sql);
+            if (query.method === "values") {
+              return { rows: await statement.raw() };
+            }
+            if (query.method === "get") {
+              const row = await statement.first();
+              return { rows: row == null ? [] : [row] };
+            }
+            const result = query.method === "run" ? await statement.run() : await statement.all();
+            return { rows: result.results ?? [] };
+          }),
+        ),
+      );
+
     yield* Effect.all(CRON_ROUTINES.map((cron) => registerCron(cron, RoutineLayer)));
 
     return {
@@ -395,6 +436,56 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
             return { calibration, sweep };
           }).pipe(Effect.provide(CalibrationHarnessLayer));
           return yield* HttpServerResponse.json({ ok: true, ...report });
+        }
+
+        if (request.method === "GET" && url.pathname === "/admin/yahoo/access-token") {
+          const adminToken = yield* Config.string("ADMIN_TRIGGER_TOKEN");
+          if (url.searchParams.get("token") !== adminToken) {
+            return HttpServerResponse.text("Unauthorized", { status: 401 });
+          }
+          const accessToken = yield* Effect.gen(function* () {
+            const oauth = yield* YahooOAuth;
+            return yield* oauth.getAccessToken;
+          }).pipe(Effect.provide(OAuthLayer));
+          return yield* HttpServerResponse.json({ accessToken });
+        }
+
+        if (request.method === "POST" && url.pathname === "/admin/d1/query") {
+          const adminToken = yield* Config.string("ADMIN_TRIGGER_TOKEN");
+          if (url.searchParams.get("token") !== adminToken) {
+            return HttpServerResponse.text("Unauthorized", { status: 401 });
+          }
+          const body = yield* request.json.pipe(Effect.catch(() => Effect.succeed(undefined)));
+          if (body == null || typeof body !== "object") {
+            return yield* HttpServerResponse.json(
+              { ok: false, error: "Expected JSON request body" },
+              { status: 400 },
+            );
+          }
+          const record = body as Record<string, unknown>;
+          if (Array.isArray(record["queries"])) {
+            const queries = record["queries"].map(parseD1ProxyQuery);
+            if (queries.some((query) => query == null)) {
+              return yield* HttpServerResponse.json(
+                { ok: false, error: "Invalid D1 query batch body" },
+                { status: 400 },
+              );
+            }
+            const results = yield* Effect.all(
+              queries.map((query) => runD1ProxyQuery(query!)),
+              { concurrency: 1 },
+            );
+            return yield* HttpServerResponse.json({ results });
+          }
+          const query = parseD1ProxyQuery(record);
+          if (query == null) {
+            return yield* HttpServerResponse.json(
+              { ok: false, error: "Invalid D1 query body" },
+              { status: 400 },
+            );
+          }
+          const result = yield* runD1ProxyQuery(query);
+          return yield* HttpServerResponse.json(result);
         }
 
         if (request.method === "GET" && url.pathname === "/internal/sim-chunk") {

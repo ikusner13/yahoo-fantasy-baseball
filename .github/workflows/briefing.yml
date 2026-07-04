@@ -1,0 +1,36 @@
+name: daily-briefing
+
+on:
+  schedule:
+    - cron: "45 12 * * *"
+    - cron: "30 14 * * *"
+  workflow_dispatch:
+
+concurrency: briefing
+
+jobs:
+  briefing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          cache: true
+      - run: vp install
+      - run: vp run gm:briefing
+        env:
+          WORKER_BASE_URL: https://fantasygm-fantasygmworker-prod-cbbdqptg2afhvv5l.ikusner13.workers.dev
+          ADMIN_TRIGGER_TOKEN: ${{ secrets.ADMIN_TRIGGER_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          YAHOO_LEAGUE_ID: ${{ secrets.YAHOO_LEAGUE_ID }}
+          YAHOO_TEAM_ID: ${{ secrets.YAHOO_TEAM_ID }}
+          USE_STANDINGS_HISTORY: "true"
+      - name: alert on failure
+        if: failure()
+        run: |
+          curl -sS "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode text="GHA briefing job failed: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"

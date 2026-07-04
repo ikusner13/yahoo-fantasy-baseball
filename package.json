@@ -23,7 +23,7 @@
     "gm:lineup-check": "tsx scripts/fantasy-cli.ts lineup-check",
     "gm:pitcher-starts": "tsx scripts/fantasy-cli.ts pitcher-starts",
     "gm:matchup": "tsx scripts/fantasy-cli.ts matchup",
-    "gm:briefing": "tsx scripts/fantasy-cli.ts briefing",
+    "gm:briefing": "tsx scripts/daily-briefing.ts",
     "gm:next": "tsx scripts/fantasy-cli.ts next",
     "gm:briefing:worker": "tsx scripts/fantasy-cli.ts briefing --worker",
     "gm:briefing:cached": "tsx scripts/fantasy-cli.ts briefing --cached",
