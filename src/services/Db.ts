@@ -1,5 +1,4 @@
 import type { D1ConnectionClient } from "alchemy/Cloudflare";
-import { RuntimeContext } from "alchemy";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -8,6 +7,10 @@ import * as Layer from "effect/Layer";
 import * as schema from "../db/schema.ts";
 
 export type AppDatabase = DrizzleD1Database<typeof schema>;
+
+const runtimeContextTag = Effect.promise(() =>
+  import("alchemy").then((alchemy) => alchemy.RuntimeContext),
+);
 
 export class Db extends Context.Service<
   Db,
@@ -20,11 +23,12 @@ export class Db extends Context.Service<
     return Layer.effect(
       Db,
       Effect.gen(function* () {
-        const runtimeContext = yield* RuntimeContext;
+        const tag = yield* runtimeContextTag;
+        const runtimeContext = yield* tag;
         return Db.of({
           d1: connection,
           drizzle: connection.raw.pipe(
-            Effect.provideService(RuntimeContext, runtimeContext),
+            Effect.provideService(tag, runtimeContext),
             Effect.map((binding) => drizzle(binding, { schema })),
           ),
         });
