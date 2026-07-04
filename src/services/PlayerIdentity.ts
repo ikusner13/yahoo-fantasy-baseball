@@ -1,4 +1,4 @@
-import { inArray } from "drizzle-orm";
+import { inArray, sql } from "drizzle-orm";
 import * as Context from "effect/Context";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
@@ -7,6 +7,13 @@ import * as Schema from "effect/Schema";
 
 import { playerIds } from "../db/schema.ts";
 import { Db } from "./Db.ts";
+
+// D1 rejects statements with more than 100 bound params; keep headroom for generated SQL changes.
+export const D1_MAX_BOUND_PARAMS_SAFE = 90;
+const PLAYER_IDENTITY_VALUE_PARAMS_PER_ROW = 7;
+const PLAYER_IDENTITY_UPSERT_CHUNK_SIZE = Math.floor(
+  D1_MAX_BOUND_PARAMS_SAFE / PLAYER_IDENTITY_VALUE_PARAMS_PER_ROW,
+);
 
 export class PlayerIdentityRow extends Schema.Class<PlayerIdentityRow>("PlayerIdentityRow")({
   yahooId: Schema.String,
@@ -35,6 +42,24 @@ const toRow = (row: typeof playerIds.$inferSelect) =>
     team: toOptional(row.team),
   });
 
+const chunksOf = <A>(values: ReadonlyArray<A>, size: number) => {
+  const chunks: Array<ReadonlyArray<A>> = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+};
+
+const toInsertValue = (row: PlayerIdentityRow): typeof playerIds.$inferInsert => ({
+  yahooId: row.yahooId,
+  mlbId: row.mlbId ?? null,
+  fangraphsId: row.fangraphsId ?? null,
+  fangraphsKey: row.fangraphsKey ?? null,
+  name: row.name,
+  positions: row.positions ?? null,
+  team: row.team ?? null,
+});
+
 export class PlayerIdentity extends Context.Service<
   PlayerIdentity,
   {
@@ -56,11 +81,18 @@ export class PlayerIdentity extends Context.Service<
         Effect.gen(function* () {
           if (yahooIds.length === 0) return new Map<string, PlayerIdentityRow>();
           const rows = yield* Effect.tryPromise({
-            try: () =>
-              database
-                .select()
-                .from(playerIds)
-                .where(inArray(playerIds.yahooId, [...yahooIds])),
+            try: async () => {
+              const results = [];
+              for (const chunk of chunksOf(yahooIds, D1_MAX_BOUND_PARAMS_SAFE)) {
+                results.push(
+                  ...(await database
+                    .select()
+                    .from(playerIds)
+                    .where(inArray(playerIds.yahooId, [...chunk]))),
+                );
+              }
+              return results;
+            },
             catch: (error) => new PlayerIdentityError({ message: String(error) }),
           });
           return new Map(rows.map((row) => [row.yahooId, toRow(row)]));
@@ -71,27 +103,19 @@ export class PlayerIdentity extends Context.Service<
           if (rows.length === 0) return;
           yield* Effect.tryPromise({
             try: async () => {
-              for (const row of rows) {
+              for (const chunk of chunksOf(rows, PLAYER_IDENTITY_UPSERT_CHUNK_SIZE)) {
                 await database
                   .insert(playerIds)
-                  .values({
-                    yahooId: row.yahooId,
-                    mlbId: row.mlbId ?? null,
-                    fangraphsId: row.fangraphsId ?? null,
-                    fangraphsKey: row.fangraphsKey ?? null,
-                    name: row.name,
-                    positions: row.positions ?? null,
-                    team: row.team ?? null,
-                  })
+                  .values(chunk.map(toInsertValue))
                   .onConflictDoUpdate({
                     target: playerIds.yahooId,
                     set: {
-                      mlbId: row.mlbId ?? null,
-                      fangraphsId: row.fangraphsId ?? null,
-                      fangraphsKey: row.fangraphsKey ?? null,
-                      name: row.name,
-                      positions: row.positions ?? null,
-                      team: row.team ?? null,
+                      mlbId: sql`excluded.mlb_id`,
+                      fangraphsId: sql`excluded.fangraphs_id`,
+                      fangraphsKey: sql`excluded.fangraphs_key`,
+                      name: sql`excluded.name`,
+                      positions: sql`excluded.positions`,
+                      team: sql`excluded.team`,
                     },
                   });
               }
