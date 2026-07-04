@@ -1,11 +1,15 @@
 import * as Effect from "effect/Effect";
+import type * as Context from "effect/Context";
 
 import { ApiCache } from "../services/ApiCache.ts";
 import {
   buildRetrospective,
   CalibrationHarness,
+  CalibrationVolatilityScale,
+  computeVolatilityScaleUpdate,
   isClosedOut,
   outcomesFromTotals,
+  VOLATILITY_SCALE_CACHE_KEY,
 } from "../services/CalibrationHarness.ts";
 import { calibrationInputsFromSpec, StoredSimJob } from "../services/DecisionEngine.ts";
 import { LeagueState } from "../services/LeagueState.ts";
@@ -59,6 +63,21 @@ export const recordCurrentWeekPrediction = Effect.gen(function* () {
   );
 
   return snapshot.matchup.week;
+});
+
+export const loadVolatilityScale = (cache: Context.Service.Shape<typeof ApiCache>) =>
+  cache
+    .get(VOLATILITY_SCALE_CACHE_KEY, CalibrationVolatilityScale, 365 * 24 * 60 * 60 * 1000)
+    .pipe(Effect.map((record) => record?.scale ?? 1));
+
+export const sweepAndPersistVolatilityScale = Effect.gen(function* () {
+  const cache = yield* ApiCache;
+  const harness = yield* CalibrationHarness;
+  const retros = yield* harness.load();
+  const update = computeVolatilityScaleUpdate(retros, [0.8, 1, 1.1, 1.25, 1.5, 1.75, 2]);
+  if (update == null) return undefined;
+  yield* cache.put(VOLATILITY_SCALE_CACHE_KEY, update);
+  return update;
 });
 
 // Closes out the just-completed week (current − 1) if it was recorded and is still open. Pulls that

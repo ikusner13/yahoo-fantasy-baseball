@@ -11,6 +11,7 @@ import {
   brierScore,
   buildRetrospective,
   calibrationReport,
+  computeVolatilityScaleUpdate,
   isClosedOut,
   logLoss,
   makeCalibrationHarnessTest,
@@ -19,7 +20,7 @@ import {
   scoredPredictions,
   sweepCoefficient,
 } from "../../src/services/CalibrationHarness";
-import { simulateMatchup } from "../../src/services/DecisionEngine";
+import { ENGINE_VERSION, simulateMatchup } from "../../src/services/DecisionEngine";
 import { WeeklyBatterLine } from "../../src/services/ProjectionModel";
 
 const prediction = (category: string, winProbability: number, tieProbability = 0) =>
@@ -35,6 +36,7 @@ const closedWeek = (
 ) =>
   new WeeklyRetrospective({
     week,
+    engineVersion: ENGINE_VERSION,
     recordedAt: "2026-06-19T00:00:00.000Z",
     predictions,
     outcomes,
@@ -55,6 +57,7 @@ describe("CalibrationHarness scoring (F8)", () => {
   it("returns null metrics when there is no closed-out history", () => {
     const open = new WeeklyRetrospective({
       week: 1,
+      engineVersion: ENGINE_VERSION,
       recordedAt: "2026-06-19T00:00:00.000Z",
       predictions: [prediction("HR", 0.6)],
     });
@@ -135,6 +138,7 @@ const batterLine = (playerKey: string, high: boolean) =>
 const sweepWeek = () =>
   new WeeklyRetrospective({
     week: 1,
+    engineVersion: ENGINE_VERSION,
     recordedAt: "2026-06-19T00:00:00.000Z",
     predictions: [prediction("R", 0.95), prediction("HR", 0.95)],
     // Engine was confidently favored in R and HR but actually LOST both — overconfident.
@@ -166,6 +170,74 @@ describe("CalibrationHarness coefficient sweep (F8)", () => {
     const result = sweepCoefficient("volatility", [noInputs], [1, 2]);
     expect(result.points.every((point) => point.predictions === 0)).toBe(true);
     expect(result.best).toBeNull();
+  });
+
+  it("excludes old-regime records from reports and sweeps", () => {
+    const oldRegime = new WeeklyRetrospective({
+      week: 9,
+      recordedAt: "2026-06-19T00:00:00.000Z",
+      predictions: [prediction("R", 0.99)],
+      outcomes: [outcome("R", "loss")],
+      inputs: new RetrospectiveInputs({
+        myRoster: [batterLine("me", true)],
+        opponentRoster: [batterLine("opp", false)],
+        iterations: 100,
+        seed: 62744,
+      }),
+    });
+    const report = calibrationReport([oldRegime]);
+    const sweep = sweepCoefficient("volatility", [oldRegime], [1, 2]);
+
+    expect(report.weeks).toBe(0);
+    expect(sweep.points.every((point) => point.predictions === 0)).toBe(true);
+  });
+
+  it("persists no volatility scalar before four closed current-regime weeks", () => {
+    const update = computeVolatilityScaleUpdate([sweepWeek(), sweepWeek(), sweepWeek()], [1, 2]);
+
+    expect(update).toBeUndefined();
+  });
+
+  it("persists a clamped volatility scalar after four weeks and a 5% Brier improvement", () => {
+    const update = computeVolatilityScaleUpdate(
+      [1, 2, 3, 4].map((week) => {
+        const base = sweepWeek();
+        return new WeeklyRetrospective({
+          week,
+          engineVersion: ENGINE_VERSION,
+          recordedAt: base.recordedAt,
+          predictions: base.predictions,
+          outcomes: base.outcomes,
+          inputs: base.inputs,
+        });
+      }),
+      [1, 4],
+      "2026-07-04T00:00:00.000Z",
+    );
+
+    expect(update?.scale).toBe(2);
+    expect(update?.weeks).toBe(4);
+    expect(update?.computedAt).toBe("2026-07-04T00:00:00.000Z");
+  });
+
+  it("does not persist a scalar when Brier improvement is below 5%", () => {
+    const stable = (week: number) =>
+      new WeeklyRetrospective({
+        week,
+        engineVersion: ENGINE_VERSION,
+        recordedAt: "2026-06-19T00:00:00.000Z",
+        predictions: [prediction("R", 0.5)],
+        outcomes: [outcome("R", "tie")],
+        inputs: new RetrospectiveInputs({
+          myRoster: [batterLine(`me-${week}`, false)],
+          opponentRoster: [batterLine(`opp-${week}`, false)],
+          iterations: 100,
+          seed: 62744,
+        }),
+      });
+    const update = computeVolatilityScaleUpdate([1, 2, 3, 4].map(stable), [1, 2]);
+
+    expect(update).toBeUndefined();
   });
 });
 
@@ -213,6 +285,7 @@ describe("CalibrationHarness service (F8)", () => {
       yield* harness.record(
         new WeeklyRetrospective({
           week: 1,
+          engineVersion: ENGINE_VERSION,
           recordedAt: "2026-06-19T00:00:00.000Z",
           predictions: [prediction("R", 0.9), prediction("HR", 0.5)],
         }),

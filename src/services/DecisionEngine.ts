@@ -10,13 +10,11 @@ import {
   type RosterSlotCount,
   type LeagueStatePlayer,
 } from "./LeagueState.ts";
+import { WeeklyBatterLine, WeeklyProjectionSet, WeeklyPitcherLine } from "./ProjectionModel.ts";
 import {
-  type WeeklyBatterLine,
-  WeeklyProjectionSet,
-  type WeeklyPitcherLine,
-} from "./ProjectionModel.ts";
-import {
+  BankedTotals,
   SimJobCandidate,
+  SimJobBankedTotals,
   SimJobSpec,
   StoredSimJobSpec,
   UnitPartial,
@@ -31,13 +29,16 @@ import { WeeklyProjections, WeeklyProjectionsError } from "./WeeklyProjections.t
 import { type YahooApiError } from "./YahooClient.ts";
 
 export const PRODUCTION_SIMULATION_COUNT = 5_000;
-export const MAX_SIMULATED_ADD_CANDIDATES = 6;
+export const MAX_SIMULATED_ADD_CANDIDATES = 20;
 const WEEKLY_WEIGHT_ALPHA = 0.75;
 const TEAM_SEASON_OBP_DENOMINATOR = 6500;
 const TEAM_SEASON_IP = 1400;
 const LEAGUE_AVG_OBP = 0.32;
 const LEAGUE_AVG_ERA = 4.1;
 const LEAGUE_AVG_WHIP = 1.28;
+const AVG_PA_PER_STARTED_GAME = 4.2;
+const AVG_GAMES_PER_WEEK = 6.2;
+export const ENGINE_VERSION = "phase2-banked-v1";
 
 const CATEGORIES = [
   "R",
@@ -187,6 +188,7 @@ type Totals = {
 };
 
 type MatchupSample = Record<Category, number>;
+type BankedSide = "mine" | "opponent";
 
 const isCategory = (category: string): category is Category => SUPPORTED_CATEGORIES.has(category);
 
@@ -211,6 +213,103 @@ const emptyTotals = (): Totals => ({
   ip: 0,
   QS: 0,
   "SV+H": 0,
+});
+
+const zeroBankedTotals = () =>
+  new BankedTotals({
+    counting: {},
+    era: { er: 0, outs: 0 },
+    whip: { baserunners: 0, outs: 0 },
+    obp: { numerator: 0, denominator: 0 },
+  });
+
+const zeroBanked = () =>
+  new SimJobBankedTotals({
+    mine: zeroBankedTotals(),
+    opponent: zeroBankedTotals(),
+  });
+
+const matchupNumber = (value: string | undefined) => {
+  if (value == null || value.trim() === "" || value.trim() === "-") return 0;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const elapsedWeekGames = (
+  snapshot: LeagueStateSnapshot | undefined,
+  contextAt: string | undefined,
+) => {
+  if (snapshot == null || snapshot.matchup.weekStart === "") return 0;
+  const weekStart = Date.parse(`${snapshot.matchup.weekStart}T00:00:00.000Z`);
+  const at = contextAt == null ? Date.now() : Date.parse(contextAt);
+  if (!Number.isFinite(weekStart) || !Number.isFinite(at) || at <= weekStart) return 0;
+  const elapsedDays = Math.min(7, Math.max(0, (at - weekStart) / (24 * 60 * 60 * 1000)));
+  return (elapsedDays / 7) * AVG_GAMES_PER_WEEK;
+};
+
+const estimatedConsumedPa = (
+  lines: ReadonlyArray<WeeklyLine>,
+  snapshot: LeagueStateSnapshot | undefined,
+  contextAt: string | undefined,
+) => {
+  const activeHitters = lines.filter((line) => line.kind === "batter").length;
+  return activeHitters * elapsedWeekGames(snapshot, contextAt) * AVG_PA_PER_STARTED_GAME;
+};
+
+export const bankedFromMatchup = (
+  categories: ReadonlyArray<LeagueStateSnapshot["matchup"]["categories"][number]>,
+  side: BankedSide,
+  paEstimate: number,
+) => {
+  const valueByCategory = new Map(
+    categories.map((category) => [
+      category.category,
+      side === "mine" ? category.myValue : category.opponentValue,
+    ]),
+  );
+  const numberFor = (category: string) => matchupNumber(valueByCategory.get(category));
+  const counting = Object.fromEntries(
+    ["R", "H", "HR", "RBI", "SB", "TB", "OUT", "K", "QS", "SV+H"].map((category) => [
+      category,
+      numberFor(category),
+    ]),
+  );
+  const outs = numberFor("OUT");
+  const ip = outs / 3;
+  const eraValue = numberFor("ERA");
+  const whipValue = numberFor("WHIP");
+  const obpDenominator = Math.max(0, paEstimate);
+  const obpValue = numberFor("OBP");
+
+  // Yahoo matchup OBP has no recoverable AB/PA components. This approximates the denominator as
+  // consumed active-lineup PA so early-week OBP anchors weakly and late-week OBP anchors strongly.
+  return new BankedTotals({
+    counting,
+    era: { er: outs > 0 ? (eraValue * ip) / 9 : 0, outs },
+    whip: { baserunners: outs > 0 ? whipValue * ip : 0, outs },
+    obp: {
+      numerator: obpDenominator > 0 ? obpValue * obpDenominator : 0,
+      denominator: obpDenominator,
+    },
+  });
+};
+
+const addBankedTotals = (totals: Totals, banked: BankedTotals): Totals => ({
+  R: totals.R + (banked.counting["R"] ?? 0),
+  H: totals.H + (banked.counting["H"] ?? 0),
+  HR: totals.HR + (banked.counting["HR"] ?? 0),
+  RBI: totals.RBI + (banked.counting["RBI"] ?? 0),
+  SB: totals.SB + (banked.counting["SB"] ?? 0),
+  TB: totals.TB + (banked.counting["TB"] ?? 0),
+  obpNumerator: totals.obpNumerator + banked.obp.numerator,
+  obpDenominator: totals.obpDenominator + banked.obp.denominator,
+  OUT: totals.OUT + (banked.counting["OUT"] ?? banked.era.outs),
+  K: totals.K + (banked.counting["K"] ?? 0),
+  er: totals.er + (banked.era.er ?? 0),
+  baserunners: totals.baserunners + (banked.whip.baserunners ?? 0),
+  ip: totals.ip + banked.era.outs / 3,
+  QS: totals.QS + (banked.counting["QS"] ?? 0),
+  "SV+H": totals["SV+H"] + (banked.counting["SV+H"] ?? 0),
 });
 
 const addExpectedLine = (totals: Totals, line: WeeklyLine) => {
@@ -301,7 +400,7 @@ const sampleTeam = (lines: ReadonlyArray<WeeklyLine>, random: () => number) => {
       totals["SV+H"] += sampleCounting(line.svh, random, vol);
     }
   }
-  return toCategoryValues(totals);
+  return totals;
 };
 
 const tagCategory = (winProbability: number) => {
@@ -315,7 +414,7 @@ const tagCategory = (winProbability: number) => {
 // probability back to the z-score (margin/σ) that produced it. The a/b/c/d coefficients and the
 // 0.02425 breakpoint are FIXED constants of the published algorithm (accurate to ~1e-9), not
 // tunable parameters; 1e-9 just keeps p inside the open interval (0,1).
-const probit = (p: number) => {
+function probit(p: number) {
   const clamped = Math.min(Math.max(p, 1e-9), 1 - 1e-9);
   const a = [
     -3.969683028665376e1, 2.209460984245205e2, -2.759285104469687e2, 1.38357751867269e2,
@@ -352,7 +451,7 @@ const probit = (p: number) => {
     ((((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q) /
     (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1)
   );
-};
+}
 
 // F7: continuous category importance weight. Marginal value of one stat-unit is proportional to
 // the probability density of the win-prob curve at the 0/0 margin threshold — i.e. φ(z) where
@@ -412,6 +511,7 @@ const simulateRawCounters = (
   seed: number,
   iterations: number,
   scoringCategories: ReadonlyArray<Category>,
+  banked: SimJobBankedTotals = zeroBanked(),
 ): UnitPartial => {
   const randomMine = createRandom(seed);
   const randomOpp = createRandom((seed ^ 0x9e3779b9) >>> 0);
@@ -426,8 +526,10 @@ const simulateRawCounters = (
   );
 
   for (let index = 0; index < iterations; index += 1) {
-    const mine = sampleTeam(myRoster, randomMine);
-    const opponent = sampleTeam(opponentRoster, randomOpp);
+    const mine = toCategoryValues(addBankedTotals(sampleTeam(myRoster, randomMine), banked.mine));
+    const opponent = toCategoryValues(
+      addBankedTotals(sampleTeam(opponentRoster, randomOpp), banked.opponent),
+    );
     for (const category of scoringCategories) {
       const myValue = mine[category];
       const opponentValue = opponent[category];
@@ -528,9 +630,10 @@ export const simulateMatchup = (
   iterations = PRODUCTION_SIMULATION_COUNT,
   seed = 62744,
   scoringCategories: ReadonlyArray<Category> = CATEGORIES,
+  banked: SimJobBankedTotals = zeroBanked(),
 ) =>
   aggregateMatchup(
-    simulateRawCounters(myRoster, opponentRoster, seed, iterations, scoringCategories),
+    simulateRawCounters(myRoster, opponentRoster, seed, iterations, scoringCategories, banked),
     scoringCategories,
   );
 
@@ -568,6 +671,76 @@ const seasonSgp = (
   return CATEGORIES.reduce((sum, category) => {
     return sum + categorySgpValue(category, totals, denominators, weights);
   }, 0);
+};
+
+const playerKeyCompare = (a: WeeklyLine, b: WeeklyLine) => a.playerKey.localeCompare(b.playerKey);
+
+const withVolatilityScale = (line: WeeklyLine, scale: number): WeeklyLine => {
+  const volatility = (line.volatility ?? 1) * scale;
+  if (line.kind === "batter") {
+    const { volatility: _previous, ...rest } = line;
+    return new WeeklyBatterLine({ ...rest, volatility });
+  }
+  const { volatility: _previous, ...rest } = line;
+  return new WeeklyPitcherLine({ ...rest, volatility });
+};
+
+const weeklyFlipScore = (
+  line: WeeklyLine,
+  denominators: Record<Category, number>,
+  weights: Record<Category, number>,
+  scoringCategories: ReadonlySet<Category>,
+) => {
+  const totals = expectedTotals([line]);
+  const applicableCategories = line.kind === "batter" ? BATTER_CATEGORIES : PITCHER_CATEGORIES;
+  return [...scoringCategories].reduce((sum, category) => {
+    if (!applicableCategories.has(category)) return sum;
+    return sum + categorySgpValue(category, totals, denominators, weights);
+  }, 0);
+};
+
+const selectSimCandidates = (
+  freeAgents: ReadonlyArray<WeeklyLine>,
+  denominators: Record<Category, number>,
+  weights: Record<Category, number>,
+  scoringCategories: ReadonlyArray<Category>,
+) => {
+  const scoringCategorySet = new Set(scoringCategories);
+  const scored = freeAgents.map((candidate) => ({
+    candidate,
+    flipScore: weeklyFlipScore(candidate, denominators, weights, scoringCategorySet),
+    seasonSgpDelta: seasonSgp(candidate, denominators, weights),
+  }));
+  const byFlip = [...scored].sort(
+    (a, b) =>
+      b.flipScore - a.flipScore ||
+      b.seasonSgpDelta - a.seasonSgpDelta ||
+      playerKeyCompare(a.candidate, b.candidate),
+  );
+  const bySeason = [...scored].sort(
+    (a, b) =>
+      b.seasonSgpDelta - a.seasonSgpDelta ||
+      b.flipScore - a.flipScore ||
+      playerKeyCompare(a.candidate, b.candidate),
+  );
+
+  const selected = new Map<string, (typeof scored)[number]>();
+  for (const entry of bySeason.slice(0, 3)) selected.set(entry.candidate.playerKey, entry);
+  for (const entry of byFlip) {
+    if (selected.size >= MAX_SIMULATED_ADD_CANDIDATES) break;
+    selected.set(entry.candidate.playerKey, entry);
+  }
+
+  return [...selected.values()]
+    .sort(
+      (a, b) =>
+        b.flipScore - a.flipScore ||
+        b.seasonSgpDelta - a.seasonSgpDelta ||
+        playerKeyCompare(a.candidate, b.candidate),
+    )
+    .map(
+      ({ candidate, seasonSgpDelta }) => new SimJobCandidate({ line: candidate, seasonSgpDelta }),
+    );
 };
 
 const categorySgpValue = (
@@ -650,6 +823,9 @@ const isPitcherSlot = (slot: RosterSlotCount) => ["P", "SP", "RP"].includes(slot
 const isActive = (player: LeagueStatePlayer | undefined) =>
   player != null && !["BN", "IL", "IL+", "NA"].includes(player.selectedPosition);
 
+const isActiveSelectedPosition = (selectedPosition: string | undefined) =>
+  selectedPosition != null && !["BN", "IL", "IL+", "NA"].includes(selectedPosition);
+
 const isHardUnavailableStatus = (status: string | undefined) =>
   status != null &&
   (status.startsWith("IL") || status === "NA" || status === "O" || status === "SUSP");
@@ -730,10 +906,12 @@ export const activeWeeklyLines = (
   snapshot: LeagueStateSnapshot | undefined,
 ) => {
   if (snapshot == null) return lines;
-  const activeKeys = new Set(
-    snapshot.roster.filter((player) => isActive(player)).map((player) => player.playerKey),
-  );
-  return lines.filter((line) => activeKeys.has(line.playerKey));
+  const rosterByKey = new Map(snapshot.roster.map((player) => [player.playerKey, player]));
+  return lines.filter((line) => {
+    const player = rosterByKey.get(line.playerKey);
+    if (player != null) return isActive(player);
+    return isActiveSelectedPosition(line.selectedPosition) || line.selectedPosition == null;
+  });
 };
 
 const lineScore = (
@@ -953,41 +1131,65 @@ export const prepareSimJob = (
   snapshot?: LeagueStateSnapshot,
   standingsHistory: ReadonlyArray<StandingCategoryTotal> = [],
   contextAt?: string,
+  volatilityScale = 1,
 ): StoredSimJob => {
   const scoringCategories = scoringCategoriesForSnapshot(snapshot);
-  const scoringRoster = activeWeeklyLines(set.myRoster, snapshot);
+  const scaledSet = new WeeklyProjectionSet({
+    myRoster: set.myRoster.map((line) => withVolatilityScale(line, volatilityScale)),
+    opponentRoster: set.opponentRoster.map((line) => withVolatilityScale(line, volatilityScale)),
+    freeAgents: set.freeAgents.map((line) => withVolatilityScale(line, volatilityScale)),
+    schedules: set.schedules,
+    dailyGameWindows: set.dailyGameWindows,
+    probablePitcherStarts: set.probablePitcherStarts,
+  });
+  const scoringRoster = activeWeeklyLines(scaledSet.myRoster, snapshot);
+  const opponentRoster = activeWeeklyLines(scaledSet.opponentRoster, snapshot);
+  const banked =
+    snapshot == null
+      ? zeroBanked()
+      : new SimJobBankedTotals({
+          mine: bankedFromMatchup(
+            snapshot.matchup.categories,
+            "mine",
+            estimatedConsumedPa(scoringRoster, snapshot, contextAt),
+          ),
+          opponent: bankedFromMatchup(
+            snapshot.matchup.categories,
+            "opponent",
+            estimatedConsumedPa(opponentRoster, snapshot, contextAt),
+          ),
+        });
   const baselinePartial = simulateRawCounters(
     scoringRoster,
-    set.opponentRoster,
+    opponentRoster,
     62744,
     PRODUCTION_SIMULATION_COUNT,
     scoringCategories,
+    banked,
   );
   const baseline = aggregateMatchup(baselinePartial, scoringCategories);
   const scout = scoutOpponent(baseline);
   const weights = scout.categoryWeights as Record<Category, number>;
   const denominators = computeSgpDenominators(standingsHistory);
-  const candidates = set.freeAgents
-    .map((candidate) => ({
-      candidate,
-      seasonSgpDelta: seasonSgp(candidate, denominators, weights),
-    }))
-    .sort((a, b) => b.seasonSgpDelta - a.seasonSgpDelta)
-    .slice(0, MAX_SIMULATED_ADD_CANDIDATES)
-    .map(
-      ({ candidate, seasonSgpDelta }) => new SimJobCandidate({ line: candidate, seasonSgpDelta }),
-    );
+  const candidates = selectSimCandidates(
+    scaledSet.freeAgents,
+    denominators,
+    weights,
+    scoringCategories,
+  );
 
   const spec = new SimJobSpec({
     scoringCategories,
     scoringRoster,
-    opponentRoster: set.opponentRoster,
+    opponentRoster,
     candidates,
     denominators,
     baseSeed: 62744,
+    banked,
+    volatilityScale,
   });
 
-  const lineup = optimizeLineup(set, baseline, snapshot, denominators);
+  const lineup = optimizeLineup(scaledSet, baseline, snapshot, denominators);
 
   return new StoredSimJob({
     stored: new StoredSimJobSpec({
@@ -1026,6 +1228,7 @@ export const simulateUnit = (
     unitSeed(spec.baseSeed, chunkIndex),
     iterations,
     scoringCategories,
+    spec.banked ?? zeroBanked(),
   );
 };
 

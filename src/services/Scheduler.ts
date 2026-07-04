@@ -38,6 +38,7 @@ import {
   UnitPartial,
 } from "./SimJob.ts";
 import { deliverManagerBriefing } from "../routines/delivery.ts";
+import { loadVolatilityScale } from "../routines/calibration.ts";
 
 const MINUTE = 60 * 1000;
 const HOUR = 60 * MINUTE;
@@ -601,7 +602,8 @@ export class Scheduler extends Context.Service<
             leagueState.snapshot,
           ]);
           const categoryTotals = useStandingsHistory ? yield* standingsHistory.categoryTotals : [];
-          return prepareSimJob(set, snapshot, categoryTotals, contextAt);
+          const volatilityScale = yield* loadVolatilityScale(cache);
+          return prepareSimJob(set, snapshot, categoryTotals, contextAt, volatilityScale);
         });
 
       // Stage 2 fan-out: one SimChunkWorker sub-invocation per (unit,chunk) with its OWN CPU budget.

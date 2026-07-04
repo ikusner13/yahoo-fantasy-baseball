@@ -8,7 +8,12 @@ import { pathToFileURL } from "node:url";
 
 import { FREE_TIER_MODE } from "../src/infra/free-tier.ts";
 import { ApiCache } from "../src/services/ApiCache.ts";
-import { closeOutPreviousWeek, recordCurrentWeekPrediction } from "../src/routines/calibration.ts";
+import {
+  closeOutPreviousWeek,
+  loadVolatilityScale,
+  recordCurrentWeekPrediction,
+  sweepAndPersistVolatilityScale,
+} from "../src/routines/calibration.ts";
 import { deliverManagerBriefing } from "../src/routines/delivery.ts";
 import { DailyLineupAdvisor } from "../src/services/DailyLineupAdvisor.ts";
 import { prepareSimJob, reduceSimJob, simulateUnit } from "../src/services/DecisionEngine.ts";
@@ -87,21 +92,23 @@ export const loadEnvFile = (path: string) => {
 const writeTaskSuccess = (cache: ApiCacheService) =>
   recordSchedulerTaskSuccess(cache, "send-briefing");
 
-const calibrationBestEffort = Effect.all(
-  [
-    recordCurrentWeekPrediction.pipe(
-      Effect.catchCause((cause) =>
-        Effect.logWarning("record calibration prediction failed", { cause: String(cause) }),
-      ),
+const calibrationBestEffort = Effect.gen(function* () {
+  yield* closeOutPreviousWeek.pipe(
+    Effect.catchCause((cause) =>
+      Effect.logWarning("close calibration week failed", { cause: String(cause) }),
     ),
-    closeOutPreviousWeek.pipe(
-      Effect.catchCause((cause) =>
-        Effect.logWarning("close calibration week failed", { cause: String(cause) }),
-      ),
+  );
+  yield* sweepAndPersistVolatilityScale.pipe(
+    Effect.catchCause((cause) =>
+      Effect.logWarning("volatility calibration sweep failed", { cause: String(cause) }),
     ),
-  ],
-  { concurrency: 1 },
-);
+  );
+  yield* recordCurrentWeekPrediction.pipe(
+    Effect.catchCause((cause) =>
+      Effect.logWarning("record calibration prediction failed", { cause: String(cause) }),
+    ),
+  );
+});
 
 export const runDailyBriefing = (flags: Flags) =>
   Effect.gen(function* () {
@@ -141,7 +148,14 @@ export const runDailyBriefing = (flags: Flags) =>
     );
     const categoryTotals = useStandingsHistory ? yield* standingsHistory.categoryTotals : [];
 
-    const stored = prepareSimJob(set, snapshot, categoryTotals, contextState?.completedAt);
+    const volatilityScale = yield* loadVolatilityScale(cache);
+    const stored = prepareSimJob(
+      set,
+      snapshot,
+      categoryTotals,
+      contextState?.completedAt,
+      volatilityScale,
+    );
     const gen = specGeneration(stored.stored.contextAt);
     if (!flags.dryRun) {
       yield* cache.put(simSpecKey(today), stored);

@@ -8,6 +8,7 @@ import * as Schema from "effect/Schema";
 import { retrospectives } from "../db/schema.ts";
 import { Db } from "./Db.ts";
 import {
+  ENGINE_VERSION,
   type MatchupSimulation,
   PRODUCTION_SIMULATION_COUNT,
   simulateMatchup,
@@ -17,6 +18,11 @@ import { WeeklyBatterLine, WeeklyPitcherLine } from "./ProjectionModel.ts";
 // Must match the default `seed` of simulateMatchup in DecisionEngine, so a recorded week
 // re-simulates to the same predictions at coefficient = 1.
 const DEFAULT_SIM_SEED = 62744;
+export const VOLATILITY_SCALE_CACHE_KEY = "calibration:volatility-scale:v1";
+const VOLATILITY_SCALE_MIN_WEEKS = 4;
+const VOLATILITY_SCALE_MIN_RELATIVE_BRIER_GAIN = 0.05;
+const VOLATILITY_SCALE_MIN = 0.8;
+const VOLATILITY_SCALE_MAX = 2.0;
 
 // Categories where a lower total wins (orientation for deriving outcomes from raw totals). Mirrors
 // DecisionEngine's LOWER_IS_BETTER; passed explicitly to outcomesFromTotals to keep this module from
@@ -63,6 +69,7 @@ export class RetrospectiveInputs extends Schema.Class<RetrospectiveInputs>("Retr
 
 export class WeeklyRetrospective extends Schema.Class<WeeklyRetrospective>("WeeklyRetrospective")({
   week: Schema.Finite,
+  engineVersion: Schema.optional(Schema.String),
   recordedAt: Schema.String,
   predictions: Schema.Array(CategoryPrediction),
   // Filled in at close-out. A retrospective without outcomes is "open" and not scored yet.
@@ -70,6 +77,15 @@ export class WeeklyRetrospective extends Schema.Class<WeeklyRetrospective>("Week
   // Optional so a prediction can be logged even when the re-simulation inputs are unavailable;
   // only retrospectives that carry inputs participate in the coefficient sweep.
   inputs: Schema.optional(RetrospectiveInputs),
+}) {}
+
+export class CalibrationVolatilityScale extends Schema.Class<CalibrationVolatilityScale>(
+  "CalibrationVolatilityScale",
+)({
+  scale: Schema.Finite,
+  computedAt: Schema.String,
+  weeks: Schema.Finite,
+  brier: Schema.Finite,
 }) {}
 
 export interface ScoredPrediction {
@@ -92,6 +108,7 @@ const predictedPoints = (prediction: CategoryPrediction) =>
 const withOutcomes = (retro: WeeklyRetrospective, outcomes: ReadonlyArray<CategoryOutcome>) =>
   new WeeklyRetrospective({
     week: retro.week,
+    engineVersion: retro.engineVersion,
     recordedAt: retro.recordedAt,
     predictions: retro.predictions,
     outcomes,
@@ -113,6 +130,7 @@ export const buildRetrospective = (params: {
 }) =>
   new WeeklyRetrospective({
     week: params.week,
+    engineVersion: ENGINE_VERSION,
     recordedAt: params.recordedAt,
     predictions: params.baseline.categories.map(
       (category) =>
@@ -154,6 +172,9 @@ export const isClosedOut = (
   retro: WeeklyRetrospective,
 ): retro is WeeklyRetrospective & { outcomes: ReadonlyArray<CategoryOutcome> } =>
   retro.outcomes != null && retro.outcomes.length > 0;
+
+export const isCurrentEngineRegime = (retro: WeeklyRetrospective) =>
+  retro.engineVersion === ENGINE_VERSION;
 
 // Flatten retrospectives into (predicted, actual) pairs, matching predictions to outcomes by
 // category. Predictions without a matching outcome (and vice versa) are dropped.
@@ -286,7 +307,7 @@ export class CalibrationReport extends Schema.Class<CalibrationReport>("Calibrat
 export const calibrationReport = (
   retros: ReadonlyArray<WeeklyRetrospective>,
 ): CalibrationReport => {
-  const closed = retros.filter(isClosedOut);
+  const closed = retros.filter(isClosedOut).filter(isCurrentEngineRegime);
   const pairs = scoredPredictions(closed);
   return new CalibrationReport({
     weeks: closed.length,
@@ -336,7 +357,7 @@ export const sweepCoefficient = (
   retros: ReadonlyArray<WeeklyRetrospective>,
   values: ReadonlyArray<number>,
 ): SweepResult => {
-  const usable = retros.filter(
+  const usable = retros.filter(isCurrentEngineRegime).filter(
     (
       retro,
     ): retro is WeeklyRetrospective & {
@@ -380,6 +401,32 @@ export const sweepCoefficient = (
       : scored.reduce((lowest, point) => (point.brier < lowest.brier ? point : lowest)).value;
 
   return { coefficient, points, best };
+};
+
+export const computeVolatilityScaleUpdate = (
+  retros: ReadonlyArray<WeeklyRetrospective>,
+  values: ReadonlyArray<number>,
+  computedAt = new Date().toISOString(),
+): CalibrationVolatilityScale | undefined => {
+  const currentClosed = retros.filter(isCurrentEngineRegime).filter(isClosedOut);
+  if (currentClosed.length < VOLATILITY_SCALE_MIN_WEEKS) return undefined;
+  const sweep = sweepCoefficient("volatility", currentClosed, values);
+  const baseline = sweep.points.find((point) => point.value === 1);
+  const best = sweep.points
+    .filter((point): point is SweepPoint & { brier: number } => point.brier != null)
+    .reduce<(SweepPoint & { brier: number }) | undefined>(
+      (lowest, point) => (lowest == null || point.brier < lowest.brier ? point : lowest),
+      undefined,
+    );
+  if (baseline?.brier == null || best == null || baseline.brier <= 0) return undefined;
+  const relativeGain = (baseline.brier - best.brier) / baseline.brier;
+  if (relativeGain < VOLATILITY_SCALE_MIN_RELATIVE_BRIER_GAIN) return undefined;
+  return new CalibrationVolatilityScale({
+    scale: Math.max(VOLATILITY_SCALE_MIN, Math.min(VOLATILITY_SCALE_MAX, best.value)),
+    computedAt,
+    weeks: currentClosed.length,
+    brier: best.brier,
+  });
 };
 
 export class CalibrationHarness extends Context.Service<

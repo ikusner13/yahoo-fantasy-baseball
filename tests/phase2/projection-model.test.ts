@@ -17,6 +17,7 @@ import {
   StatcastPlayerContext,
   WeeklyContext,
   WeeklySchedule,
+  volatilityFromCv,
 } from "../../src/services/ProjectionModel";
 
 const makeBatter = (overrides: {
@@ -79,6 +80,55 @@ describe("ProjectionModel Phase 2 math", () => {
     expect(projection?.hr).toBe(8.5);
     expect(projection?.obp).toBeCloseTo(0.38);
     expect(projection?.ab).toBe(77);
+  });
+
+  it("maps cross-system CV into bounded line volatility", () => {
+    expect(volatilityFromCv(0)).toBe(1);
+    expect(volatilityFromCv(100)).toBe(1.6);
+  });
+
+  it("defaults volatility to neutral with fewer than two projection systems", () => {
+    const [projection] = blendBatterProjections(
+      [makeBatter({})],
+      [new ProjectionSourceWeight({ source: "rthebatx", weight: 1 })],
+    );
+    const line = prorateBatterProjection(
+      projection!,
+      new WeeklyContext({
+        schedules: [new WeeklySchedule({ team: "NYY", gamesThisWeek: 1, gamesRemaining: 1 })],
+        probableStartsByPlayerKey: {},
+        impliedRunsByTeam: {},
+      }),
+    );
+
+    expect(line.volatility).toBe(1);
+  });
+
+  it("raises volatility when projection systems disagree", () => {
+    const [projection] = blendBatterProjections([
+      makeBatter({}),
+      new BatterProjectionSource({
+        source: "steamerr",
+        playerKey: "mlb.p.batter",
+        name: "Ada Batter",
+        team: "NYY",
+        pa: 100,
+        r: 1,
+        h: 1,
+        hr: 1,
+        rbi: 1,
+        sb: 1,
+        tb: 1,
+        obp: 0.1,
+        ab: 90,
+        bb: 1,
+        hbp: 0,
+        sf: 1,
+      }),
+    ]);
+
+    expect(projection?.volatility).toBeGreaterThan(1);
+    expect(projection?.volatility).toBeLessThanOrEqual(1.6);
   });
 
   it("prorates batter counting stats by remaining games and Vegas implied runs", () => {

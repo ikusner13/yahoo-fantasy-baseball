@@ -784,8 +784,33 @@ const makeYahooClientShape = (
       request(`/team/${teamKey}/roster/players;date=${date}`, YahooRosterPayload),
     getRosterForTeam: (targetTeamKey) =>
       request(`/team/${targetTeamKey}/roster/players`, YahooRosterPayload),
-    getAvailablePlayers: (count) =>
-      request(`/league/${leagueKey}/players;status=FA;count=${count}`, YahooPlayersPayload),
+    getAvailablePlayers: (count) => {
+      const pageSize = 25;
+      const starts = Array.from(
+        { length: Math.max(1, Math.ceil(Math.max(0, count) / pageSize)) },
+        (_, index) => index * pageSize,
+      );
+      return Effect.gen(function* () {
+        const pages = yield* Effect.forEach(
+          starts,
+          (start) => {
+            const pageCount = Math.min(pageSize, Math.max(0, count - start));
+            const startParam = start === 0 ? "" : `;start=${start}`;
+            return request(
+              `/league/${leagueKey}/players;status=FA;count=${pageCount}${startParam}`,
+              YahooPlayersPayload,
+            );
+          },
+          { concurrency: 3 },
+        );
+        const players = pages.flatMap((page) => page.fantasy_content.league[1].players);
+        return {
+          fantasy_content: {
+            league: [{}, { players: players.slice(0, count) }],
+          },
+        } satisfies YahooPlayersPayload;
+      });
+    },
     getLeagueTransactions: (count) =>
       request(
         `/league/${leagueKey}/transactions;team_key=${teamKey};types=add,drop;count=${count}`,

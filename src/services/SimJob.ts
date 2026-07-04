@@ -10,6 +10,33 @@ import { WeeklyBatterLine, WeeklyPitcherLine } from "./ProjectionModel.ts";
 
 const WeeklyLineSchema = Schema.Union([WeeklyBatterLine, WeeklyPitcherLine]);
 
+export class RatioBankedComponent extends Schema.Class<RatioBankedComponent>(
+  "RatioBankedComponent",
+)({
+  numerator: Schema.Finite,
+  denominator: Schema.Finite,
+}) {}
+
+export class PitchingBankedComponent extends Schema.Class<PitchingBankedComponent>(
+  "PitchingBankedComponent",
+)({
+  er: Schema.optional(Schema.Finite),
+  baserunners: Schema.optional(Schema.Finite),
+  outs: Schema.Finite,
+}) {}
+
+export class BankedTotals extends Schema.Class<BankedTotals>("BankedTotals")({
+  counting: Schema.Record(Schema.String, Schema.Finite),
+  era: PitchingBankedComponent,
+  whip: PitchingBankedComponent,
+  obp: RatioBankedComponent,
+}) {}
+
+export class SimJobBankedTotals extends Schema.Class<SimJobBankedTotals>("SimJobBankedTotals")({
+  mine: BankedTotals,
+  opponent: BankedTotals,
+}) {}
+
 // Per-category raw Monte Carlo counters for a single sim unit. These sum exactly across chunks and
 // across the (decoupled-stream) seed scheme, so reduce can add partials before deriving win probs.
 export class UnitPartialCounter extends Schema.Class<UnitPartialCounter>("UnitPartialCounter")({
@@ -43,6 +70,8 @@ export class SimJobSpec extends Schema.Class<SimJobSpec>("SimJobSpec")({
   candidates: Schema.Array(SimJobCandidate),
   denominators: Schema.Record(Schema.String, Schema.Finite),
   baseSeed: Schema.Finite,
+  banked: Schema.optional(SimJobBankedTotals),
+  volatilityScale: Schema.optional(Schema.Finite),
 }) {}
 
 // What stage 1 persists under the `spec` key: the job spec, the baseline unit's partial (approach

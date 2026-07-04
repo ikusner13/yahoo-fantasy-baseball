@@ -1,11 +1,12 @@
 import * as Context from "effect/Context";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
+import * as Config from "effect/Config";
 import * as Layer from "effect/Layer";
 
 import { LeagueState, type LeagueStatePlayer } from "./LeagueState.ts";
-import { PlayerIdentity, PlayerIdentityError, PlayerIdentityRow } from "./PlayerIdentity.ts";
-import { ProjectionData, ProjectionDataError } from "./ProjectionData.ts";
+import { PlayerIdentity, PlayerIdentityRow } from "./PlayerIdentity.ts";
+import { ProjectionData } from "./ProjectionData.ts";
 import {
   BatterProjectionSource,
   buildWeeklyProjectionSet,
@@ -15,14 +16,9 @@ import {
   WeeklyContext,
   WeeklyProjectionSet,
 } from "./ProjectionModel.ts";
-import {
-  YahooApiError,
-  YahooClient,
-  type YahooPlayersPayload,
-  type YahooRosterPayload,
-} from "./YahooClient.ts";
+import { YahooClient, type YahooPlayersPayload, type YahooRosterPayload } from "./YahooClient.ts";
 
-const DEFAULT_FREE_AGENT_COUNT = 50;
+const DEFAULT_FREE_AGENT_COUNT = 200;
 
 export class WeeklyProjectionsError extends Data.TaggedError("WeeklyProjectionsError")<{
   readonly message: string;
@@ -33,6 +29,7 @@ type YahooProjectionPlayer = {
   readonly name: string;
   readonly team: string;
   readonly positions?: ReadonlyArray<string>;
+  readonly selectedPosition?: string;
   readonly status?: string;
 };
 
@@ -51,12 +48,13 @@ const identityKey = (player: { readonly name: string; readonly team: string }) =
 
 const rosterPlayers = (payload: YahooRosterPayload): ReadonlyArray<YahooProjectionPlayer> =>
   payload.fantasy_content.team[1].roster["0"].players.map((entry) => {
-    const [player] = entry.player;
+    const [player, selectedPosition] = entry.player;
     return {
       playerKey: player.playerKey,
       name: player.name,
       team: player.team,
       positions: player.eligiblePositions,
+      selectedPosition: selectedPosition?.position,
       status: player.status,
     };
   });
@@ -83,6 +81,7 @@ const snapshotPlayers = (
     name: player.name,
     team: player.team,
     positions: player.eligiblePositions,
+    selectedPosition: player.selectedPosition,
     status: player.status,
   }));
 
@@ -133,6 +132,7 @@ const canonicalizeBatters = (
         // default ⇒ overall park factor. Wiring MLB Stats /people/{id} batSide is a follow-up.
         bats: row.bats,
         eligiblePositions: player.positions == null ? undefined : [...player.positions],
+        selectedPosition: player.selectedPosition,
       }),
     ];
   });
@@ -179,6 +179,7 @@ const canonicalizePitchers = (
         appearances: row.appearances,
         status: player.status,
         eligiblePositions: player.positions == null ? undefined : [...player.positions],
+        selectedPosition: player.selectedPosition,
       }),
     ];
   });
@@ -225,8 +226,12 @@ const remapProbableStarts = (
   });
 };
 
-const mapError = (error: YahooApiError | ProjectionDataError | PlayerIdentityError) =>
-  new WeeklyProjectionsError({ message: `${error._tag}: ${error.message}` });
+const mapError = (error: unknown) => {
+  const tagged = error as { readonly _tag?: string; readonly message?: string };
+  return new WeeklyProjectionsError({
+    message: `${tagged._tag ?? "ConfigError"}: ${tagged.message ?? String(error)}`,
+  });
+};
 
 export class WeeklyProjections extends Context.Service<
   WeeklyProjections,
@@ -245,12 +250,15 @@ export class WeeklyProjections extends Context.Service<
       // Worker isolates can live for days; TTL avoids memoizing transient upstream failures forever.
       const currentMatchup = yield* Effect.cachedWithTTL(
         Effect.gen(function* () {
+          const freeAgentCount = yield* Config.number("FREE_AGENT_COUNT").pipe(
+            Config.withDefault(DEFAULT_FREE_AGENT_COUNT),
+          );
           const snapshot = yield* leagueState.snapshot;
           const [opponentRosterPayload, freeAgentPayload, batters, pitchers, context] =
             yield* Effect.all(
               [
                 yahoo.getRosterForTeam(snapshot.matchup.opponentTeamKey),
-                yahoo.getAvailablePlayers(DEFAULT_FREE_AGENT_COUNT),
+                yahoo.getAvailablePlayers(freeAgentCount),
                 projectionData.batterProjections,
                 projectionData.pitcherProjections,
                 projectionData.weeklyContext(snapshot.matchup.weekStart, snapshot.matchup.weekEnd),

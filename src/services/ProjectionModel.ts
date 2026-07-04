@@ -9,6 +9,9 @@ const AVG_PA_PER_STARTED_GAME = 4.2;
 const DEFAULT_ROS_TEAM_GAMES = 162;
 const LEAGUE_AVG_IMPLIED_RUNS = 4.5;
 const MIN_OPENER_IP = 1;
+export const VOLATILITY_CV_GAIN = 2.0;
+const VOLATILITY_MIN = 0.85;
+const VOLATILITY_MAX = 1.6;
 
 // F7: empirical PA-per-game by batting-order slot. Leadoff gets the most PA, each slot down the
 // order loses ~16 PA/season (≈0.11 PA/game), #9 is the floor. Source: Spaeder 2023 actuals
@@ -150,6 +153,8 @@ export class BatterProjectionSource extends Schema.Class<BatterProjectionSource>
   // in WeeklyProjections.ts); wiring an MLB Stats batSide source is the remaining follow-up.
   bats: Schema.optional(Schema.String),
   eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
+  selectedPosition: Schema.optional(Schema.String),
+  volatility: Schema.optional(Schema.Finite),
 }) {}
 
 export class PitcherProjectionSource extends Schema.Class<PitcherProjectionSource>(
@@ -171,6 +176,8 @@ export class PitcherProjectionSource extends Schema.Class<PitcherProjectionSourc
   // See BatterProjectionSource.status (F4 playing-time/injury discount).
   status: Schema.optional(Schema.String),
   eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
+  selectedPosition: Schema.optional(Schema.String),
+  volatility: Schema.optional(Schema.Finite),
 }) {}
 
 export class BlendedBatterProjection extends Schema.Class<BlendedBatterProjection>(
@@ -198,6 +205,8 @@ export class BlendedBatterProjection extends Schema.Class<BlendedBatterProjectio
   // See BatterProjectionSource.bats (F6 handedness HR park split).
   bats: Schema.optional(Schema.String),
   eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
+  selectedPosition: Schema.optional(Schema.String),
+  volatility: Schema.optional(Schema.Finite),
 }) {}
 
 export class BlendedPitcherProjection extends Schema.Class<BlendedPitcherProjection>(
@@ -219,6 +228,8 @@ export class BlendedPitcherProjection extends Schema.Class<BlendedPitcherProject
   // See BatterProjectionSource.status (F4 playing-time/injury discount).
   status: Schema.optional(Schema.String),
   eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
+  selectedPosition: Schema.optional(Schema.String),
+  volatility: Schema.optional(Schema.Finite),
 }) {}
 
 export class WeeklyBatterLine extends Schema.Class<WeeklyBatterLine>("WeeklyBatterLine")({
@@ -237,6 +248,7 @@ export class WeeklyBatterLine extends Schema.Class<WeeklyBatterLine>("WeeklyBatt
   obpDenominator: Schema.Finite,
   obp: Schema.Finite,
   eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
+  selectedPosition: Schema.optional(Schema.String),
   // σ multiplier on this line's Monte Carlo sampling (1.0 = neutral/default). Lets the F1
   // Δ(win-prob) ranking become variance-aware (F2). Currently defaults to neutral; a real
   // per-player boom/bust / role-uncertainty source is future work (ties into F3).
@@ -259,6 +271,7 @@ export class WeeklyPitcherLine extends Schema.Class<WeeklyPitcherLine>("WeeklyPi
   svh: Schema.Finite,
   expectedStarts: Schema.optional(Schema.Finite),
   eligiblePositions: Schema.optional(Schema.Array(Schema.String)),
+  selectedPosition: Schema.optional(Schema.String),
   // σ multiplier on this line's Monte Carlo sampling (1.0 = neutral/default). See WeeklyBatterLine.
   volatility: Schema.optional(Schema.Finite),
 }) {}
@@ -406,6 +419,30 @@ const weightedMean = <A extends { source: string }>(
     totalWeight += weight;
   }
   return totalWeight > 0 ? total / totalWeight : 0;
+};
+
+export const volatilityFromCv = (cv: number) =>
+  boundedMultiplier(1 + VOLATILITY_CV_GAIN * cv, VOLATILITY_MIN, VOLATILITY_MAX);
+
+const coefficientOfVariation = (values: ReadonlyArray<number>) => {
+  const usable = values.filter((value) => Number.isFinite(value));
+  if (usable.length < 2) return 0;
+  const avg = usable.reduce((sum, value) => sum + value, 0) / usable.length;
+  if (avg <= 0) return 0;
+  const variance = usable.reduce((sum, value) => sum + (value - avg) ** 2, 0) / usable.length;
+  return Math.sqrt(variance) / avg;
+};
+
+const volatilityFromDispersion = <A extends { source: string }>(
+  rows: WeightedRows<A>,
+  categories: ReadonlyArray<string>,
+  select: (row: A, category: string) => number,
+) => {
+  const cvs = categories.map((category) =>
+    coefficientOfVariation(rows.map((row) => select(row, category))),
+  );
+  const meanCv = cvs.length === 0 ? 0 : cvs.reduce((sum, cv) => sum + cv, 0) / cvs.length;
+  return volatilityFromCv(meanCv);
 };
 
 const groupByPlayer = <A extends { playerKey: string }>(rows: ReadonlyArray<A>) => {
@@ -649,6 +686,13 @@ export const blendBatterProjections = (
       status: first.status,
       bats: first.bats,
       eligiblePositions: first.eligiblePositions == null ? undefined : [...first.eligiblePositions],
+      selectedPosition: first.selectedPosition,
+      volatility: volatilityFromDispersion(group, batterBlendCategories, (row, category) => {
+        if (category === "ab" || category === "bb" || category === "hbp" || category === "sf") {
+          return inferObpComponents(row)[category];
+        }
+        return row[category as keyof BatterProjectionSource] as number;
+      }),
     });
   });
 };
@@ -681,6 +725,11 @@ export const blendPitcherProjections = (
       ),
       status: first.status,
       eligiblePositions: first.eligiblePositions == null ? undefined : [...first.eligiblePositions],
+      selectedPosition: first.selectedPosition,
+      volatility: volatilityFromDispersion(group, pitcherBlendCategories, (row, category) => {
+        if (category === "appearances") return row.appearances ?? row.gs;
+        return row[category as keyof PitcherProjectionSource] as number;
+      }),
     });
   });
 };
@@ -725,6 +774,8 @@ export const prorateBatterProjection = (
     obp: safeDivide(obpNumerator * contactMultiplier, obpDenominator),
     eligiblePositions:
       projection.eligiblePositions == null ? undefined : [...projection.eligiblePositions],
+    selectedPosition: projection.selectedPosition,
+    volatility: projection.volatility,
   });
 };
 
@@ -775,6 +826,8 @@ export const proratePitcherProjection = (
     expectedStarts: starts,
     eligiblePositions:
       projection.eligiblePositions == null ? undefined : [...projection.eligiblePositions],
+    selectedPosition: projection.selectedPosition,
+    volatility: projection.volatility,
   });
 };
 

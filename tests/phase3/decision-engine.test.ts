@@ -1,13 +1,17 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  bankedFromMatchup,
   categoryWeight,
   computeSgpDenominators,
   MAX_SIMULATED_ADD_CANDIDATES,
   optimizeLineup,
+  prepareSimJob,
   PRODUCTION_SIMULATION_COUNT,
   rankAddCandidates,
+  reduceSimJob,
   simulateMatchup,
+  simulateUnit,
 } from "../../src/services/DecisionEngine";
 import {
   LeagueStatePlayer,
@@ -57,6 +61,52 @@ const pitcher = (overrides: Partial<ConstructorParameters<typeof WeeklyPitcherLi
     ...overrides,
   });
 
+const snapshot = (overrides: Partial<ConstructorParameters<typeof LeagueStateSnapshot>[0]> = {}) =>
+  new LeagueStateSnapshot({
+    leagueId: "62744",
+    teamId: "12",
+    scoringFormat: "cumulative-category-h2h",
+    scoringCategories: [
+      "R",
+      "H",
+      "HR",
+      "RBI",
+      "SB",
+      "TB",
+      "OBP",
+      "OUT",
+      "K",
+      "ERA",
+      "WHIP",
+      "QS",
+      "SV+H",
+    ],
+    weeklyAddLimit: 6,
+    addsUsed: 0,
+    roster: [
+      new LeagueStatePlayer({
+        playerKey: "mine",
+        name: "Mine",
+        team: "NYY",
+        eligiblePositions: ["Util"],
+        selectedPosition: "Util",
+      }),
+    ],
+    rosterSlots: [new RosterSlotCount({ position: "Util", count: 1 })],
+    emptySlots: [],
+    ilUsed: 0,
+    ilSlots: 0,
+    matchup: {
+      week: 10,
+      weekStart: "2026-06-01",
+      weekEnd: "2026-06-07",
+      opponentTeamKey: "mlb.l.62744.t.2",
+      opponentTeamName: "Opponent",
+      categories: [],
+    },
+    ...overrides,
+  });
+
 describe("DecisionEngine Phase 3", () => {
   it("uses a research-backed production Monte Carlo floor", () => {
     expect(PRODUCTION_SIMULATION_COUNT).toBeGreaterThanOrEqual(5000);
@@ -87,7 +137,21 @@ describe("DecisionEngine Phase 3", () => {
   });
 
   it("keeps add-candidate simulation breadth within Worker CPU limits", () => {
-    expect(MAX_SIMULATED_ADD_CANDIDATES).toBeLessThanOrEqual(8);
+    expect(MAX_SIMULATED_ADD_CANDIDATES).toBe(20);
+  });
+
+  it("reconstructs exact ERA components from Yahoo ERA plus OUT", () => {
+    const banked = bankedFromMatchup(
+      [
+        { category: "ERA", myValue: "4.50", opponentValue: "0.00" },
+        { category: "OUT", myValue: "27", opponentValue: "0" },
+      ],
+      "mine",
+      0,
+    );
+
+    expect(banked.era.er).toBeCloseTo(4.5, 10);
+    expect(banked.era.outs).toBe(27);
   });
 
   it("computes SGP denominators as standings-history slopes", () => {
@@ -177,6 +241,125 @@ describe("DecisionEngine Phase 3", () => {
     const hits = result.categories.find((category) => category.category === "H");
     expect(obp?.winProbability).toBeGreaterThan(0.85);
     expect(hits?.winProbability).toBeLessThan(0.1);
+  });
+
+  it("seeds the sim with a banked SB lead and downweights the locked category", () => {
+    const stored = prepareSimJob(
+      new WeeklyProjectionSet({
+        myRoster: [batter({ playerKey: "mine", sb: 0.1, selectedPosition: "Util" })],
+        opponentRoster: [batter({ playerKey: "opp", sb: 0.1, selectedPosition: "Util" })],
+        freeAgents: [],
+      }),
+      snapshot({
+        scoringCategories: ["SB"],
+        matchup: {
+          week: 10,
+          weekStart: "2026-06-01",
+          weekEnd: "2026-06-07",
+          opponentTeamKey: "mlb.l.62744.t.2",
+          opponentTeamName: "Opponent",
+          categories: [{ category: "SB", myValue: "10", opponentValue: "0" }],
+        },
+      }),
+      [],
+      "2026-06-06T12:00:00.000Z",
+    );
+    const report = reduceSimJob(stored, []);
+    const sb = report.baseline.categories.find((category) => category.category === "SB");
+
+    expect(sb?.winProbability).toBeGreaterThan(0.95);
+    expect(report.scout.categoryWeights["SB"]).toBeLessThan(0.35);
+  });
+
+  it("keeps zero-banked specs identical to the unseeded simulation path", () => {
+    const set = new WeeklyProjectionSet({
+      myRoster: [
+        batter({ playerKey: "mine", selectedPosition: "Util" }),
+        pitcher({ playerKey: "my-pitcher", selectedPosition: "P" }),
+      ],
+      opponentRoster: [
+        batter({ playerKey: "opp", selectedPosition: "Util" }),
+        pitcher({ playerKey: "opp-pitcher", selectedPosition: "P" }),
+      ],
+      freeAgents: [],
+    });
+    const categories = [
+      "R",
+      "H",
+      "HR",
+      "RBI",
+      "SB",
+      "TB",
+      "OBP",
+      "OUT",
+      "K",
+      "ERA",
+      "WHIP",
+      "QS",
+      "SV+H",
+    ];
+    const zeroCategories = categories.map((category) => ({
+      category,
+      myValue: "0",
+      opponentValue: "0",
+    }));
+
+    const unseeded = prepareSimJob(set, undefined, []);
+    const seeded = prepareSimJob(
+      set,
+      snapshot({
+        scoringCategories: categories,
+        roster: [
+          new LeagueStatePlayer({
+            playerKey: "mine",
+            name: "Mine",
+            team: "NYY",
+            eligiblePositions: ["Util"],
+            selectedPosition: "Util",
+          }),
+          new LeagueStatePlayer({
+            playerKey: "my-pitcher",
+            name: "Pitcher",
+            team: "SEA",
+            eligiblePositions: ["P"],
+            selectedPosition: "P",
+          }),
+        ],
+        matchup: {
+          week: 10,
+          weekStart: "2026-06-01",
+          weekEnd: "2026-06-07",
+          opponentTeamKey: "mlb.l.62744.t.2",
+          opponentTeamName: "Opponent",
+          categories: zeroCategories,
+        },
+      }),
+      [],
+      "2026-06-01T00:00:00.000Z",
+    );
+
+    expect(JSON.parse(JSON.stringify(seeded.stored.baseline))).toEqual(
+      JSON.parse(JSON.stringify(unseeded.stored.baseline)),
+    );
+    expect(JSON.parse(JSON.stringify(simulateUnit(seeded, 0)))).toEqual(
+      JSON.parse(JSON.stringify(seeded.stored.baseline)),
+    );
+  });
+
+  it("filters the opponent roster through activeWeeklyLines using selected positions", () => {
+    const stored = prepareSimJob(
+      new WeeklyProjectionSet({
+        myRoster: [batter({ playerKey: "mine", selectedPosition: "Util" })],
+        opponentRoster: [
+          batter({ playerKey: "opp-active", r: 1, selectedPosition: "Util" }),
+          batter({ playerKey: "opp-bench", r: 100, selectedPosition: "BN" }),
+        ],
+        freeAgents: [],
+      }),
+      snapshot(),
+    );
+
+    expect(stored.stored.spec.opponentRoster.map((line) => line.playerKey)).toEqual(["opp-active"]);
   });
 
   it("draws opponent samples from a stream independent of myRoster size (CRN invariant)", () => {
@@ -304,6 +487,90 @@ describe("DecisionEngine Phase 3", () => {
     // Lock-padding move barely moves the objective; coin-flip move clearly does.
     expect(Math.abs(lockPadder!.weeklyDelta)).toBeLessThan(0.1);
     expect(coinFlipHelper!.weeklyDelta).toBeGreaterThan(0.1);
+  });
+
+  it("selects simulated candidates by baseline-weighted weekly flip score", () => {
+    const set = new WeeklyProjectionSet({
+      myRoster: [batter({ playerKey: "mine", hr: 12, sb: 5, r: 1, h: 1, rbi: 1, tb: 25 })],
+      opponentRoster: [batter({ playerKey: "opp", hr: 1, sb: 5, r: 20, h: 20, rbi: 20, tb: 5 })],
+      freeAgents: [
+        batter({ playerKey: "all-rounder", name: "All Rounder", r: 3, h: 3, rbi: 3, sb: 1 }),
+        batter({
+          playerKey: "sb-specialist",
+          name: "SB Specialist",
+          r: 0,
+          h: 0,
+          hr: 0,
+          rbi: 0,
+          sb: 8,
+          tb: 0,
+          obpNumerator: 0,
+          obpDenominator: 0,
+          obp: 0,
+        }),
+      ],
+    });
+
+    const stored = prepareSimJob(set, undefined, []);
+    expect(stored.stored.spec.candidates.map((candidate) => candidate.line.playerKey)).toEqual([
+      "sb-specialist",
+      "all-rounder",
+    ]);
+  });
+
+  it("keeps candidate ordering deterministic under shuffled input", () => {
+    const candidates = [
+      batter({ playerKey: "c", name: "C", sb: 5 }),
+      batter({ playerKey: "a", name: "A", sb: 5 }),
+      batter({ playerKey: "b", name: "B", sb: 5 }),
+    ];
+    const build = (freeAgents: ReadonlyArray<WeeklyBatterLine>) =>
+      prepareSimJob(
+        new WeeklyProjectionSet({
+          myRoster: [batter({ playerKey: "mine", sb: 3 })],
+          opponentRoster: [batter({ playerKey: "opp", sb: 3 })],
+          freeAgents,
+        }),
+        undefined,
+        [],
+      ).stored.spec.candidates.map((candidate) => candidate.line.playerKey);
+
+    expect(build(candidates)).toEqual(build([...candidates].reverse()));
+    expect(build(candidates)).toEqual(["a", "b", "c"]);
+  });
+
+  it("unions the top season-SGP safety candidates into the 20-player sim funnel", () => {
+    const speedCandidates = Array.from({ length: 25 }, (_, index) =>
+      batter({
+        playerKey: `speed-${String(index).padStart(2, "0")}`,
+        name: `Speed ${index}`,
+        hr: 0,
+        r: 0,
+        h: 0,
+        rbi: 0,
+        sb: 25 - index,
+        tb: 0,
+        obpNumerator: 0,
+        obpDenominator: 0,
+        obp: 0,
+      }),
+    );
+    const stored = prepareSimJob(
+      new WeeklyProjectionSet({
+        myRoster: [batter({ playerKey: "mine", hr: 12, sb: 5, tb: 25 })],
+        opponentRoster: [batter({ playerKey: "opp", hr: 1, sb: 5, tb: 5 })],
+        freeAgents: [
+          ...speedCandidates,
+          batter({ playerKey: "season-stud", name: "Season Stud", hr: 100, tb: 300, sb: 0 }),
+        ],
+      }),
+      undefined,
+      [],
+    );
+    const selected = stored.stored.spec.candidates.map((candidate) => candidate.line.playerKey);
+
+    expect(selected).toHaveLength(MAX_SIMULATED_ADD_CANDIDATES);
+    expect(selected).toContain("season-stud");
   });
 
   it("prefers the ceiling candidate for a losing category and the floor candidate for a winning one (F2)", () => {
