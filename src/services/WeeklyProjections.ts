@@ -242,7 +242,8 @@ export class WeeklyProjections extends Context.Service<
       const projectionData = yield* ProjectionData;
       const playerIdentity = yield* PlayerIdentity;
 
-      const currentMatchup = yield* Effect.cached(
+      // Worker isolates can live for days; TTL avoids memoizing transient upstream failures forever.
+      const currentMatchup = yield* Effect.cachedWithTTL(
         Effect.gen(function* () {
           const snapshot = yield* leagueState.snapshot;
           const [opponentRosterPayload, freeAgentPayload, batters, pitchers, context] =
@@ -302,6 +303,7 @@ export class WeeklyProjections extends Context.Service<
             canonicalContext,
           );
         }).pipe(Effect.mapError(mapError)),
+        "45 minutes",
       );
 
       return WeeklyProjections.of({ currentMatchup });

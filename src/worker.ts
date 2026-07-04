@@ -13,7 +13,7 @@ import { CRON_ROUTINES } from "./infra/crons.ts";
 import { FREE_TIER_MODE } from "./infra/free-tier.ts";
 import { DecisionLogDb, LeagueStateCache } from "./infra/resources.ts";
 import { deliverManagerBriefing } from "./routines/delivery.ts";
-import { dispatchRoutine } from "./routines/dispatch.ts";
+import { dispatchRoutine, safeDispatchRoutine } from "./routines/dispatch.ts";
 import { ApiCache } from "./services/ApiCache.ts";
 import { CalibrationHarness } from "./services/CalibrationHarness.ts";
 import { Db } from "./services/Db.ts";
@@ -73,7 +73,7 @@ const registerCron = (
   >,
 ) =>
   Cloudflare.cron(cron.expression).subscribe(() =>
-    dispatchRoutine(cron.routine).pipe(Effect.provide(runtimeLayer), Effect.orDie),
+    safeDispatchRoutine(cron.routine).pipe(Effect.provide(runtimeLayer), Effect.orDie),
   );
 
 const easternDateKey = (date: Date) => {

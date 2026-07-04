@@ -58,11 +58,11 @@ const SCHEDULER_TASKS = [
   "send-briefing",
 ] as const satisfies ReadonlyArray<SchedulerTask>;
 
-const taskStateKey = (task: SchedulerTask) => `scheduler:task:${task}:last-success:v1`;
+export const taskStateKey = (task: SchedulerTask) => `scheduler:task:${task}:last-success:v1`;
 const taskRunCountKey = (task: SchedulerTask, date: string) =>
   `scheduler:task:${task}:run-count:${date}:v2`;
 const DAILY_TASK_LIMITS = FREE_TIER_MODE.dailyTaskLimits satisfies Record<SchedulerTask, number>;
-class TaskState extends Schema.Class<TaskState>("TaskState")({
+export class TaskState extends Schema.Class<TaskState>("TaskState")({
   completedAt: Schema.String,
 }) {}
 
@@ -137,7 +137,7 @@ const toSchedulerError = (task: SchedulerTask, error: unknown) =>
     message: error instanceof Error ? error.message : String(error),
   });
 
-const easternDateKey = (date: Date) => {
+export const easternDateKey = (date: Date) => {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/New_York",
     year: "numeric",
@@ -148,7 +148,7 @@ const easternDateKey = (date: Date) => {
   return `${part("year")}-${part("month")}-${part("day")}`;
 };
 
-const easternHour = (date: Date) => {
+export const easternHour = (date: Date) => {
   const hour = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
     hour: "2-digit",
@@ -259,11 +259,10 @@ type PrecomputeCache = {
 // the next tick. ONE-STAGE-PER-TICK is a HARD RULE: a single invocation advances roughly one heavy
 // stage, and spec-build and reduce NEVER run in the same invocation (a tick doing both was ~1037ms
 // CPU → exceededCpu; spec-build alone is ~874ms, fan-out+reduce together ~632ms — both safe).
-//   Stage 1 (spec): no StoredSimJob at simSpecKey(date) — or it is STALE (built from an older
-//     context than `contextAt`) — → build it (one baseline sim) and persist, then RETURN
-//     IMMEDIATELY (`spec-built`). It does NOT fan out or reduce this tick; a later tick (spec
-//     present, not stale) does that. Any existing partials/reduced artifact are implicitly stale and
-//     get OVERWRITTEN by the later fan-out/reduce (same keys), so no delete primitive is needed.
+//   Stage 1 (spec): no StoredSimJob at simSpecKey(date) → build it (one baseline sim) and persist,
+//     then RETURN IMMEDIATELY (`spec-built`). A same-day spec is pinned to the context it was built
+//     from; later refresh-context ticks must not invalidate it, or fan-out never gets a stable spec
+//     to finish. It does NOT fan out or reduce this tick; a later tick (spec present) does that.
 //   Stage 2 (fan-out): pending = {1..unitCount} minus units whose simPartialKey already exists.
 //     Fan out each pending unit to the separate SimChunkWorker (its OWN CPU budget); the dispatcher
 //     only awaits I/O. This shares a tick with stage 3 (fan-out is I/O, reduce ~632ms → safe).
@@ -282,19 +281,15 @@ export const runPrecompute = (deps: {
   ) => Effect.Effect<ManagerBriefingReport, unknown>;
 }): Effect.Effect<PrecomputeOutcome, unknown> =>
   Effect.gen(function* () {
-    const { cache, date, contextAt, buildSpec, fetchChunk, briefingFromReport } = deps;
+    const { cache, date, buildSpec, fetchChunk, briefingFromReport } = deps;
     const chunkCount = deps.chunkCount ?? 1;
     let stored = yield* cache.get(simSpecKey(date), StoredSimJob, SIM_JOB_MAX_AGE_MS);
-    const isStale =
-      stored != null && contextAt != null && (stored.stored.contextAt ?? "") < contextAt;
 
-    if (stored == null || isStale) {
+    if (stored == null) {
       // Stage 1: build + persist the spec (one baseline sim, the heavy ~874ms CPU of this stage),
       // then RETURN IMMEDIATELY. One-stage-per-tick HARD RULE: this tick must NOT also fan out or
       // reduce (spec-build + reduce in one tick is the ~1037ms exceededCpu failure). A later tick
-      // (spec now present, not stale) does the fan-out + reduce. The fresh spec's unitCount is the
-      // count to fan out; any stale partials/reduced artifact from a prior spec get overwritten by
-      // the later fan-out/reduce on the same keys.
+      // does the fan-out + reduce. The spec's unitCount is the count to fan out.
       const rebuilt = yield* buildSpec;
       yield* cache.put(simSpecKey(date), rebuilt);
       return { stage: "spec-built", unitCount: rebuilt.stored.unitCount, reduced: false } as const;

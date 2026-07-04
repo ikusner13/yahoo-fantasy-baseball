@@ -367,6 +367,7 @@ export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport
 export class TelegramNotifier extends Context.Service<
   TelegramNotifier,
   {
+    readonly postMessage: (content: string) => Effect.Effect<void, TelegramNotifierError>;
     readonly postManagerBriefing: (
       briefing: ManagerBriefingReport,
     ) => Effect.Effect<void, TelegramNotifierError>;
@@ -381,6 +382,13 @@ export class TelegramNotifier extends Context.Service<
 
       if (Option.isNone(tokenOption) || Option.isNone(chatIdOption)) {
         return TelegramNotifier.of({
+          postMessage: () =>
+            Effect.fail(
+              new TelegramNotifierError({
+                message:
+                  "Telegram delivery disabled; missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID",
+              }),
+            ),
           postManagerBriefing: () =>
             Effect.fail(
               new TelegramNotifierError({
@@ -426,6 +434,7 @@ export class TelegramNotifier extends Context.Service<
           );
 
       return TelegramNotifier.of({
+        postMessage,
         postManagerBriefing: (briefing) =>
           Effect.gen(function* () {
             for (const chunk of splitDiscordMessage(

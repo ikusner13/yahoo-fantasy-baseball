@@ -233,41 +233,33 @@ describe("precompute dispatcher (runPrecompute)", () => {
     expect(again.stage).toBe("already-reduced");
   });
 
-  it("rebuilds the spec and re-fans-out when a newer context exists (staleness)", async () => {
+  it("keeps the existing same-day spec when a newer context exists", async () => {
     const store: Store = new Map();
     const specForContext = (contextAt: string) =>
       Effect.sync(() => prepareSimJob(fixtureSet(), undefined, [], contextAt));
-    // Spec built from an older context: tick 1 builds spec (spec-built), tick 2 reduces.
+    // Spec built from an older context: tick 1 builds spec and returns before fan-out.
     const built = await run(store, {
       contextAt: "2026-06-20T10:00:00.000Z",
       buildSpec: specForContext("2026-06-20T10:00:00.000Z"),
     });
     expect(built.stage).toBe("spec-built");
-    await run(store, {
-      contextAt: "2026-06-20T10:00:00.000Z",
-      buildSpec: specForContext("2026-06-20T10:00:00.000Z"),
-    });
-    expect(store.has(simReducedKey(DATE))).toBe(true);
     const firstSpec = store.get(simSpecKey(DATE))!.data;
 
-    // A newer context arrives: the spec must be REBUILT (spec-built), not treated as already-reduced
-    // — one-stage-per-tick means this rebuild tick returns immediately without re-reducing.
-    const rebuild = await run(store, {
-      contextAt: "2026-06-20T15:00:00.000Z",
-      buildSpec: specForContext("2026-06-20T15:00:00.000Z"),
-    });
-    expect(rebuild.stage).toBe("spec-built");
-    // A following tick (spec now fresh, not stale) re-fans-out and re-reduces.
+    let buildCalls = 0;
     const outcome = await run(store, {
       contextAt: "2026-06-20T15:00:00.000Z",
-      buildSpec: specForContext("2026-06-20T15:00:00.000Z"),
+      buildSpec: Effect.sync(() => {
+        buildCalls += 1;
+        return prepareSimJob(fixtureSet(), undefined, [], "2026-06-20T15:00:00.000Z");
+      }),
     });
     expect(outcome.stage).toBe("reduced");
+    expect(buildCalls).toBe(0);
     const rebuiltSpec = store.get(simSpecKey(DATE))!.data;
     const parsedFirst = JSON.parse(firstSpec) as { stored: { contextAt?: string } };
     const parsedRebuilt = JSON.parse(rebuiltSpec) as { stored: { contextAt?: string } };
     expect(parsedFirst.stored.contextAt).toBe("2026-06-20T10:00:00.000Z");
-    expect(parsedRebuilt.stored.contextAt).toBe("2026-06-20T15:00:00.000Z");
+    expect(parsedRebuilt.stored.contextAt).toBe("2026-06-20T10:00:00.000Z");
   });
 
   it("reduce output matches reduceSimJob over the persisted partials", async () => {
