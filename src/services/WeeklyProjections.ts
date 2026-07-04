@@ -18,6 +18,10 @@ import {
 } from "./ProjectionModel.ts";
 import { YahooClient, type YahooPlayersPayload, type YahooRosterPayload } from "./YahooClient.ts";
 
+// 200 = 8 Yahoo FA pages @25. Worker-fallback budget check (free tier: 50 external
+// subrequests/invocation; D1/KV don't count): snapshot ~3 + opp roster 1 + 8 FA pages
+// + ≤8 FanGraphs + ~3 schedule/odds ≈ 25 worst-case. Raising this past ~700 (28 pages)
+// would breach the budget — override via FREE_AGENT_COUNT env instead of editing this.
 const DEFAULT_FREE_AGENT_COUNT = 200;
 
 export class WeeklyProjectionsError extends Data.TaggedError("WeeklyProjectionsError")<{
