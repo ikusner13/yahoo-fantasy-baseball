@@ -114,9 +114,9 @@ export const closeOutPreviousWeek = Effect.gen(function* () {
 
   const valueByStatId = (
     stats: ReadonlyArray<{
-      readonly stat: { readonly stat_id: string | number; readonly value: string | number };
+      readonly stat: { readonly stat_id: string | number; readonly value: string | number | null };
     }>,
-  ) => new Map(stats.map((entry) => [String(entry.stat.stat_id), entry.stat.value]));
+  ) => new Map(stats.map((entry) => [String(entry.stat.stat_id), entry.stat.value ?? Number.NaN]));
   const myValues = valueByStatId(matchup["0"].teams["0"].team[1].team_stats.stats);
   const opponentValues = valueByStatId(matchup["0"].teams["1"].team[1].team_stats.stats);
 

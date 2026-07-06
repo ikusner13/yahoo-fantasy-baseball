@@ -211,7 +211,8 @@ const YahooPlayersPayload = Schema.Struct({
 
 const YahooStat = Schema.Struct({
   stat_id: Schema.Union([Schema.String, Schema.Finite]),
-  value: Schema.Union([Schema.String, Schema.Finite]),
+  // Yahoo returns null for ratio categories (ERA/WHIP) with no denominator yet, e.g. 0 IP early in a period.
+  value: Schema.Union([Schema.String, Schema.Finite, Schema.Null]),
 });
 
 const YahooTeamStats = Schema.Struct({
