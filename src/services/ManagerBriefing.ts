@@ -1203,7 +1203,13 @@ export class ManagerBriefing extends Context.Service<
           { aggression },
         );
         return { scoreboard, waiverTargets };
-      }).pipe(Effect.orElseSucceed(() => undefined));
+      }).pipe(
+        // Cap the 5 added network calls so a wedged Yahoo/projection fetch can't stall brief
+        // delivery — timeout FAILS with TimeoutError, which orElseSucceed then degrades to no
+        // strategic sections (the brief still ships its core lineup/transaction content).
+        Effect.timeout("20 seconds"),
+        Effect.orElseSucceed(() => undefined),
+      );
 
       // Shared post-plan assembly: lineup + write status + buildManagerBriefing. Used by both the
       // live path and the precompute path so they produce an identical report from the same plan.
