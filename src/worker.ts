@@ -17,7 +17,7 @@ import { dispatchRoutine, safeDispatchRoutine } from "./routines/dispatch.ts";
 import { ApiCache } from "./services/ApiCache.ts";
 import { CalibrationHarness } from "./services/CalibrationHarness.ts";
 import { Db } from "./services/Db.ts";
-import { DecisionEngine } from "./services/DecisionEngine.ts";
+import { computeSgpDenominators, DecisionEngine } from "./services/DecisionEngine.ts";
 import { DiscordNotifier } from "./services/DiscordNotifier.ts";
 import { DailyLineupAdvisor } from "./services/DailyLineupAdvisor.ts";
 import { LeagueState } from "./services/LeagueState.ts";
@@ -38,6 +38,7 @@ import {
 } from "./services/ManagerBriefing.ts";
 import { PlayerIdentity } from "./services/PlayerIdentity.ts";
 import { ProjectionData } from "./services/ProjectionData.ts";
+import { blendBatterProjections, blendPitcherProjections } from "./services/ProjectionModel.ts";
 import {
   readSchedulerStatus,
   Scheduler,
@@ -49,9 +50,20 @@ import { StandingsHistory } from "./services/StandingsHistory.ts";
 import { runSimChunk } from "./services/SimChunk.ts";
 import { renderManagerBriefingForTelegram } from "./services/TelegramNotifier.ts";
 import { TelegramNotifier } from "./services/TelegramNotifier.ts";
+import {
+  buildValueIndex,
+  CATEGORIES as TRADE_CATEGORIES,
+  findCounters,
+  lookupValue,
+  type Category as TradeCategory,
+} from "./services/TradeEval.ts";
 import { TransactionPlanner } from "./services/TransactionPlanner.ts";
 import { WeeklyProjections } from "./services/WeeklyProjections.ts";
-import { YahooClient } from "./services/YahooClient.ts";
+import {
+  YahooClient,
+  type YahooRosterPayload,
+  type YahooStandingsPayload,
+} from "./services/YahooClient.ts";
 import { YahooLineupExecutor } from "./services/YahooLineupExecutor.ts";
 import { kvYahooTokenStore, YahooOAuth } from "./services/YahooOAuth.ts";
 import type { D1ProxyMethod, D1ProxyQuery } from "./services/WorkerAdmin.ts";
@@ -212,6 +224,49 @@ const htmlResponse = (body: string, options?: { readonly status?: number }) =>
     status: options?.status,
     contentType: "text/html; charset=utf-8",
   });
+
+// Mirrors LeagueState.ts's inline roster parsing / scripts/fantasy-cli.ts's
+// `rosterPlayersFromPayload` — a plain roster-players extraction from a Yahoo roster payload.
+const rosterPlayersFromTeamPayload = (payload: YahooRosterPayload) =>
+  payload.fantasy_content.team[1].roster["0"].players.map((entry) => {
+    const [player] = entry.player;
+    return { name: player.name, team: player.team };
+  });
+
+// Mirrors StandingsHistory.ts's `metadataValue` helper (module-private there) for pulling a
+// field (team_key / name) out of a Yahoo team-metadata array.
+const standingsMetadataValue = (items: unknown, key: string) => {
+  if (!Array.isArray(items)) return undefined;
+  for (const item of items) {
+    if (item != null && typeof item === "object" && key in item) {
+      const value = (item as Record<string, unknown>)[key];
+      if (typeof value === "string" || typeof value === "number") return String(value);
+    }
+  }
+  return undefined;
+};
+
+// Resolves a `team` query param (case-insensitive team NAME, or a bare numeric teamId) to a
+// Yahoo team key. Returns undefined (never throws) when it can't be resolved so the route can
+// still answer with the core verdict and an explanatory note.
+const resolveTeamKey = (
+  standings: YahooStandingsPayload,
+  leagueId: string,
+  teamParam: string,
+): string | undefined => {
+  const trimmed = teamParam.trim();
+  if (/^\d+$/.test(trimmed)) return `mlb.l.${leagueId}.t.${trimmed}`;
+  const teams = standings.fantasy_content.league[1].standings[0].teams;
+  for (const entry of Object.values(teams)) {
+    const team = (entry as { readonly team?: unknown })?.team;
+    if (!Array.isArray(team)) continue;
+    const metadataItems = team[0];
+    const name = standingsMetadataValue(metadataItems, "name");
+    const key = standingsMetadataValue(metadataItems, "team_key");
+    if (name != null && key != null && name.toLowerCase() === trimmed.toLowerCase()) return key;
+  }
+  return undefined;
+};
 
 const D1_PROXY_METHODS = new Set(["run", "all", "get", "values"]);
 
@@ -1236,6 +1291,164 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
           return yield* HttpServerResponse.json({
             ok: true,
             report,
+          });
+        }
+
+        if (request.method === "GET" && url.pathname === "/admin/trade-eval") {
+          const adminToken = yield* Config.string("ADMIN_TRIGGER_TOKEN");
+          if (url.searchParams.get("token") !== adminToken) {
+            return HttpServerResponse.text("Unauthorized", { status: 401 });
+          }
+
+          const parseNames = (value: string | null) =>
+            (value ?? "")
+              .split(",")
+              .map((name) => name.trim())
+              .filter((name) => name.length > 0);
+
+          const sendNames = parseNames(url.searchParams.get("send"));
+          const receiveNames = parseNames(url.searchParams.get("receive"));
+          const teamParam = url.searchParams.get("team")?.trim();
+
+          if (sendNames.length === 0 || receiveNames.length === 0) {
+            return yield* HttpServerResponse.json(
+              {
+                ok: false,
+                error:
+                  "Both `send` and `receive` query params are required (comma-separated player names).",
+              },
+              { status: 400 },
+            );
+          }
+
+          const FAIRNESS_BAND = 1.5;
+
+          const outcome = yield* Effect.gen(function* () {
+            const leagueState = yield* LeagueState;
+            const projectionData = yield* ProjectionData;
+            const standingsHistory = yield* StandingsHistory;
+            const yahoo = yield* YahooClient;
+
+            const [snapshot, batterRows, pitcherRows] = yield* Effect.all([
+              leagueState.snapshot,
+              projectionData.batterProjections,
+              projectionData.pitcherProjections,
+            ]);
+
+            const denominators = yield* standingsHistory.categoryTotals.pipe(
+              Effect.map(computeSgpDenominators),
+              Effect.orElseSucceed(() => computeSgpDenominators([])),
+            );
+
+            const scoringCategories = new Set(
+              snapshot.scoringCategories.filter((category): category is TradeCategory =>
+                (TRADE_CATEGORIES as ReadonlyArray<string>).includes(category),
+              ),
+            );
+
+            const blendedBatters = blendBatterProjections(batterRows);
+            const blendedPitchers = blendPitcherProjections(pitcherRows);
+            const valueIndex = buildValueIndex(
+              blendedBatters,
+              blendedPitchers,
+              denominators,
+              scoringCategories,
+            );
+
+            const unmatched: Array<string> = [];
+            const resolveValues = (names: ReadonlyArray<string>) =>
+              names.flatMap((name) => {
+                const value = lookupValue(valueIndex, name);
+                if (value == null) {
+                  unmatched.push(name);
+                  return [];
+                }
+                return [value];
+              });
+
+            const sendValues = resolveValues(sendNames);
+            const receiveValues = resolveValues(receiveNames);
+
+            const mySend = sendValues.reduce((sum, player) => sum + player.total, 0);
+            const myReceive = receiveValues.reduce((sum, player) => sum + player.total, 0);
+            const myNet = myReceive - mySend;
+
+            const perCategoryDelta = Object.fromEntries(
+              TRADE_CATEGORIES.map((category) => {
+                const sent = sendValues.reduce(
+                  (sum, player) => sum + player.perCategory[category],
+                  0,
+                );
+                const received = receiveValues.reduce(
+                  (sum, player) => sum + player.perCategory[category],
+                  0,
+                );
+                return [category, received - sent];
+              }),
+            ) as Record<TradeCategory, number>;
+
+            const verdict =
+              myNet > FAIRNESS_BAND
+                ? "accept (wins value)"
+                : myNet < -FAIRNESS_BAND
+                  ? "decline (loses value)"
+                  : "fair / coin-flip";
+
+            let counters: ReturnType<typeof findCounters> = [];
+            let note: string | undefined;
+
+            if (teamParam == null || teamParam.length === 0) {
+              note = "No `team` param provided; counters not computed.";
+            } else {
+              const standings = yield* yahoo.getLeagueStandings;
+              const teamKey = resolveTeamKey(standings, snapshot.leagueId, teamParam);
+              if (teamKey == null) {
+                note = `Could not resolve team "${teamParam}" to a roster; returning core verdict only.`;
+              } else {
+                const theirRoster = yield* yahoo.getRosterForTeam(teamKey);
+                const theirPlayers = rosterPlayersFromTeamPayload(theirRoster);
+                const theirValues = theirPlayers.flatMap((player) => {
+                  const value = lookupValue(valueIndex, player.name);
+                  return value == null ? [] : [value];
+                });
+                const myValues = snapshot.roster.flatMap((player) => {
+                  const value = lookupValue(valueIndex, player.name);
+                  return value == null ? [] : [value];
+                });
+                counters = findCounters({
+                  myPlayers: myValues,
+                  theirPlayers: theirValues,
+                  outgoing: sendValues,
+                  fairnessBand: FAIRNESS_BAND,
+                });
+              }
+            }
+
+            return {
+              sendValues,
+              receiveValues,
+              unmatched,
+              myNet,
+              perCategoryDelta,
+              verdict,
+              counters,
+              note,
+            };
+          }).pipe(
+            Effect.map((value) => ({ ok: true as const, ...value })),
+            Effect.catch((error) => Effect.succeed({ ok: false as const, error: String(error) })),
+            Effect.provide(
+              Layer.mergeAll(RuntimeLayer, ProjectionDataLayer, YahooLayer, StandingsHistoryLayer),
+            ),
+          );
+
+          if (!outcome.ok) {
+            return yield* HttpServerResponse.json(outcome, { status: 502 });
+          }
+
+          return yield* HttpServerResponse.json({
+            ...outcome,
+            trade: { send: sendNames, receive: receiveNames, team: teamParam },
           });
         }
 
