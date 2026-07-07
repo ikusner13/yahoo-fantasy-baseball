@@ -151,6 +151,7 @@ const stubBriefing = () =>
     rejectedTransactions: [],
     doNow: [],
     holdForLater: [],
+    waiverTargets: [],
     warnings: [],
   });
 

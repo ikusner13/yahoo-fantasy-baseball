@@ -48,7 +48,7 @@ const pitcher = new WeeklyPitcherLine({
 describe("SimJob D1 key helpers", () => {
   it("produces dated, versioned keys", () => {
     expect(simSpecKey("2026-06-20")).toBe("sim:job:2026-06-20:spec:v1");
-    expect(simReducedKey("2026-06-20")).toBe("sim:job:2026-06-20:reduced:v1");
+    expect(simReducedKey("2026-06-20")).toBe("sim:job:2026-06-20:reduced:v1.r2");
     // Partial keys carry a spec-generation segment (default "0") so a newer-context rebuild's
     // partials never collide with the prior spec's on the same date.
     expect(simPartialKey("2026-06-20", 3)).toBe("sim:job:2026-06-20:partial:0:3:0:v1");

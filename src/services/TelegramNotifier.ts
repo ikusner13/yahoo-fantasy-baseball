@@ -193,6 +193,40 @@ const nextPitcherStartLine = (briefing: ManagerBriefingReport) => {
   return start == null ? [] : [`🗓️ Next: ${start}`];
 };
 
+const signedGap = (gap: number) => {
+  const rounded = Math.abs(gap) >= 1 ? Math.round(gap) : Number(gap.toFixed(3));
+  return `${rounded > 0 ? "+" : ""}${rounded}`;
+};
+
+const buildSeasonSection = (briefing: ManagerBriefingReport) => {
+  const scoreboard = briefing.seasonScoreboard;
+  if (scoreboard == null || scoreboard.standings.length === 0) return [];
+  const worst = scoreboard.standings.slice(0, 3);
+  return [
+    "",
+    "📊 Season",
+    scoreboard.headline,
+    ...worst.map(
+      (standing) =>
+        `• ${standing.category}  ${standing.myRank}/${standing.teamCount} (${signedGap(standing.gapToMedian)} vs median) · ${standing.posture.toUpperCase()}`,
+    ),
+    `Attack: ${scoreboard.attack.join(", ") || "none"}  Punt: ${scoreboard.punt.join(", ") || "none"}`,
+  ];
+};
+
+const buildPickupsSection = (briefing: ManagerBriefingReport) => {
+  if (briefing.waiverTargets.length === 0) return [];
+  return [
+    "",
+    "🎯 Pickups (by need)",
+    ...briefing.waiverTargets.slice(0, 6).map((target) => {
+      const positions = target.positions.join("/");
+      const note = target.note.length > 0 ? ` — ${target.note}` : "";
+      return `• ${target.name} (${positions})${note}`;
+    }),
+  ];
+};
+
 export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport) => {
   const actions = briefing.doNow.length > 0 ? briefing.doNow : briefing.holdForLater.slice(0, 1);
   const lineupProblems = briefing.lineupAlerts.filter(isLineupProblem);
@@ -221,6 +255,8 @@ export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport
     if (alerts.length > 0 || writeAlerts.length > 0) {
       lines.push("", ...alerts.slice(0, 5).map((line) => `🚨 ${line}`), ...writeAlerts.slice(0, 2));
     }
+    lines.push(...buildSeasonSection(briefing));
+    lines.push(...buildPickupsSection(briefing));
     lines.push(...nextPitcherStartLine(briefing));
     return lines.join("\n");
   }
@@ -325,6 +361,9 @@ export const renderManagerBriefingForTelegram = (briefing: ManagerBriefingReport
       ...briefing.categorySituations.slice(0, 8).map(compactCategoryLine),
     );
   }
+
+  lines.push(...buildSeasonSection(briefing));
+  lines.push(...buildPickupsSection(briefing));
 
   if (briefing.addTriggers.length > 0) {
     lines.push(

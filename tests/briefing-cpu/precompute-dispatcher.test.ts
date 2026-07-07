@@ -131,6 +131,7 @@ const stubBriefing = () =>
     rejectedTransactions: [],
     doNow: [],
     holdForLater: [],
+    waiverTargets: [],
     warnings: [],
   });
 
@@ -316,6 +317,6 @@ describe("send-briefing read-only delivery (deliverPreparedBriefing)", () => {
     expect(outcome.status).toBe("delivered");
     expect(posted).toEqual(["telegram", "discord"]);
     // the prepared briefing was copied to the delivery source key
-    expect(store.has("manager-briefing:last:v1")).toBe(true);
+    expect(store.has("manager-briefing:last:v2")).toBe(true);
   });
 });

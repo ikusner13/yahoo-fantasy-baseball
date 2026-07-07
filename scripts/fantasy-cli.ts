@@ -13,6 +13,7 @@ import { LeagueState } from "../src/services/LeagueState.ts";
 import {
   buildYahooApplyPlan,
   ManagerBriefing,
+  StrategicBriefInputs,
   type YahooApplyPlan,
 } from "../src/services/ManagerBriefing.ts";
 import { makePlayerIdentityTest } from "../src/services/PlayerIdentity.ts";
@@ -2095,7 +2096,17 @@ const TransactionPlannerLayer = TransactionPlanner.layerLive.pipe(
 );
 const ManagerBriefingLayer = ManagerBriefing.layerLive.pipe(
   Layer.provide(
-    Layer.mergeAll(TransactionPlannerLayer, DailyLineupAdvisorLayer, makeApiCacheTest()),
+    Layer.mergeAll(
+      TransactionPlannerLayer,
+      DailyLineupAdvisorLayer,
+      makeApiCacheTest(),
+      LeagueStateLayer,
+      StandingsHistoryLayer,
+      YahooLayer,
+      ProjectionDataLayer,
+      // Node path — enable the strategic block (worker path deliberately omits this).
+      StrategicBriefInputs.layer,
+    ),
   ),
 );
 const AppLayer = Layer.mergeAll(

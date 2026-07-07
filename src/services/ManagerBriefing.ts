@@ -2,6 +2,7 @@ import * as Context from "effect/Context";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import {
@@ -18,7 +19,24 @@ import {
   type DailyLineupReport,
 } from "./DailyLineupAdvisor.ts";
 import { LAST_MANAGER_WRITE_STATUS_CACHE_KEY, ManagerWriteStatus } from "./ManagerWriteStatus.ts";
-import type { YahooTransactionWrite } from "./YahooClient.ts";
+import { YahooClient, type YahooTransactionWrite } from "./YahooClient.ts";
+import { LeagueState } from "./LeagueState.ts";
+import { StandingsHistory } from "./StandingsHistory.ts";
+import { ProjectionData } from "./ProjectionData.ts";
+import { computeSgpDenominators } from "./DecisionEngine.ts";
+import { blendBatterProjections, blendPitcherProjections } from "./ProjectionModel.ts";
+import {
+  buildValueIndex,
+  CATEGORIES as TRADE_CATEGORIES,
+  type Category as TradeCategory,
+} from "./TradeEval.ts";
+import {
+  type AvailablePlayer,
+  buildSeasonScoreboard,
+  buildWaiverTargets,
+  type SeasonScoreboard,
+  type WaiverTarget,
+} from "./SeasonStrategy.ts";
 
 export class ManualAction extends Schema.Class<ManualAction>("ManualAction")({
   priority: Schema.Finite,
@@ -143,13 +161,59 @@ export class ManagerBriefingReport extends Schema.Class<ManagerBriefingReport>(
   doNow: Schema.Array(ManualAction),
   holdForLater: Schema.Array(ManualAction),
   warnings: Schema.Array(Schema.String),
+  seasonScoreboard: Schema.optional(
+    Schema.Struct({
+      headline: Schema.String,
+      standings: Schema.Array(
+        Schema.Struct({
+          category: Schema.String,
+          myRank: Schema.Finite,
+          teamCount: Schema.Finite,
+          myValue: Schema.Finite,
+          gapToMedian: Schema.Finite,
+          posture: Schema.String,
+        }),
+      ),
+      attack: Schema.Array(Schema.String),
+      punt: Schema.Array(Schema.String),
+    }),
+  ),
+  waiverTargets: Schema.Array(
+    Schema.Struct({
+      name: Schema.String,
+      team: Schema.String,
+      positions: Schema.Array(Schema.String),
+      forCategories: Schema.Array(Schema.String),
+      isPitcher: Schema.Boolean,
+      note: Schema.String,
+    }),
+  ),
 }) {}
+
+// Presence of this service ENABLES the season-strategic block (scoreboard + waiver-by-need). It is
+// provided ONLY in the GHA/CLI brief path (Node — no CPU limit). The worker leaves it unset so the
+// strategic fetch + projection-blend never runs inside a CPU-bounded workerd tick (the precompute
+// reduce tick has a documented ~1s exceededCpu ceiling; an exceededCpu abort is uncatchable, so
+// orElseSucceed cannot protect it). Absent → the brief renders without the strategic sections.
+export class StrategicBriefInputs extends Context.Service<
+  StrategicBriefInputs,
+  { readonly enabled: true }
+>()("fantasy-gm/StrategicBriefInputs") {
+  static readonly layer = Layer.succeed(
+    StrategicBriefInputs,
+    StrategicBriefInputs.of({ enabled: true }),
+  );
+}
 
 export class ManagerBriefingError extends Data.TaggedError("ManagerBriefingError")<{
   readonly message: string;
 }> {}
 
-export const LAST_MANAGER_BRIEFING_CACHE_KEY = "manager-briefing:last:v1";
+// v2: ManagerBriefingReport gained seasonScoreboard/waiverTargets. Bumped so reports cached under
+// v1 (which lack the required waiverTargets field) are treated as a cache MISS rather than a decode
+// failure — the latter is an ApiCacheError that would break resend/recover-briefing + cached
+// previews until the cache is rewritten.
+export const LAST_MANAGER_BRIEFING_CACHE_KEY = "manager-briefing:last:v2";
 
 export class YahooApplyStep extends Schema.Class<YahooApplyStep>("YahooApplyStep")({
   kind: Schema.Union([
@@ -801,6 +865,8 @@ export const buildManagerBriefing = (
   plan: TransactionPlan,
   lineup?: DailyLineupReport,
   writeStatus?: ManagerWriteStatus,
+  scoreboard?: SeasonScoreboard,
+  waiverTargets: ReadonlyArray<WaiverTarget> = [],
 ) => {
   const actions = plan.steps.map((step, index) => manualAction(step, index + 1));
   const hasUrgentLineupFix = (lineup?.activeUnavailable.length ?? 0) > 0;
@@ -931,6 +997,30 @@ export const buildManagerBriefing = (
     doNow,
     holdForLater,
     warnings,
+    seasonScoreboard:
+      scoreboard == null || scoreboard.standings.length === 0
+        ? undefined
+        : {
+            headline: scoreboard.headline,
+            standings: scoreboard.standings.map((standing) => ({
+              category: standing.category,
+              myRank: standing.myRank,
+              teamCount: standing.teamCount,
+              myValue: standing.myValue,
+              gapToMedian: standing.gapToMedian,
+              posture: standing.posture,
+            })),
+            attack: [...scoreboard.attack],
+            punt: [...scoreboard.punt],
+          },
+    waiverTargets: waiverTargets.map((target) => ({
+      name: target.name,
+      team: target.team,
+      positions: [...target.positions],
+      forCategories: [...target.forCategories],
+      isPitcher: target.isPitcher,
+      note: target.note,
+    })),
   });
 };
 
@@ -1049,6 +1139,72 @@ export class ManagerBriefing extends Context.Service<
       const planner = yield* TransactionPlanner;
       const lineupAdvisor = yield* DailyLineupAdvisor;
       const cache = yield* ApiCache;
+      const leagueState = yield* LeagueState;
+      const standingsHistory = yield* StandingsHistory;
+      const yahoo = yield* YahooClient;
+      const projectionData = yield* ProjectionData;
+      // Gate: strategic block runs only when StrategicBriefInputs is provided (GHA/CLI Node path),
+      // never in the CPU-bounded worker path. serviceOption → no required dependency is added.
+      const strategicEnabled = Option.isSome(yield* Effect.serviceOption(StrategicBriefInputs));
+
+      // Season-strategic layer (scoreboard + waiver-by-need). Fragile (standings/projection/Yahoo)
+      // and intentionally non-fatal: any failure degrades to the existing brief via
+      // Effect.orElseSucceed(undefined), so a standings/projection hiccup never blocks delivery.
+      // The value index is built the SAME way as the /admin/trade-eval route.
+      const strategic = Effect.gen(function* () {
+        const [snapshot, totals, batterRows, pitcherRows, playersPayload] = yield* Effect.all([
+          leagueState.snapshot,
+          standingsHistory.categoryTotals,
+          projectionData.batterProjections,
+          projectionData.pitcherProjections,
+          yahoo.getAvailablePlayers(50),
+        ]);
+
+        const denominators = computeSgpDenominators(totals);
+        const scoringCategories = new Set(
+          snapshot.scoringCategories.filter((category): category is TradeCategory =>
+            (TRADE_CATEGORIES as ReadonlyArray<string>).includes(category),
+          ),
+        );
+        const valueIndex = buildValueIndex(
+          blendBatterProjections(batterRows),
+          blendPitcherProjections(pitcherRows),
+          denominators,
+          scoringCategories,
+        );
+
+        const myTeamKey = `mlb.l.${snapshot.leagueId}.t.${snapshot.teamId}`;
+        const teamCount = totals.length;
+        const myRank =
+          totals.find(
+            (team) =>
+              team.teamKey === myTeamKey ||
+              team.teamKey.slice(team.teamKey.indexOf(".l.")) ===
+                myTeamKey.slice(myTeamKey.indexOf(".l.")),
+          )?.rank ?? teamCount;
+        // Bottom 3 → ultra-aggressive (fight for marginal wins, punt only hopeless cats).
+        const aggression = myRank >= teamCount - 2 ? "ultra" : "normal";
+
+        const scoreboard = buildSeasonScoreboard(myTeamKey, totals, scoringCategories, aggression);
+        const available: ReadonlyArray<AvailablePlayer> =
+          playersPayload.fantasy_content.league[1].players.map((entry) => {
+            const [player] = entry.player;
+            return {
+              name: player.name,
+              team: player.team,
+              eligiblePositions: player.eligiblePositions,
+              status: player.status,
+            };
+          });
+        const waiverTargets = buildWaiverTargets(
+          available,
+          valueIndex,
+          new Set(scoreboard.attack),
+          { aggression },
+        );
+        return { scoreboard, waiverTargets };
+      }).pipe(Effect.orElseSucceed(() => undefined));
+
       // Shared post-plan assembly: lineup + write status + buildManagerBriefing. Used by both the
       // live path and the precompute path so they produce an identical report from the same plan.
       const briefingFromPlan = (plan: TransactionPlan) =>
@@ -1059,7 +1215,14 @@ export class ManagerBriefing extends Context.Service<
             ManagerWriteStatus,
             30 * 24 * 60 * 60 * 1000,
           );
-          return buildManagerBriefing(plan, lineup, writeStatus);
+          const strat = strategicEnabled ? yield* strategic : undefined;
+          return buildManagerBriefing(
+            plan,
+            lineup,
+            writeStatus,
+            strat?.scoreboard,
+            strat?.waiverTargets ?? [],
+          );
         });
       return ManagerBriefing.of({
         currentBriefing: Effect.gen(function* () {

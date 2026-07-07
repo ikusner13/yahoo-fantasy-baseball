@@ -30,6 +30,7 @@ describe("DiscordNotifier", () => {
         optimalBench: [],
         doNow: [],
         holdForLater: [],
+        waiverTargets: [],
         warnings: [],
       }),
     );
@@ -99,6 +100,7 @@ describe("DiscordNotifier", () => {
           }),
         ],
         holdForLater: [],
+        waiverTargets: [],
         warnings: ["Do not execute add/drop actions until Yahoo availability is re-checked."],
       }),
     );
@@ -155,6 +157,7 @@ describe("DiscordNotifier", () => {
         optimalBench: [],
         doNow: [],
         holdForLater: [],
+        waiverTargets: [],
         warnings: [
           "This is a manual manager decision generated from Yahoo roster, status, and lock data.",
         ],
@@ -197,6 +200,7 @@ describe("DiscordNotifier", () => {
             yahooSteps: [],
           }),
         ],
+        waiverTargets: [],
         warnings: [],
       }),
     );

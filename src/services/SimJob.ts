@@ -116,7 +116,12 @@ export const simSpecKey = (date: string) => `sim:job:${date}:spec:${SIM_JOB_KEY_
 export const simPartialKey = (date: string, unit: number, chunk = 0, gen = "0") =>
   `sim:job:${date}:partial:${gen}:${unit}:${chunk}:${SIM_JOB_KEY_VERSION}`;
 
-export const simReducedKey = (date: string) => `sim:job:${date}:reduced:${SIM_JOB_KEY_VERSION}`;
+// Independent schema-version segment for the reduced artifact only (it stores a ManagerBriefingReport):
+// bump this — not SIM_JOB_KEY_VERSION — when the report shape changes, so the expensive partial-sim
+// chunks keyed off SIM_JOB_KEY_VERSION are NOT invalidated. r2: added seasonScoreboard/waiverTargets.
+const SIM_REDUCED_SCHEMA_VERSION = "r2";
+export const simReducedKey = (date: string) =>
+  `sim:job:${date}:reduced:${SIM_JOB_KEY_VERSION}.${SIM_REDUCED_SCHEMA_VERSION}`;
 
 // Records which spec generation the (generation-free) reduced artifact was built from, so the
 // dispatcher can tell a current reduce from a STALE one after a newer-context spec rebuild without

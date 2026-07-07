@@ -35,6 +35,7 @@ const briefing = (generatedAt: string) =>
     optimalBench: [],
     doNow: [],
     holdForLater: [],
+    waiverTargets: [],
     warnings: [],
   });
 

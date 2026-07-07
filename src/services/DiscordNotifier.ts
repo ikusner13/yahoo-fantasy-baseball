@@ -124,6 +124,11 @@ const normalizeWarning = (warning: string) =>
     ? "Manager decision generated from Yahoo roster, status, lock data, matchup context, and category guardrails."
     : warning;
 
+const signedGap = (gap: number) => {
+  const rounded = Math.abs(gap) >= 1 ? Math.round(gap) : Number(gap.toFixed(3));
+  return `${rounded > 0 ? "+" : ""}${rounded}`;
+};
+
 export const renderManagerBriefingForDiscord = (briefing: ManagerBriefingReport) => {
   const actions = briefing.doNow.length > 0 ? briefing.doNow : briefing.holdForLater.slice(0, 1);
   const lineupMoves = briefing.lineupAlerts.filter(isLineupMove);
@@ -159,6 +164,34 @@ export const renderManagerBriefingForDiscord = (briefing: ManagerBriefingReport)
       "",
       "**Current categories**",
       ...briefing.categorySituations.map(categorySituationLine),
+    );
+  }
+
+  const scoreboard = briefing.seasonScoreboard;
+  if (scoreboard != null && scoreboard.standings.length > 0) {
+    lines.push(
+      "",
+      "**📊 Season**",
+      scoreboard.headline,
+      ...scoreboard.standings
+        .slice(0, 3)
+        .map(
+          (standing) =>
+            `- ${standing.category} ${standing.myRank}/${standing.teamCount} (${signedGap(standing.gapToMedian)} vs median) · ${standing.posture.toUpperCase()}`,
+        ),
+      `Attack: ${scoreboard.attack.join(", ") || "none"} | Punt: ${scoreboard.punt.join(", ") || "none"}`,
+    );
+  }
+
+  if (briefing.waiverTargets.length > 0) {
+    lines.push(
+      "",
+      "**🎯 Pickups (by need)**",
+      ...briefing.waiverTargets.slice(0, 6).map((target) => {
+        const positions = target.positions.join("/");
+        const note = target.note.length > 0 ? ` — ${target.note}` : "";
+        return `- ${target.name} (${positions})${note}`;
+      }),
     );
   }
 

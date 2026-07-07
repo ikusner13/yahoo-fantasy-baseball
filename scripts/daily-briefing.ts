@@ -24,6 +24,7 @@ import {
 import {
   LAST_MANAGER_BRIEFING_CACHE_KEY,
   ManagerBriefing,
+  StrategicBriefInputs,
 } from "../src/services/ManagerBriefing.ts";
 import { PlayerIdentity } from "../src/services/PlayerIdentity.ts";
 import { ProjectionData } from "../src/services/ProjectionData.ts";
@@ -230,7 +231,19 @@ export const makeAppLayer = () => {
     Layer.provide(Layer.mergeAll(WeeklyProjectionLayer, LeagueStateLayer, StandingsHistoryLayer)),
   );
   const ManagerBriefingLayer = ManagerBriefing.layerLive.pipe(
-    Layer.provide(Layer.mergeAll(TransactionPlannerLayer, DailyLineupAdvisorLayer, ApiCacheLayer)),
+    Layer.provide(
+      Layer.mergeAll(
+        TransactionPlannerLayer,
+        DailyLineupAdvisorLayer,
+        ApiCacheLayer,
+        LeagueStateLayer,
+        StandingsHistoryLayer,
+        YahooLayer,
+        ProjectionDataLayer,
+        // Node path — enable the strategic block (worker path deliberately omits this).
+        StrategicBriefInputs.layer,
+      ),
+    ),
   );
   const TelegramNotifierLayer = TelegramNotifier.layerLive.pipe(
     Layer.provide(FetchHttpClient.layer),

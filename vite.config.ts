@@ -9,7 +9,7 @@ export default defineConfig({
     target: "webworker",
   },
   test: {
-    include: ["tests/**/*.test.ts"],
+    include: ["tests/**/*.test.ts", "src/**/*.test.ts"],
   },
   staged: {
     "*": "vp check --fix",

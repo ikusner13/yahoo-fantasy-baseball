@@ -424,7 +424,15 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
     );
     const ManagerBriefingLayer = ManagerBriefing.layerLive.pipe(
       Layer.provide(
-        Layer.mergeAll(TransactionPlannerLayer, DailyLineupAdvisorLayer, ApiCacheLayer),
+        Layer.mergeAll(
+          TransactionPlannerLayer,
+          DailyLineupAdvisorLayer,
+          ApiCacheLayer,
+          RuntimeLayer,
+          StandingsHistoryLayer,
+          YahooLayer,
+          ProjectionDataLayer,
+        ),
       ),
     );
     const TelegramNotifierLayer = TelegramNotifier.layerLive.pipe(
@@ -1500,6 +1508,69 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
             ...outcome,
             trade: { send: sendNames, receive: receiveNames, team: teamParam },
           });
+        }
+
+        if (request.method === "GET" && url.pathname === "/admin/probable-starts") {
+          const adminToken = yield* Config.string("ADMIN_TRIGGER_TOKEN");
+          if (url.searchParams.get("token") !== adminToken) {
+            return HttpServerResponse.text("Unauthorized", { status: 401 });
+          }
+
+          const dateParam = url.searchParams.get("date")?.trim() || undefined;
+
+          // Accent-, case-, and punctuation-insensitive fold so a probable-start pitcher name
+          // matches the Yahoo free-agent name regardless of diacritics or punctuation (mirrors
+          // TradeEval.ts's normalizeName).
+          const normalizeName = (name: string) =>
+            name
+              .normalize("NFD")
+              .replace(/[̀-ͯ]/g, "")
+              .toLowerCase()
+              .replace(/[^a-z0-9]/g, "");
+
+          const outcome = yield* Effect.gen(function* () {
+            const weeklyProjections = yield* WeeklyProjections;
+            const yahoo = yield* YahooClient;
+
+            const [set, availablePayload] = yield* Effect.all([
+              weeklyProjections.currentMatchup,
+              yahoo.getAvailablePlayers(50),
+            ]);
+
+            const freeAgentNames = new Set(
+              availablePayload.fantasy_content.league[1].players.map((entry) =>
+                normalizeName(entry.player[0].name),
+              ),
+            );
+
+            return [...(set.probablePitcherStarts ?? [])]
+              .filter((start) => dateParam == null || start.date === dateParam)
+              .map((start) => ({
+                playerKey: start.playerKey,
+                playerName: start.playerName,
+                team: start.team,
+                opponentTeam: start.opponentTeam,
+                date: start.date,
+                gameTime: start.gameTime,
+                homeAway: start.homeAway,
+                isFreeAgent: freeAgentNames.has(normalizeName(start.playerName)),
+              }))
+              .sort((a, b) => {
+                if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+                const at = a.gameTime ?? "";
+                const bt = b.gameTime ?? "";
+                return at < bt ? -1 : at > bt ? 1 : 0;
+              });
+          }).pipe(
+            Effect.map((starts) => ({ ok: true as const, date: dateParam ?? null, starts })),
+            Effect.catch((error) => Effect.succeed({ ok: false as const, error: String(error) })),
+            Effect.provide(Layer.mergeAll(WeeklyProjectionLayer, YahooLayer)),
+            // WeeklyProjectionLayer's D1-backed layers resolve RuntimeContext at layer-build time,
+            // which the fetch handler doesn't carry — same workaround as /admin/trade-eval.
+            Effect.provideService(RuntimeContext, runtimeContext),
+          );
+
+          return yield* HttpServerResponse.json(outcome, { status: outcome.ok ? 200 : 502 });
         }
 
         if (

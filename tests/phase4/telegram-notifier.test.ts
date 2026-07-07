@@ -29,6 +29,7 @@ describe("TelegramNotifier", () => {
         optimalBench: [],
         doNow: [],
         holdForLater: [],
+        waiverTargets: [],
         warnings: [],
       }),
     );
@@ -94,6 +95,7 @@ describe("TelegramNotifier", () => {
         rejectedTransactions: [],
         doNow: [],
         holdForLater: [],
+        waiverTargets: [],
         warnings: [],
       }),
     );
@@ -174,6 +176,7 @@ describe("TelegramNotifier", () => {
           }),
         ],
         holdForLater: [],
+        waiverTargets: [],
         warnings: [
           "Manager decision generated from Yahoo roster, status, lock data, matchup context, and category guardrails.",
         ],
@@ -258,6 +261,7 @@ describe("TelegramNotifier", () => {
         optimalBench: [],
         doNow: [],
         holdForLater: [],
+        waiverTargets: [],
         warnings: [],
       }),
     );
@@ -302,6 +306,7 @@ describe("TelegramNotifier", () => {
           }),
         ],
         holdForLater: [],
+        waiverTargets: [],
         warnings: [
           "This is a manual manager decision generated from Yahoo roster, status, and lock data.",
         ],
@@ -346,6 +351,7 @@ describe("TelegramNotifier", () => {
             yahooSteps: [],
           }),
         ],
+        waiverTargets: [],
         warnings: [],
       }),
     );
@@ -381,6 +387,7 @@ describe("TelegramNotifier", () => {
         optimalBench: [],
         doNow: [],
         holdForLater: [],
+        waiverTargets: [],
         warnings: [],
       }),
     );
@@ -416,6 +423,7 @@ describe("TelegramNotifier", () => {
         optimalBench: [],
         doNow: [],
         holdForLater: [],
+        waiverTargets: [],
         warnings: [],
       }),
     );
@@ -451,6 +459,7 @@ describe("TelegramNotifier", () => {
         optimalBench: [],
         doNow: [],
         holdForLater: [],
+        waiverTargets: [],
         warnings: [],
       }),
     );
@@ -500,6 +509,7 @@ describe("TelegramNotifier", () => {
         optimalBench: [],
         doNow: [],
         holdForLater: [],
+        waiverTargets: [],
         warnings: ["The 20-IP floor appears covered; do not add risky pitchers just for volume."],
       }),
     );
@@ -564,6 +574,7 @@ describe("TelegramNotifier", () => {
         rejectedTransactions: [],
         doNow: [],
         holdForLater: [],
+        waiverTargets: [],
         warnings: [],
       }),
     );
@@ -612,6 +623,7 @@ describe("TelegramNotifier", () => {
         optimalBench: [],
         doNow: [],
         holdForLater: [],
+        waiverTargets: [],
         warnings: [],
       }),
     );
@@ -671,6 +683,7 @@ describe("TelegramNotifier", () => {
         optimalBench: [],
         doNow: [],
         holdForLater: [],
+        waiverTargets: [],
         warnings: [],
       }),
     );
