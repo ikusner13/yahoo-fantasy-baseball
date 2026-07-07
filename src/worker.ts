@@ -246,26 +246,51 @@ const standingsMetadataValue = (items: unknown, key: string) => {
   return undefined;
 };
 
-// Resolves a `team` query param (case-insensitive team NAME, or a bare numeric teamId) to a
-// Yahoo team key. Returns undefined (never throws) when it can't be resolved so the route can
-// still answer with the core verdict and an explanatory note.
-const resolveTeamKey = (
+// Accent- and case-insensitive fold so a `team` param like "Republica Dominicana" matches the
+// Yahoo name "República Dominicana" regardless of which vowel carries the diacritic.
+const foldTeamName = (name: string) =>
+  name
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .trim()
+    .toLowerCase();
+
+// Flattens the Yahoo standings payload into a plain {teamId, teamKey, name} list. teamId is the
+// trailing `.t.N` segment of the team key. Used by resolveTeamKey and the /admin/teams route.
+const teamsFromStandings = (
   standings: YahooStandingsPayload,
-  leagueId: string,
-  teamParam: string,
-): string | undefined => {
-  const trimmed = teamParam.trim();
-  if (/^\d+$/.test(trimmed)) return `mlb.l.${leagueId}.t.${trimmed}`;
+): ReadonlyArray<{ readonly teamId: string; readonly teamKey: string; readonly name: string }> => {
   const teams = standings.fantasy_content.league[1].standings[0].teams;
+  const out: Array<{ teamId: string; teamKey: string; name: string }> = [];
   for (const entry of Object.values(teams)) {
     const team = (entry as { readonly team?: unknown })?.team;
     if (!Array.isArray(team)) continue;
     const metadataItems = team[0];
     const name = standingsMetadataValue(metadataItems, "name");
-    const key = standingsMetadataValue(metadataItems, "team_key");
-    if (name != null && key != null && name.toLowerCase() === trimmed.toLowerCase()) return key;
+    const teamKey = standingsMetadataValue(metadataItems, "team_key");
+    if (name == null || teamKey == null) continue;
+    out.push({ teamId: teamKey.split(".t.")[1] ?? teamKey, teamKey, name });
   }
-  return undefined;
+  return out;
+};
+
+// Resolves a `team` query param (accent/case-insensitive team NAME, or a bare numeric teamId) to a
+// Yahoo team key. Returns undefined (never throws) when it can't be resolved so the route can
+// still answer with the core verdict and an explanatory note.
+const resolveTeamKey = (
+  standings: YahooStandingsPayload,
+  _leagueId: string,
+  teamParam: string,
+): string | undefined => {
+  const trimmed = teamParam.trim();
+  const teams = teamsFromStandings(standings);
+  if (/^\d+$/.test(trimmed)) {
+    // Match by the trailing teamId AND reuse a real team_key's prefix (e.g. "469.l.62744"), which
+    // is game-code-specific — a hardcoded "mlb.l." prefix does not match Yahoo's actual keys.
+    return teams.find((team) => team.teamId === trimmed)?.teamKey;
+  }
+  const target = foldTeamName(trimmed);
+  return teams.find((team) => foldTeamName(team.name) === target)?.teamKey;
 };
 
 const D1_PROXY_METHODS = new Set(["run", "all", "get", "values"]);
@@ -1294,6 +1319,26 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
           });
         }
 
+        if (request.method === "GET" && url.pathname === "/admin/teams") {
+          const adminToken = yield* Config.string("ADMIN_TRIGGER_TOKEN");
+          if (url.searchParams.get("token") !== adminToken) {
+            return HttpServerResponse.text("Unauthorized", { status: 401 });
+          }
+
+          const outcome = yield* Effect.gen(function* () {
+            const yahoo = yield* YahooClient;
+            const standings = yield* yahoo.getLeagueStandings;
+            return teamsFromStandings(standings);
+          }).pipe(
+            Effect.map((teams) => ({ ok: true as const, teams })),
+            Effect.catch((error) => Effect.succeed({ ok: false as const, error: String(error) })),
+            Effect.provide(YahooLayer),
+            Effect.provideService(RuntimeContext, runtimeContext),
+          );
+
+          return yield* HttpServerResponse.json(outcome, { status: outcome.ok ? 200 : 502 });
+        }
+
         if (request.method === "GET" && url.pathname === "/admin/trade-eval") {
           const adminToken = yield* Config.string("ADMIN_TRIGGER_TOKEN");
           if (url.searchParams.get("token") !== adminToken) {
@@ -1440,6 +1485,11 @@ export default class FantasyGMWorker extends Cloudflare.Worker<FantasyGMWorker>(
             Effect.provide(
               Layer.mergeAll(RuntimeLayer, ProjectionDataLayer, YahooLayer, StandingsHistoryLayer),
             ),
+            // Db.layer resolves RuntimeContext from the effect context at layer-build time, but the
+            // fetch handler (unlike the scheduled/cron path) doesn't carry it — same workaround as
+            // the /admin/d1/query route above. Without this the D1-backed layers die with
+            // "Service not found: RuntimeContext" and the defect escapes Effect.catch as a raw 500.
+            Effect.provideService(RuntimeContext, runtimeContext),
           );
 
           if (!outcome.ok) {
